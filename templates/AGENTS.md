@@ -1,6 +1,6 @@
 # AGENTS.md - Multi-Agent Harness Architecture & Operational Guide
 
-This document governs the multi-agent collaboration model across AI coding harnesses (Claude Code, Cursor, Pi, Codex, OpenCode, Windsurf).
+This document governs the multi-agent collaboration model and operational protocol across modern AI coding harnesses (Claude Code, Cursor, Pi, Codex, OpenCode, Windsurf).
 
 ---
 
@@ -12,13 +12,17 @@ This document governs the multi-agent collaboration model across AI coding harne
    - **Reviewer / QA**: Runs compilers, unit tests, and security scans. Inspects git diff for unintended changes.
 
 2. **Session Context Management & Anti-Rot**:
-   - **Token Economy & Progressive Disclosure**: Context is finite and degrades with bloat. Never dump whole directories or 2,000-line files into memory. First list symbols/paths, then slice inspect only the relevant functions.
+   - **Token Economy & Progressive Disclosure**: Context is finite and degrades with bloat. Never dump whole directories or 2,000-line files into memory:
+     - Step 1: List symbol outlines or search paths with `rg` / `grep`.
+     - Step 2: Slice inspect only the targeted function or block with line offsets/limits.
+     - Step 3: Read full files only when architectural refactoring is explicitly required.
    - **Compacted Hand-Off & Checkpoints**: In long multi-turn sessions, summarize findings into dense structured checkpoints:
      1. Stated objective & completed milestones.
      2. Active hypotheses & verified file paths.
      3. Blockers / root causes identified.
      4. Next immediate surgical actions.
    - **Sub-Agent & Scratchpad Isolation**: Use dedicated sub-agents or subshells for noisy exploratory searches (e.g., broad regex searches, running massive test suites) to prevent polluting the primary orchestrator's context window.
+   - **The 3-Attempt Circuit Breaker**: If an agent fails to resolve a compiler or test error after 3 consecutive edits, it MUST STOP immediately. Do not spam speculative changes. Revert unverified changes (`git checkout -- <file>`), formulate a new root-cause hypothesis, or summarize findings to the user.
 
 3. **Deterministic Tools Over Generative Guessing**:
    - Use `grep`, `rg`, AST parsers, and language server diagnostics to locate symbols. Never guess line numbers, interfaces, or file locations.
@@ -28,7 +32,7 @@ This document governs the multi-agent collaboration model across AI coding harne
 
 ## 2. Model Context Protocol (MCP) & Tool Operations
 
-When invoking tools via MCP servers or native CLI integrations:
+When developing or invoking tools via MCP servers and native CLI integrations:
 
 1. **Payload Restraint & Chunking**:
    - Never request raw multi-megabyte payloads into the context window.
@@ -36,9 +40,11 @@ When invoking tools via MCP servers or native CLI integrations:
 2. **MCP Resources vs Tools**:
    - Use MCP Resources (`resources/read`) for static documentation, OpenAPI specs, and reference schemas.
    - Use MCP Tools (`tools/call`) exclusively for purposeful, state-changing or diagnostic actions with strict JSON Schema validation.
-3. **Fail Fast on Missing Schemas**:
-   - Verify tool arguments against the declared JSON Schema before execution.
-   - If an MCP tool returns an error, parse the diagnostic error message before attempting any fallback.
+3. **Tool Design Discipline for MCP Servers**:
+   - **JSON Schema Precision**: Every parameter must include a clear `description` explaining allowed formats (e.g., ISO-8601 dates, UUIDs, absolute paths). Never leave parameters untyped.
+   - **Destructive Safety & Dry-Run**: Destructive tools (file writes, database mutations, external calls) must support a `dryRun: boolean` parameter whenever feasible.
+   - **Structured Error Response**: Never crash the MCP transport on invalid input. Return `{ isError: true, content: [{ type: "text", text: "Descriptive error message and remediation hint" }] }`.
+   - **Stdio Transport Hygiene**: When writing stdio-based MCP servers, strictly log diagnostic messages to `stderr` (`console.error` / `logging.error`). Never write arbitrary text to `stdout`, which corrupts the JSON-RPC stream.
 4. **Local Tools First**:
    - Favor deterministic local tools (`git`, `grep`, `rg`, language server diagnostics) over costly remote MCP roundtrips when inspecting local codebases.
 

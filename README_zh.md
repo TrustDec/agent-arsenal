@@ -31,6 +31,7 @@
 
 除了通用的防幻觉规则外，现已全面补充主流技术栈与现代协议规范：
 
+- 🔷 **TypeScript 与 Node.js/Bun 生产级规范 (`rules/typescript.md`)**：全面严禁 `any` 与未经校验的暴力断言（`as T`）、I/O 边界强制使用 Zod/运行时 Schema 校验、根绝浮动 Promise（Floating Promise）、严禁非空断言感叹号（`!`）、强制可辨识联合类型（Discriminated Unions）消除不可能状态、防范 Node/Bun 事件监听器泄露与无上限 Map 内存暴涨。
 - 🐹 **Golang 并发与系统工程 (`rules/golang.md`)**：强制 `context.Context` 规范传递、严防 Goroutine 泄露、测试必带 `go test -race`、HTTP 响应体关闭前 Drain 排水排查、错误严格包装与生产代码零 panic。
 - 🗄️ **SQL 与数据库生产级安全 (`rules/database-sql.md`)**：严守 Expand & Contract 零停机迁移法、生产接口严禁 `SELECT *`、外键与筛选列强制索引、PostgreSQL 并发建索引、超短事务与严禁事务内发起网络 I/O。
 - 💚 **Vue 3 与 Nuxt 3 响应式与 SSR 严苛守则 (`rules/vue-nuxt.md`)**：强制 `<script setup lang="ts">`、严禁直接解构 Props（丢失响应式）、严禁覆写 `reactive()` 对象引用、消灭 Nuxt SSR 水合不匹配（Setup 严禁访问浏览器全局变量）、Pinia 状态解构必配 `storeToRefs` 与生命周期副作用必须卸载。
@@ -66,6 +67,7 @@ agent-arsenal/
 ├── rules/
 │   ├── CLAUDE.md           # Claude Code 与通用 Harness 主规则
 │   ├── .cursorrules        # Cursor 经典根目录规则
+│   ├── typescript.md       # 严格类型、运行时校验与 Node/Bun 生产准则
 │   ├── golang.md           # Go 并发安全、生命周期与系统级规范
 │   ├── database-sql.md     # 数据库零停机迁移、索引与事务准则
 │   ├── svelte-sveltekit.md # Svelte 5 Runes 与 SvelteKit 生产规范

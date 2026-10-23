@@ -31,6 +31,7 @@
 
 Beyond core general rules, `agent-arsenal` includes plug-and-play rules for modern stacks and environments:
 
+- 🔷 **TypeScript & Runtime Discipline (`rules/typescript.md`)**: Total ban on `any` and unvalidated type assertions (`as T`), mandatory Zod/runtime validation at I/O boundaries, zero floating promises, non-null assertion (`!`) ban, discriminated unions, and safe Node/Bun stream & memory leak prevention.
 - 🐹 **Golang Concurrency & Systems (`rules/golang.md`)**: Context lifecycle propagation, zero goroutine leaks, `go test -race` invariants, explicit error wrapping, and HTTP response body drain requirements.
 - 🗄️ **SQL & Database Production Safety (`rules/database-sql.md`)**: Expand-and-contract zero-downtime migrations, `SELECT *` ban in production endpoints, concurrent indexing, short transactions, and zero network I/O inside DB transactions.
 - 💚 **Vue 3 & Nuxt 3 (`rules/vue-nuxt.md`)**: Enforces `<script setup lang="ts">`, preserves prop reactivity (`toRefs` invariants), bans `reactive()` reassignment, prevents Nuxt SSR hydration mismatches (zero browser globals in setup), and guarantees Pinia `storeToRefs` & side-effect cleanup.
@@ -66,6 +67,7 @@ agent-arsenal/
 ├── rules/
 │   ├── CLAUDE.md           # Master rules for Claude Code & general harnesses
 │   ├── .cursorrules        # Optimized rules for Cursor IDE (root fallback)
+│   ├── typescript.md       # Strict typing, runtime validation & Node/Bun invariants
 │   ├── golang.md           # Concurrency, context & Go production discipline
 │   ├── database-sql.md     # Zero-downtime migrations & SQL invariants
 │   ├── svelte-sveltekit.md # Svelte 5 Runes & SvelteKit SSR invariants
