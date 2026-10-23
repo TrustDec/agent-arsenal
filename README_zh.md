@@ -34,6 +34,7 @@
 - 🐹 **Golang 并发与系统工程 (`rules/golang.md`)**：强制 `context.Context` 规范传递、严防 Goroutine 泄露、测试必带 `go test -race`、HTTP 响应体关闭前 Drain 排水排查、错误严格包装与生产代码零 panic。
 - 🗄️ **SQL 与数据库生产级安全 (`rules/database-sql.md`)**：严守 Expand & Contract 零停机迁移法、生产接口严禁 `SELECT *`、外键与筛选列强制索引、PostgreSQL 并发建索引、超短事务与严禁事务内发起网络 I/O。
 - 💚 **Vue 3 与 Nuxt 3 响应式与 SSR 严苛守则 (`rules/vue-nuxt.md`)**：强制 `<script setup lang="ts">`、严禁直接解构 Props（丢失响应式）、严禁覆写 `reactive()` 对象引用、消灭 Nuxt SSR 水合不匹配（Setup 严禁访问浏览器全局变量）、Pinia 状态解构必配 `storeToRefs` 与生命周期副作用必须卸载。
+- 🧡 **Svelte 5 Runes 与 SvelteKit 生产级守则 (`rules/svelte-sveltekit.md`)**：全面废弃 Svelte 3/4 旧语法，强制使用 Svelte 5 符文（Runes: `$state`, `$derived`, `$props`），严禁滥用 `$effect()` 造成多轮重渲染/死循环，消灭 SSR 水合不匹配，原生 Form Actions 渐进增强（`use:enhance`）与 `.svelte.ts` 模块级防 SSR 用户间数据泄漏。
 - ⚛️ **Next.js 14/15 与 React (`rules/react-nextjs.md`)**：严格划分 App Router 服务端组件与客户端组件边界，根除 Hydration 水合不匹配与客户端瀑布流请求。
 - 🦀 **Rust 工业级安全 (`rules/rust.md`)**：生产代码严禁 `.unwrap()` / `.expect()`，强制 `Result<?>` 错误向上传播，杜绝为了通过编译而疯狂 `.clone()`。
 - 🐍 **Python 与 FastAPI (`rules/python-fastapi.md`)**：强制全函数类型注解（Type Hints）、严格 Pydantic 校验，严禁静默吞掉报错的 `except Exception: pass`。
@@ -67,6 +68,7 @@ agent-arsenal/
 │   ├── .cursorrules        # Cursor 经典根目录规则
 │   ├── golang.md           # Go 并发安全、生命周期与系统级规范
 │   ├── database-sql.md     # 数据库零停机迁移、索引与事务准则
+│   ├── svelte-sveltekit.md # Svelte 5 Runes 与 SvelteKit 生产规范
 │   ├── vue-nuxt.md         # Vue 3 响应式规范与 Nuxt 3 SSR 准则
 │   ├── react-nextjs.md     # Next.js App Router 与 React 架构边界
 │   ├── rust.md             # Rust 工业级安全与反 unwrap 守则

@@ -34,6 +34,7 @@ Beyond core general rules, `agent-arsenal` includes plug-and-play rules for mode
 - 🐹 **Golang Concurrency & Systems (`rules/golang.md`)**: Context lifecycle propagation, zero goroutine leaks, `go test -race` invariants, explicit error wrapping, and HTTP response body drain requirements.
 - 🗄️ **SQL & Database Production Safety (`rules/database-sql.md`)**: Expand-and-contract zero-downtime migrations, `SELECT *` ban in production endpoints, concurrent indexing, short transactions, and zero network I/O inside DB transactions.
 - 💚 **Vue 3 & Nuxt 3 (`rules/vue-nuxt.md`)**: Enforces `<script setup lang="ts">`, preserves prop reactivity (`toRefs` invariants), bans `reactive()` reassignment, prevents Nuxt SSR hydration mismatches (zero browser globals in setup), and guarantees Pinia `storeToRefs` & side-effect cleanup.
+- 🧡 **Svelte 5 Runes & SvelteKit (`rules/svelte-sveltekit.md`)**: Complete ban on legacy Svelte 3/4 reactive syntax, strict `$state` vs `$state.raw` memory discipline, prohibition of `$effect()` for derived computations, SSR hydration guards, form actions progressive enhancement (`use:enhance`), and universal reactivity safety in `.svelte.ts`.
 - ⚛️ **Next.js 14/15 & React (`rules/react-nextjs.md`)**: Enforces App Router Server/Client Component boundaries, eliminates hydration mismatches, and bans client-side waterfall fetches.
 - 🦀 **Rust Industrial Safety (`rules/rust.md`)**: Strictly bans `.unwrap()` in production branches, enforces `Result<?>` error propagation, and blocks gratuitous `.clone()` spam.
 - 🐍 **Python & FastAPI (`rules/python-fastapi.md`)**: Mandates strict type hints, Pydantic validation, and bans silent `except Exception: pass`.
@@ -67,6 +68,7 @@ agent-arsenal/
 │   ├── .cursorrules        # Optimized rules for Cursor IDE (root fallback)
 │   ├── golang.md           # Concurrency, context & Go production discipline
 │   ├── database-sql.md     # Zero-downtime migrations & SQL invariants
+│   ├── svelte-sveltekit.md # Svelte 5 Runes & SvelteKit SSR invariants
 │   ├── vue-nuxt.md         # Vue 3 Composition API & Nuxt 3 SSR invariants
 │   ├── react-nextjs.md     # App Router & React invariants
 │   ├── rust.md             # Anti-unwrap & Rust safety rules
