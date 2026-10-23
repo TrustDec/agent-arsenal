@@ -33,10 +33,12 @@ Beyond core general rules, `agent-arsenal` includes plug-and-play rules for mode
 
 - 🐹 **Golang Concurrency & Systems (`rules/golang.md`)**: Context lifecycle propagation, zero goroutine leaks, `go test -race` invariants, explicit error wrapping, and HTTP response body drain requirements.
 - 🗄️ **SQL & Database Production Safety (`rules/database-sql.md`)**: Expand-and-contract zero-downtime migrations, `SELECT *` ban in production endpoints, concurrent indexing, short transactions, and zero network I/O inside DB transactions.
+- 💚 **Vue 3 & Nuxt 3 (`rules/vue-nuxt.md`)**: Enforces `<script setup lang="ts">`, preserves prop reactivity (`toRefs` invariants), bans `reactive()` reassignment, prevents Nuxt SSR hydration mismatches (zero browser globals in setup), and guarantees Pinia `storeToRefs` & side-effect cleanup.
 - ⚛️ **Next.js 14/15 & React (`rules/react-nextjs.md`)**: Enforces App Router Server/Client Component boundaries, eliminates hydration mismatches, and bans client-side waterfall fetches.
 - 🦀 **Rust Industrial Safety (`rules/rust.md`)**: Strictly bans `.unwrap()` in production branches, enforces `Result<?>` error propagation, and blocks gratuitous `.clone()` spam.
 - 🐍 **Python & FastAPI (`rules/python-fastapi.md`)**: Mandates strict type hints, Pydantic validation, and bans silent `except Exception: pass`.
 - 🤖 **Multi-Agent & MCP Protocols (`templates/AGENTS.md`)**: Context window anti-rot discipline, compacted hand-offs, sub-agent isolation, and safe Model Context Protocol (MCP) tool payload constraints.
+- 🎯 **Modern Cursor `.mdc` Rules**: All rules include YAML frontmatter (`description`, `globs`, `alwaysApply: false`) ready for Cursor's intelligent auto-attaching rule engine.
 
 ---
 
@@ -50,7 +52,7 @@ curl -fsSL https://raw.githubusercontent.com/TrustDec/agent-arsenal/main/install
 
 Or copy the files directly into your project root:
 - Copy `rules/CLAUDE.md` to `./CLAUDE.md`
-- Copy `rules/.cursorrules` to `./.cursorrules` (and stack rules into `./.cursor/rules/`)
+- Copy `rules/.cursorrules` to `./.cursorrules` (and stack rules into `./.cursor/rules/*.mdc`)
 - Copy `skills/` to `./.agents/skills/`
 - Copy `templates/AGENTS.md` to `./AGENTS.md`
 
@@ -65,6 +67,7 @@ agent-arsenal/
 │   ├── .cursorrules        # Optimized rules for Cursor IDE (root fallback)
 │   ├── golang.md           # Concurrency, context & Go production discipline
 │   ├── database-sql.md     # Zero-downtime migrations & SQL invariants
+│   ├── vue-nuxt.md         # Vue 3 Composition API & Nuxt 3 SSR invariants
 │   ├── react-nextjs.md     # App Router & React invariants
 │   ├── rust.md             # Anti-unwrap & Rust safety rules
 │   └── python-fastapi.md   # Strict typing & Python invariants
@@ -73,7 +76,7 @@ agent-arsenal/
 │   └── code-discipline/    # Staff Engineer verification protocol
 ├── templates/
 │   └── AGENTS.md           # Multi-agent collaboration & MCP context protocols
-└── install.sh              # 1-click installer (Cursor, Claude Code, Pi, OpenCode)
+└── install.sh              # 1-click installer (Cursor .mdc, Claude Code, Pi, OpenCode)
 ```
 
 ---

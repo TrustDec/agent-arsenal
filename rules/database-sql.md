@@ -1,3 +1,9 @@
+---
+description: SQL and database production invariants, zero-downtime migrations, and query safety
+globs: **/*.{sql,prisma},**/migrations/**
+alwaysApply: false
+---
+
 # SQL & Database Production Invariants
 
 > Add these rules to your project if writing relational database migrations, SQL queries, or ORM data models (PostgreSQL, MySQL, SQLite).

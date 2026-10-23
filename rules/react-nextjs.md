@@ -1,3 +1,9 @@
+---
+description: Next.js 14/15 App Router and React strict architectural discipline and hydration safety
+globs: **/*.{tsx,jsx,ts,js}
+alwaysApply: false
+---
+
 # Next.js 14/15 & React Strict Architectural Discipline
 
 > Add these rules to your project if developing in Next.js (App Router) or modern React.

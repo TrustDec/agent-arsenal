@@ -1,3 +1,9 @@
+---
+description: Python and FastAPI production invariants, strict typing, and zero-silent-excepts
+globs: **/*.py,**/pyproject.toml,**/requirements*.txt
+alwaysApply: false
+---
+
 # Python & FastAPI Production Invariants
 
 > Add these rules to your project if developing in Python, FastAPI, or Django.

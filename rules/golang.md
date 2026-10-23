@@ -1,3 +1,9 @@
+---
+description: Golang concurrency safety, context lifecycle propagation, and production invariants
+globs: **/*.go,**/go.mod
+alwaysApply: false
+---
+
 # Golang Production Discipline & Concurrency Safety
 
 > Add these rules to your project if developing in Go (Golang) microservices, CLI tools, or distributed backends.

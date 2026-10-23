@@ -1,3 +1,9 @@
+---
+description: Rust industrial safety, anti-unwrap enforcement, and zero-panic invariants
+globs: **/*.rs,**/Cargo.toml
+alwaysApply: false
+---
+
 # Rust Industrial Safety & Anti-Unwrap Rules
 
 > Add these rules to your project if developing in Rust.
