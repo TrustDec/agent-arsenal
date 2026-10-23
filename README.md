@@ -15,32 +15,25 @@
 
 ---
 
-## The Problem with Modern Coding Agents
+## ⚡ The Visual Contrast (Before vs After)
 
-Every developer using **Claude Code, Cursor, Pi, Codex, or OpenCode** faces the same recurring frustrations:
-
-1. **The Over-Engineering Trap**: You ask for a 2-line bug fix; the agent unilaterally refactors 6 unrelated files, re-orders your imports, and deletes existing comments.
-2. **Phantom Fixes**: The agent hallucinates that an issue is resolved without compiling or running a single test.
-3. **AI Slop UI**: Every frontend the agent generates has the same generic look: oversaturated purple-to-blue linear gradients, rounded-3xl bubbly cards, low contrast gray text, and chaotic spacing.
+| Default AI Generation (AI Slop) | With Agent Arsenal Injected |
+| :--- | :--- |
+| ❌ Neon purple/blue linear gradient cards | ✅ Deep Zinc/Slate neutral surfaces with 1px micro-borders |
+| ❌ Cluttered `rounded-3xl` bubbly shapes | ✅ Refined 8pt grid, optical kerning & Geist/SF Pro typography |
+| ❌ `Lorem Ipsum` and fake placeholder stats | ✅ Realistic domain data, accessible focus rings & tactile feedback |
+| ❌ Uncontrolled 200-line diff for 2-line bug | ✅ Surgical 2-line diff; zero untouched code modifications |
+| ❌ Uses `unwrap()` or `@ts-ignore` to silence errors | ✅ Root-cause fixes verified by machine compiler & test output |
 
 ---
 
-## What Agent Arsenal Injects
+## ✨ Specialized Language & Stack Invariants
 
-`agent-arsenal` gives your coding agents the operational discipline of a **Staff Software Engineer** and the design taste of a **Principal Product Designer**.
+Beyond core general rules, `agent-arsenal` now includes plug-and-play rules for modern stacks:
 
-### 1. 🛡️ Anti-Hallucination & Code Discipline (`rules/CLAUDE.md`, `.cursorrules`)
-- **Minimal Surgical Edits**: Strict invariant that prevents touching unaffected code lines.
-- **Empirical Verification**: Forces the agent to compile, lint, and run tests before claiming completion.
-- **Zero Phantom Packages**: Prevents inventing fictitious NPM/Cargo/PyPI libraries.
-
-### 2. 🎨 Aesthetic Taste & Design System (`skills/design-system`)
-- **Kills Neon Gradients**: Replaces amateur AI palettes with sophisticated zinc/slate neutrals and restrained accent strokes.
-- **Typography & Grid**: Enforces strict 8pt rhythm, SF Pro/Geist font stacks, and optical kerning.
-- **Tactile Feedback**: Mandates accessible focus rings, active scaling, and realistic mock data (no `Lorem Ipsum`).
-
-### 3. 🤝 Multi-Agent Architecture (`templates/AGENTS.md`)
-- Clear role division between Architect (read-only research), Implementer (targeted diffs), and Reviewer (compiler & lint checks).
+- ⚛️ **Next.js 14/15 & React (`rules/react-nextjs.md`)**: Enforces App Router Server/Client Component boundaries, eliminates hydration mismatches, and bans client-side waterfall fetches.
+- 🦀 **Rust Industrial Safety (`rules/rust.md`)**: Strictly bans `.unwrap()` in production branches, enforces `Result<?>` error propagation, and blocks gratuitous `.clone()` spam.
+- 🐍 **Python & FastAPI (`rules/python-fastapi.md`)**: Mandates strict type hints, Pydantic validation, and bans silent `except Exception: pass`.
 
 ---
 
@@ -65,7 +58,10 @@ Or copy the files directly into your project root:
 agent-arsenal/
 ├── rules/
 │   ├── CLAUDE.md           # Master rules for Claude Code & general harnesses
-│   └── .cursorrules        # Optimized rules for Cursor IDE
+│   ├── .cursorrules        # Optimized rules for Cursor IDE
+│   ├── react-nextjs.md     # App Router & React invariants
+│   ├── rust.md             # Anti-unwrap & Rust safety rules
+│   └── python-fastapi.md   # Strict typing & Python invariants
 ├── skills/
 │   ├── design-system/      # Apple/Vercel-level aesthetic taste engine
 │   └── code-discipline/    # Staff Engineer verification protocol

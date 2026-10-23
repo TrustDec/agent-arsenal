@@ -15,27 +15,25 @@
 
 ---
 
-## 解决的核心痛点
+## ⚡ 效果对比（Before vs After）
 
-所有用 **Claude Code, Cursor, Pi, Codex, OpenCode** 写代码的开发者，每天都在被这三件事折磨：
-
-1. **自作主张瞎改**：让你修一个 2 行的 bug，AI 顺手把你 6 个无关文件的格式重排一遍，删掉你原有的注释，甚至引入一个庞大的外部依赖；
-2. **假装修复（幻觉）**：没跑编译、没跑测试，信誓旦言说“已为您修复”，结果一运行全是报错；
-3. **一眼 AI 味的土味 UI**：只要让 AI 写前端，永远是千篇一律的高饱和紫蓝渐变、巨大圆角的土气卡片、对比度极低的灰色字体。
+| 默认 AI 生成状态（AI 糊弄） | 注入 Agent Arsenal 之后 |
+| :--- | :--- |
+| ❌ 高饱和刺眼紫蓝渐变背景卡片 | ✅ 纯正深 Zinc/Slate 优雅中性色 + 1px 精致微边框 |
+| ❌ 臃肿滑稽的 `rounded-3xl` 大圆角堆叠 | ✅ 严苛 8pt 网格对齐、光学字偶距微调与 Geist/SF Pro 现代排版 |
+| ❌ 满屏 `Lorem Ipsum` 和假数据 | ✅ 贴合真实生产业务的数据语义、按压微交互与可访问性焦点环 |
+| ❌ 修 2 行 bug 造成 200 行污染 Diff | ✅ 外科手术式修改，无辜代码行 0 变动 |
+| ❌ 遇到报错无脑用 `unwrap()` 或 `@ts-ignore` 掩盖 | ✅ 机器真实验证（编译/测试），根因排查彻底修复 |
 
 ---
 
-## Agent Arsenal 注入的两大超能力
+## ✨ 垂直技术栈专属严苛规范
 
-### 1. 🛡️ 工业级工程戒律 (`rules/CLAUDE.md`, `.cursorrules`, `skills/code-discipline`)
-- **外科手术式修改**：严禁碰无关代码行，保持 Git Diff 干净最小化；
-- **机器真实验证**：禁止用 `@ts-ignore` 或空 `catch` 掩盖错误，任务完成前必须跑通编译/测试；
-- **拒绝虚构库**：禁止捏造不存在的 NPM/Cargo/PyPI 函数或参数。
+除了通用的防幻觉规则外，现已全面补充特定技术栈的即插即用规范：
 
-### 2. 🎨 顶级审美设计系统 (`skills/design-system`)
-- **终结廉价渐变**：切换为现代深 Zinc/Slate 中性色基底与精致的 1px 微边框；
-- **排版与间距**：严格对齐 8pt 网格与 Geist/SF Pro 现代无衬线字体；
-- **真实感交互**：自带按压微动效、可访问性焦点环，彻底告别 `Lorem Ipsum` 假数据。
+- ⚛️ **Next.js 14/15 与 React (`rules/react-nextjs.md`)**：严格划分 App Router 服务端组件与客户端组件边界，根除 Hydration 水合不匹配与客户端瀑布流请求。
+- 🦀 **Rust 工业级安全 (`rules/rust.md`)**：生产代码严禁 `.unwrap()` / `.expect()`，强制 `Result<?>` 错误向上传播，杜绝为了通过编译而疯狂 `.clone()`。
+- 🐍 **Python 与 FastAPI (`rules/python-fastapi.md`)**：强制全函数类型注解（Type Hints）、严格 Pydantic 校验，严禁静默吞掉报错的 `except Exception: pass`。
 
 ---
 
