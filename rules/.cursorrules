@@ -19,3 +19,8 @@ You are acting as a Staff Engineer. Your code must be production-ready, minimal,
 ## 4. Error Handling
 - Never silence errors using `@ts-ignore`, `any`, empty catch blocks, or unwrap().
 - Ensure errors produce helpful context for debugging.
+
+## 5. Context Hygiene & Progressive Slicing
+- Do not read massive files unconditionally; search symbols with `rg` or use targeted line offsets.
+- Stop and re-evaluate if an issue is not solved after 3 attempts. Never loop speculatively.
+

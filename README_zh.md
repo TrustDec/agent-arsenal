@@ -37,6 +37,7 @@
 - 🧠 **AI、LLM 应用与 RAG 检索增强生产级规范 (`rules/ai-llm-rag.md`)**：强制原生 Structured Outputs / JSON Schema 结构化提取与单轮自愈机制、严禁无脑固定字符切割（强制 Markdown/AST 语义边界切分）、混合检索（向量密集检索 + BM25 稀疏词法检索经 RRF 融合）、Cross-Encoder 精准重排、RAG 注入隔离边界（XML 显式防间接提示词注入）、严格 Token 窗口预算、全抖动指数退避抗 429 限流与 SSE 流式连接断开即时中止上游。
 - 🛡️ **应用安全与 OWASP 防御规范 (`rules/security-appsec.md`)**：严打 Agent 随手写出的 SSRF 漏洞（强制 DNS 预解析与内网私有 IP/云元数据 169.254 封禁）、命令拼接与 Shell 注入绝对防御、SQL 参数化与动态列白名单校验、路径遍历根目录规范校验、密码/签名常量时间比较（`timingSafeEqual` 防时序侧信道攻击）、CSPRNG 密码学安全随机数与 ReDoS 正则灾难性回溯免疫。
 - 🐳 **Docker 与容器化生产级规范 (`rules/docker-containers.md`)**：强制多阶段构建（Multi-Stage）收敛攻击面（`distroless`/`alpine`）、生产环境严禁 root 用户运行（`USER nonroot`）、PID 1 信号转发与轻量 Init（`tini`/Exec 格式）杜绝优雅关机超时死进程、BuildKit Secret 挂载防密钥硬编码至镜像层、同层包管理器缓存清理与真实健康检查。
+- ☸️ **Kubernetes 与云原生生产级规范 (`rules/kubernetes-cloud-native.md`)**：全面严禁在 `livenessProbe` 中探测数据库等外部依赖（根除依赖抖动诱发全集群 Pod 连环重启雪崩）、强制注入 `preStop` 延时睡眠解决滚动发布期间 502 Bad Gateway 路由不同步瞬断陷阱、Pod 安全准则 PSS restricted 加固（无 root 运行、根文件系统只读、Drop 全部 Linux Capabilities）、ConfigMap/Secret 标记 `immutable: true` 减轻 API Server 负载、Secret 采用只读 Volume 挂载防环境变量泄露，以及强制配置 PodDisruptionBudget (PDB) 护航集群调度。
 - 🔌 **Model Context Protocol (MCP) 服务端与工具规范 (`rules/mcp-server.md`)**：全面严禁 stdio 传输下的 `stdout` 杂质输出（`console.log` / `print` 会彻底打崩 JSON-RPC 字节流致客户端断联）、工具入参强制配备详尽 Schema `description` 引导 Agent 决策、严格上限控制与分页防 Context 爆炸、错误统一走 `{ isError: true }` 优雅降级，以及路径遍历白名单与 Shell 注入绝对防御。
 - 🔷 **TypeScript 与 Node.js/Bun 生产级规范 (`rules/typescript.md`)**：全面严禁 `any` 与未经校验的暴力断言（`as T`）、I/O 边界强制使用 Zod/运行时 Schema 校验、根绝浮动 Promise（Floating Promise）、严禁非空断言感叹号（`!`）、强制可辨识联合类型（Discriminated Unions）消除不可能状态、防范 Node/Bun 事件监听器泄露与无上限 Map 内存暴涨。
 - 🐹 **Golang 并发与系统工程 (`rules/golang.md`)**：强制 `context.Context` 规范传递、`errgroup` 协同工作与严防 Goroutine 泄露、切片子切片内存截留排查、测试必带 `go test -race`、HTTP 响应体关闭前 Drain 排水排查、错误使用 `%w` 与 `errors.Is/As` 保持因果链、生产代码零 panic 与优雅停机。
@@ -80,6 +81,7 @@ agent-arsenal/
 │   ├── ai-llm-rag.md       # AI, LLM 应用、RAG 检索增强与向量检索规范
 │   ├── security-appsec.md  # 应用安全、SSRF 防御与 OWASP 严苛守则
 │   ├── docker-containers.md# 容器化多阶段构建、无 root 运行与优雅停机规范
+│   ├── kubernetes-cloud-native.md # 探针防雪崩、preStop零停机与k8s安全加固
 │   ├── mcp-server.md       # Model Context Protocol (MCP) 服务端与工具生产规范
 │   ├── typescript.md       # 严格类型、运行时校验与 Node/Bun 生产准则
 │   ├── golang.md           # Go 并发安全、生命周期与系统级规范

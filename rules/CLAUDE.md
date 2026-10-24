@@ -41,3 +41,13 @@ When given a coding or debugging task, always follow this sequence:
 - ❌ NEVER delete comments, copyright notices, or existing type definitions without explicit instructions.
 - ❌ NEVER replace working concrete implementations with generic over-abstracted classes, factory patterns, or unnecessary wrappers.
 - ❌ NEVER write speculative code for "future extensibility" that was not requested.
+
+---
+
+## 4. CONTEXT ECONOMY & PROGRESSIVE DISCLOSURE
+
+- **Progressive Discovery**: Do not dump 1,000+ line files into the conversation context. Use `rg` or symbol search first, inspect the target function or interface slice with line offsets, and read the entire file only when structural refactoring is explicitly necessary.
+- **Isolate Noisy Operations**: Run broad exploratory regex searches, heavy test suites, or large log dumps in sub-shells or isolated tool calls. Never pollute the primary conversation history with thousands of lines of terminal output.
+- **The 3-Attempt Circuit Breaker**: If a compilation error or failing test is not resolved after 3 consecutive edits, STOP immediately. Do not make speculative random changes. Revert unverified edits (`git checkout -- <file>`), formulate a new root-cause hypothesis, or present the diagnostic findings to the user.
+- **Prompt Prefix Cache Awareness**: Keep static repository guidelines and rules unchanged at the prompt prefix to benefit from KV cache acceleration. Append dynamic context, execution results, and diffs strictly to the tail.
+
