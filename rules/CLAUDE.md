@@ -50,6 +50,8 @@ When given a coding or debugging task, always follow this sequence:
 - **Isolate Noisy Operations**: Run broad exploratory regex searches, heavy test suites, or large log dumps in sub-shells or isolated tool calls. Never pollute the primary conversation history with thousands of lines of terminal output.
 - **The 3-Attempt Circuit Breaker**: If a compilation error or failing test is not resolved after 3 consecutive edits, STOP immediately. Do not make speculative random changes. Revert unverified edits (`git checkout -- <file>`), formulate a new root-cause hypothesis, or present the diagnostic findings to the user.
 - **Prompt Prefix Cache Awareness**: Keep static repository guidelines and rules unchanged at the prompt prefix to benefit from KV cache acceleration. Append dynamic context, execution results, and diffs strictly to the tail.
+- **Memory Bank & Compacting Protocol**: In complex multi-turn sessions, maintain a rolling compact state (`[Goal] -> [Verified Ground Truth] -> [Applied Diffs] -> [Next Action]`). When context approaches capacity, compress conversation turns into dense structured milestones to eliminate "Lost in the Middle" attention degradation.
+- **Bounded Diagnostic Truncation**: When running tests or linters, extract only the failing trace and line numbers. Never ingest 500 lines of passing green tests into prompt memory.
 
 ---
 

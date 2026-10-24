@@ -39,6 +39,7 @@
 - 🛡️ **应用安全与 OWASP 防御规范 (`rules/security-appsec.md`)**：严打 Agent 随手写出的 SSRF 漏洞（强制 DNS 预解析与内网私有 IP/云元数据 169.254 封禁）、命令拼接与 Shell 注入绝对防御、SQL 参数化与动态列白名单校验、路径遍历根目录规范校验、密码/签名常量时间比较（`timingSafeEqual` 防时序侧信道攻击）、CSPRNG 密码学安全随机数与 ReDoS 正则灾难性回溯免疫。
 - 🐳 **Docker 与容器化生产级规范 (`rules/docker-containers.md`)**：强制多阶段构建（Multi-Stage）收敛攻击面（`distroless`/`alpine`）、生产环境严禁 root 用户运行（`USER nonroot`）、PID 1 信号转发与轻量 Init（`tini`/Exec 格式）杜绝优雅关机超时死进程、BuildKit Secret 挂载防密钥硬编码至镜像层、同层包管理器缓存清理与真实健康检查。
 - ☸️ **Kubernetes 与云原生生产级规范 (`rules/kubernetes-cloud-native.md`)**：全面严禁在 `livenessProbe` 中探测数据库等外部依赖（根除依赖抖动诱发全集群 Pod 连环重启雪崩）、强制注入 `preStop` 延时睡眠解决滚动发布期间 502 Bad Gateway 路由不同步瞬断陷阱、Pod 安全准则 PSS restricted 加固（无 root 运行、根文件系统只读、Drop 全部 Linux Capabilities）、ConfigMap/Secret 标记 `immutable: true` 减轻 API Server 负载、Secret 采用只读 Volume 挂载防环境变量泄露，以及强制配置 PodDisruptionBudget (PDB) 护航集群调度。
+- 🏗️ **Terraform 与基础设施即代码 (IaC) 生产级规范 (`rules/terraform-iac.md`)**：远程 Backend 状态文件强加密与 DynamoDB 原子分布式状态锁、有状态核心资源强制 `lifecycle { prevent_destroy = true }` 避免误删毁灭性灾难、热更资源 `create_before_destroy = true` 规避下线瞬断窗口、IAM 策略严禁通配符（`Action: "*"` 与 `Resource: "*"` 绝对红线）、非公开端口严禁 `0.0.0.0/0` 全网暴露、S3 存储桶强制开启四项防公开访问保护与 KMS 桶密钥加密、敏感变量声明 `sensitive = true` 杜绝日志脱敏穿透，以及悲观提供商版本锁定 (`~> 5.40`) 与入参 `validation` 强校验。
 - 🔌 **Model Context Protocol (MCP) 服务端与工具规范 (`rules/mcp-server.md`)**：全面严禁 stdio 传输下的 `stdout` 杂质输出（`console.log` / `print` 会彻底打崩 JSON-RPC 字节流致客户端断联）、工具入参强制配备详尽 Schema `description` 引导 Agent 决策、严格上限控制与分页防 Context 爆炸、错误统一走 `{ isError: true }` 优雅降级，以及路径遍历白名单与 Shell 注入绝对防御。
 - 🔷 **TypeScript 与 Node.js/Bun 生产级规范 (`rules/typescript.md`)**：全面严禁 `any` 与未经校验的暴力断言（`as T`）、I/O 边界强制使用 Zod/运行时 Schema 校验、根绝浮动 Promise（Floating Promise）、严禁非空断言感叹号（`!`）、强制可辨识联合类型（Discriminated Unions）消除不可能状态、防范 Node/Bun 事件监听器泄露与无上限 Map 内存暴涨。
 - 🐹 **Golang 并发与系统工程 (`rules/golang.md`)**：强制 `context.Context` 规范传递、`errgroup` 协同工作与严防 Goroutine 泄露、切片子切片内存截留排查、测试必带 `go test -race`、HTTP 响应体关闭前 Drain 排水排查、错误使用 `%w` 与 `errors.Is/As` 保持因果链、生产代码零 panic 与优雅停机。
@@ -89,6 +90,7 @@ agent-arsenal/
 │   ├── security-appsec.md  # 应用安全、SSRF 防御与 OWASP 严苛守则
 │   ├── docker-containers.md# 容器化多阶段构建、无 root 运行与优雅停机规范
 │   ├── kubernetes-cloud-native.md # 探针防雪崩、preStop零停机与k8s安全加固
+│   ├── terraform-iac.md    # 远程状态锁、防误删保护与云 IaC 安全规范
 │   ├── mcp-server.md       # Model Context Protocol (MCP) 服务端与工具生产规范
 │   ├── typescript.md       # 严格类型、运行时校验与 Node/Bun 生产准则
 │   ├── golang.md           # Go 并发安全、生命周期与系统级规范

@@ -28,6 +28,22 @@ alwaysApply: false
         return fmt.Errorf("batch processing failed: %w", err)
     }
     ```
+- **Loop Variable Goroutine Capture**:
+  - In Go 1.22+, `for` loop variables are scoped per iteration. However, for codebases targeting Go < 1.22 or maintaining backward-compatible libraries, ALWAYS shadow loop variables (`item := item`) before passing into a goroutine or closure.
+- **Modern Typed Atomics (`sync/atomic`)**:
+  - Use Go 1.19+ typed atomic primitives (`atomic.Int64`, `atomic.Bool`, `atomic.Pointer[T]`) instead of error-prone low-level pointer arithmetic (`atomic.AddInt64(&val, 1)`). They guarantee memory alignment and type safety.
+- **Channel Sizing, Backpressure & Non-Blocking Invariants**:
+  - Prefer unbuffered channels for strict synchronous synchronization handoffs.
+  - Buffered channels must have explicit documented sizing rationale; never use unbounded buffers as makeshift queues.
+  - When emitting telemetry or dropping low-priority events under high load, use non-blocking `select` with `default` to prevent worker starvation:
+    ```go
+    select {
+    case ch <- metric:
+    default:
+        // Channel full: record drop metric to prevent blocking producer goroutines
+        droppedCounter.Add(1)
+    }
+    ```
 - **Race Condition Immunity**:
   - Always run tests with the race detector enabled: `go test -race ./...`. Any detected data race is a blocking production bug.
 - **Mutex Discipline & Copy Prevention**:
@@ -61,6 +77,15 @@ alwaysApply: false
 - **Timer & Ticker Leaks in Long-Running Loops**:
   - Always stop tickers: `ticker := time.NewTicker(interval); defer ticker.Stop()`.
   - ❌ **AVOID `time.After` inside loops or select statements**: `time.After` allocations are not garbage collected until the timer expires. Use an explicit `time.NewTimer` and stop/drain it when done.
+- **`sync.Pool` Reset Discipline & Memory Retention**:
+  - Always reset slice lengths (`buf = buf[:0]`) before returning buffers to a `sync.Pool`.
+  - Cap buffer sizes before `pool.Put(buf)` to avoid retaining memory from abnormal large spikes:
+    ```go
+    if cap(buf) <= maxReusableBufferSize {
+        pool.Put(buf[:0])
+    }
+    ```
+  - Never store pointers to structs that retain references to external large objects inside `sync.Pool`, which pins them against garbage collection.
 - **Drain Before Close for HTTP Response Bodies**:
   - When consuming HTTP response bodies, ALWAYS drain before closing to ensure TCP connection reuse (keep-alive):
     ```go
