@@ -528,3 +528,40 @@ alwaysApply: false
     WHERE accounts.id = v.id;
     ```
 
+---
+
+## 17. `work_mem` Per-Operation Sizing, REINDEX CONCURRENTLY & Automated Slow Query Plans
+- **PostgreSQL `work_mem` Per-Operation Sizing & Server-Wide OOM Defense**:
+  - ❌ **The Multiplied `work_mem` Server Crash Trap**: `work_mem` is allocated **per sort and per hash operation per query**, NOT per connection. A single complex query with 4 sorts and 2 hash joins across 50 concurrent connections will consume $6 \times 50 = 300 \times \text{work\_mem}$. Setting `work_mem = 512MB` globally will instantly cause the Linux kernel OOM killer to invoke `SIGKILL` on the PostgreSQL primary process.
+  - ✅ **Production Invariant**: Keep global `work_mem` modest (`16MB`–`32MB`), and dynamically raise it per transaction for heavy batch/analytical reporting:
+    ```sql
+    BEGIN;
+    -- Temporarily elevate work_mem only for this analytical reporting session:
+    SET LOCAL work_mem = '256MB';
+
+    SELECT customer_id, sum(amount), percent_rank() OVER (ORDER BY sum(amount) DESC)
+    FROM orders
+    GROUP BY customer_id;
+    COMMIT;
+    ```
+- **Zero-Downtime Index Corruption & Bloat Repair via `REINDEX CONCURRENTLY`**:
+  - ❌ **The Table Lock Freeze Trap**: Executing standard `REINDEX TABLE orders;` acquires an `ACCESS EXCLUSIVE` lock on the entire table, blocking all concurrent `SELECT`, `INSERT`, `UPDATE`, and `DELETE` queries until completion.
+  - ✅ **Production Invariant**: In production environments, always execute `REINDEX CONCURRENTLY`:
+    ```sql
+    -- Builds replacement index in background without blocking reads or writes:
+    REINDEX TABLE CONCURRENTLY orders;
+    ```
+- **Automated Slow Query Plan Diagnostics with `track_io_timing = on` and `auto_explain`**:
+  - ❌ **The Missing I/O Visibility Blindspot**: Default PostgreSQL metrics only report elapsed execution time, concealing whether a 2-second query was stalled on CPU or blocked waiting for disk blocks to read into memory.
+  - ✅ **Production Invariant**: Enable I/O timing and automated query plan logging in `postgresql.conf`:
+    ```ini
+    track_io_timing = on
+    shared_preload_libraries = 'auto_explain'
+    auto_explain.log_min_duration = '500ms'
+    auto_explain.log_analyze = on
+    auto_explain.log_buffers = on
+    auto_explain.log_timing = on
+    auto_explain.log_nested_statements = on
+    ```
+
+

@@ -652,3 +652,60 @@ alwaysApply: false
     </script>
     ```
 
+---
+
+## 11. Svelte 5 Typed Callback Props, SvelteKit `handleFetch` & Targeted Invalidation
+- **Svelte 5 Typed Callback Props over Deprecated `createEventDispatcher` and `on:click`**:
+  - ❌ **The Legacy Event Dispatcher Boilerplate**: In Svelte 5, using `createEventDispatcher()` or directive syntax (`on:select`) is deprecated. It introduces runtime event bubbling overhead and lacks native TypeScript return inference.
+  - ✅ **Production Invariant**: Declare typed callback props directly in `$props()`:
+    ```svelte
+    <!-- src/lib/components/Modal.svelte -->
+    <script lang="ts">
+      let {
+        title,
+        onConfirm,
+        onClose,
+      }: {
+        title: string;
+        onConfirm: () => Promise<void> | void;
+        onClose: () => void;
+      } = $props();
+    </script>
+
+    <div class="modal">
+      <h2>{title}</h2>
+      <button onclick={onClose}>Cancel</button>
+      <button onclick={onConfirm}>Confirm</button>
+    </div>
+    ```
+- **SvelteKit `handleFetch` Internal Service Auth & Host Rewriting**:
+  - ❌ **The Server-Side DNS Loop & Lost Auth Cookies**: When SvelteKit SSR calls internal microservices or API endpoints via `fetch('/api/...)`, it executes an external HTTP round-trip without user session cookies unless explicitly forwarded.
+  - ✅ **Production Invariant**: Implement `handleFetch` in `src/hooks.server.ts` to clone requests, forward incoming cookies, and route directly to internal service addresses:
+    ```ts
+    // src/hooks.server.ts
+    import type { HandleFetch } from '@sveltejs/kit';
+
+    export const handleFetch: HandleFetch = async ({ event, request, fetch }) => {
+      // Forward authentication cookie to internal API endpoints:
+      if (request.url.startsWith('https://api.internal/')) {
+        request.headers.set('cookie', event.request.headers.get('cookie') || '');
+      }
+
+      return fetch(request);
+    };
+    ```
+- **SvelteKit Page Invalidation Precision (`invalidate(url)` vs `invalidateAll()`)**:
+  - ❌ **The Brutal `invalidateAll()` Refetch Storm**: Calling `invalidateAll()` upon small user interactions forces every `load` function on the page (user profile, navigation counts, heavy data tables) to re-run concurrently.
+  - ✅ **Production Invariant**: Use targeted URL invalidation or `depends` tags to refresh only the exact data affected:
+    ```svelte
+    <script lang="ts">
+      import { invalidate } from '$app/navigation';
+
+      async function refreshInvoices() {
+        // Re-runs only load functions that depend on '/api/invoices':
+        await invalidate('/api/invoices');
+      }
+    </script>
+    ```
+
+

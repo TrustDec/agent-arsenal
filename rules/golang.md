@@ -779,3 +779,54 @@ alwaysApply: false
     }
     ```
 
+---
+
+## 16. Deadlock-Free Channel Handoffs, Request Body Bounding & Premature GC Reclamation
+- **Deadlock & Goroutine Leak Defense in Channel Send Handoffs**:
+  - ❌ **The Unbuffered Channel Sender Block**: Sending to an unbuffered channel or bounded channel without selecting on `ctx.Done()` can block the sending goroutine indefinitely if the receiver encounters an error, panics, or cancels its context early:
+    ```go
+    // DANGEROUS: If receiver exits early, this goroutine leaks forever!
+    ch <- result
+    ```
+  - ✅ **Production Invariant**: Always guard channel sends with a cancellation check, or use non-blocking drops with dropped metrics:
+    ```go
+    select {
+    case ch <- result:
+        // Handoff succeeded
+    case <-ctx.Done():
+        // Context expired or canceled; avoid leaking goroutine
+        return ctx.Err()
+    }
+    ```
+- **Unbounded HTTP Request Body Memory Defense (`http.MaxBytesReader`)**:
+  - ❌ **The JSON Decoder Memory Exhaustion (OOM) Vulnerability**: Calling `json.NewDecoder(r.Body).Decode(&payload)` without limiting the reader allows an attacker to stream a 5GB malicious JSON payload, consuming all container memory and triggering the Linux OOM killer.
+  - ✅ **Production Invariant**: Always wrap `r.Body` with `http.MaxBytesReader` before decoding:
+    ```go
+    // Cap incoming request body to 10MB:
+    r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
+
+    dec := json.NewDecoder(r.Body)
+    dec.DisallowUnknownFields() // Reject unmapped parameters
+    if err := dec.Decode(&req); err != nil {
+        var maxBytesErr *http.MaxBytesError
+        if errors.As(err, &maxBytesErr) {
+            http.Error(w, "request payload exceeds maximum limit of 10MB", http.StatusRequestEntityTooLarge)
+            return
+        }
+        http.Error(w, "invalid json payload", http.StatusBadRequest)
+        return
+    }
+    ```
+- **Premature Finalizer & GC Reclamation Defense via `runtime.KeepAlive`**:
+  - ❌ **The Early Collector Sweep Bug**: When managing low-level OS file descriptors, mmap memory regions, or CGo handles wrapped in Go structs with finalizers (`runtime.SetFinalizer`), the Go garbage collector can sweep the outer struct while an internal handle method is still executing on CPU!
+  - ✅ **Production Invariant**: Use `runtime.KeepAlive` to guarantee object liveness until the critical operation finishes:
+    ```go
+    func (f *SecureFileHandle) ReadData(buf []byte) (int, error) {
+        n, err := syscall.Read(f.rawFd, buf)
+        // Keep f reachable so finalizer won't close rawFd during syscall:
+        runtime.KeepAlive(f)
+        return n, err
+    }
+    ```
+
+
