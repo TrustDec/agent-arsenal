@@ -31,6 +31,8 @@
 
 除了通用的防幻觉规则外，现已全面补充主流技术栈与现代协议规范：
 
+- 🧪 **测试工程规范与反脆弱验证守则 (`rules/testing-discipline.md`)**：全面严禁硬编码 `sleep` 随缘等待（强制条件轮询与 Fake Timers 虚拟时间推进）、基于事务 Rollback 与独立数据库实例根治测试状态互相污染、坚决打击“给 Mock 写测试”的伪测试反模式、强制核心业务配备表驱动测试（Table-Driven）与边界极限值矩阵覆盖、严禁未 `await` 的浮动异步断言，以及多协程/线程竞争检测（`-race`）。
+- 🚀 **CI/CD 自动化与 GitHub Actions 安全守则 (`rules/cicd-github-actions.md`)**：第三方 Actions 强制 40 位完整 SHA Hash 锁定（防语义化版本标签篡改发动供应链投毒）、全面根除 Bash 行内直接插值 `${{ github.event... }}` 导致的远程命令注入重大漏洞、强制顶层 `permissions: contents: read` 最小权限原则、严防 `pull_request_target` 触发器下检出不可信 Fork PR 代码导致仓库密钥泄露的著名安全陷阱，以及全链路 OIDC 短期凭证置换。
 - 🌐 **高可用 API 设计与分布式系统规范 (`rules/api-distributed-systems.md`)**：强制状态变更接口幂等性规范（`Idempotency-Key` 原子预占与 SHA-256 请求体哈希校验防篡改）、全抖动指数退避根绝重试风暴（Thundering Herd）、熔断器状态机（Closed/Open/Half-Open 探针机制）、W3C `traceparent` 与 OpenTelemetry 分布式链路追踪透传、基于事务性发件箱（Transactional Outbox）根除双写数据不一致灾难、RFC 7807 Problem Details 统一错误响应，以及分布式滑动窗口限流与优雅过载保护。
 - 🧠 **AI、LLM 应用与 RAG 检索增强生产级规范 (`rules/ai-llm-rag.md`)**：强制原生 Structured Outputs / JSON Schema 结构化提取与单轮自愈机制、严禁无脑固定字符切割（强制 Markdown/AST 语义边界切分）、混合检索（向量密集检索 + BM25 稀疏词法检索经 RRF 融合）、Cross-Encoder 精准重排、RAG 注入隔离边界（XML 显式防间接提示词注入）、严格 Token 窗口预算、全抖动指数退避抗 429 限流与 SSE 流式连接断开即时中止上游。
 - 🛡️ **应用安全与 OWASP 防御规范 (`rules/security-appsec.md`)**：严打 Agent 随手写出的 SSRF 漏洞（强制 DNS 预解析与内网私有 IP/云元数据 169.254 封禁）、命令拼接与 Shell 注入绝对防御、SQL 参数化与动态列白名单校验、路径遍历根目录规范校验、密码/签名常量时间比较（`timingSafeEqual` 防时序侧信道攻击）、CSPRNG 密码学安全随机数与 ReDoS 正则灾难性回溯免疫。
@@ -72,6 +74,8 @@ agent-arsenal/
 ├── rules/
 │   ├── CLAUDE.md           # Claude Code, Windsurf, Copilot, Cline 主规则
 │   ├── .cursorrules        # Cursor 经典根目录规则
+│   ├── testing-discipline.md # 测试工程规范、防 Flaky 与反伪测试准则
+│   ├── cicd-github-actions.md # Actions 供应链加固、命令注入免疫与 CI 安全
 │   ├── api-distributed-systems.md # 高可用 API 设计、幂等性与分布式追踪规范
 │   ├── ai-llm-rag.md       # AI, LLM 应用、RAG 检索增强与向量检索规范
 │   ├── security-appsec.md  # 应用安全、SSRF 防御与 OWASP 严苛守则

@@ -56,16 +56,19 @@ done
 # Mirror into .agents/rules for universal agent harnesses (Claude Code, Pi, OpenCode, Windsurf)
 cp "$SOURCE_DIR"/rules/*.md "$TARGET_DIR/.agents/rules/"
 
-# Copy Skills
-cp -r "$SOURCE_DIR/skills/design-system" "$TARGET_DIR/.agents/skills/"
-cp -r "$SOURCE_DIR/skills/code-discipline" "$TARGET_DIR/.agents/skills/"
+# Copy Skills dynamically
+for skill_dir in "$SOURCE_DIR/skills"/*; do
+  if [ -d "$skill_dir" ]; then
+    cp -r "$skill_dir" "$TARGET_DIR/.agents/skills/"
+  fi
+done
 
 echo "✅ Done! Injected:"
 echo "   - CLAUDE.md & .cursorrules (Anti-hallucination & minimal surgical diffs)"
 echo "   - Universal mirrors: .windsurfrules, .clinerules, .github/copilot-instructions.md"
 echo "   - .cursor/rules/*.mdc (Modern modular Cursor rules with glob triggers)"
 echo "   - AGENTS.md (Multi-agent collaboration & MCP context protocols)"
-echo "   - .agents/rules/* (Distributed Systems/API, AI/RAG, Security/AppSec, Docker, TypeScript, Go, SQL, Svelte 5/Kit, Vue/Nuxt, React/Next.js, Rust, Python, MCP Server)"
+echo "   - .agents/rules/* (Testing Discipline, CI/CD GitHub Actions, Distributed Systems/API, AI/RAG, Security/AppSec, Docker, TypeScript, Go, SQL, Svelte 5/Kit, Vue/Nuxt, React/Next.js, Rust, Python, MCP Server)"
 echo "   - .agents/skills/design-system (Apple/Vercel grade UI aesthetics)"
 echo "   - .agents/skills/code-discipline (Industrial verification discipline)"
 echo ""

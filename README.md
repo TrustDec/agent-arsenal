@@ -31,6 +31,8 @@
 
 Beyond core general rules, `agent-arsenal` includes plug-and-play rules for modern stacks and environments:
 
+- 🧪 **Testing Discipline & Anti-Flakiness Invariants (`rules/testing-discipline.md`)**: Absolute ban on arbitrary `sleep` timeouts, clock virtualization (`fakeTimers`) for temporal logic, hermetic test isolation with per-test transaction rollback, multi-worker test database partitioning, elimination of "testing the mock" antipatterns, strict table-driven boundary matrices, and zero unhandled floating promises in async tests.
+- 🚀 **CI/CD Automation & GitHub Actions Security (`rules/cicd-github-actions.md`)**: Full 40-character SHA pinning for third-party actions to prevent supply-chain hijacking, absolute elimination of script injection via intermediate environment variable mapping, top-level `permissions: contents: read` least privilege enforcement, elimination of the dangerous `pull_request_target` fork checkout trap, and OIDC cloud federation over static long-lived credentials.
 - 🌐 **Resilient API Design & Distributed Systems (`rules/api-distributed-systems.md`)**: Mandatory `Idempotency-Key` contracts with atomic reservation & SHA-256 payload checksum validation, retry storm immunity with full-jitter exponential backoff, circuit breaker state machines (Closed/Open/Half-Open), W3C `traceparent` OpenTelemetry distributed context propagation, elimination of the Dual-Write trap via the Transactional Outbox pattern, RFC 7807 Problem Details error formatting, and distributed sliding-window rate limiting.
 - 🧠 **AI, LLM Apps & RAG Systems (`rules/ai-llm-rag.md`)**: Strict Structured Outputs / JSON Schema validation, semantic chunking boundaries, hybrid search (dense embeddings + lexical BM25 via Reciprocal Rank Fusion), cross-encoder reranking, anti-prompt injection delimiter containment, token window budgeting, full-jitter exponential backoff, and SSE streaming disconnect cleanup.
 - 🛡️ **Application Security & OWASP Defense (`rules/security-appsec.md`)**: Anti-SSRF guards with DNS pre-flight & private IP bans, absolute command injection / shell interpolation elimination, parameterized SQL invariants, path traversal immunity with canonical base checks, constant-time cryptographic comparison (`timingSafeEqual`), CSPRNG token discipline, and ReDoS prevention.
@@ -72,6 +74,8 @@ agent-arsenal/
 ├── rules/
 │   ├── CLAUDE.md           # Master rules for Claude Code, Windsurf, Copilot, Cline
 │   ├── .cursorrules        # Optimized rules for Cursor IDE (root fallback)
+│   ├── testing-discipline.md # Anti-flakiness, hermetic isolation & test engineering
+│   ├── cicd-github-actions.md # Action SHA pinning, script injection & CI/CD safety
 │   ├── api-distributed-systems.md # Resilient APIs, idempotency & distributed tracing
 │   ├── ai-llm-rag.md       # AI, LLM apps, RAG pipelines & vector search safety
 │   ├── security-appsec.md  # Application security, SSRF defense & OWASP invariants
