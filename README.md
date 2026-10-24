@@ -31,13 +31,14 @@
 
 Beyond core general rules, `agent-arsenal` includes plug-and-play rules for modern stacks and environments:
 
+- 🔌 **Model Context Protocol (MCP) Server Engineering (`rules/mcp-server.md`)**: Absolute ban on stdio `stdout` pollution (`console.log` / `print` breaks JSON-RPC byte framing), mandatory descriptive Zod/Pydantic schemas for LLM tool selection, bounded token payload ceilings with pagination/projections, graceful error handling (`isError: true`), and path traversal / shell injection immunity.
 - 🔷 **TypeScript & Runtime Discipline (`rules/typescript.md`)**: Total ban on `any` and unvalidated type assertions (`as T`), mandatory Zod/runtime validation at I/O boundaries, zero floating promises, non-null assertion (`!`) ban, discriminated unions, and safe Node/Bun stream & memory leak prevention.
 - 🐹 **Golang Concurrency & Systems (`rules/golang.md`)**: Context lifecycle propagation, zero goroutine leaks, `go test -race` invariants, explicit error wrapping, and HTTP response body drain requirements.
 - 🗄️ **SQL & Database Production Safety (`rules/database-sql.md`)**: Expand-and-contract zero-downtime migrations, `SELECT *` ban in production endpoints, concurrent indexing, short transactions, and zero network I/O inside DB transactions.
 - 💚 **Vue 3 & Nuxt 3 (`rules/vue-nuxt.md`)**: Enforces `<script setup lang="ts">`, preserves prop reactivity (`toRefs` invariants), bans `reactive()` reassignment, prevents Nuxt SSR hydration mismatches (zero browser globals in setup), and guarantees Pinia `storeToRefs` & side-effect cleanup.
 - 🧡 **Svelte 5 Runes & SvelteKit (`rules/svelte-sveltekit.md`)**: Complete ban on legacy Svelte 3/4 reactive syntax, strict `$state` vs `$state.raw` memory discipline, prohibition of `$effect()` for derived computations, SSR hydration guards, form actions progressive enhancement (`use:enhance`), and universal reactivity safety in `.svelte.ts`.
-- ⚛️ **Next.js 14/15 & React (`rules/react-nextjs.md`)**: Enforces App Router Server/Client Component boundaries, eliminates hydration mismatches, and bans client-side waterfall fetches.
-- 🦀 **Rust Industrial Safety (`rules/rust.md`)**: Strictly bans `.unwrap()` in production branches, enforces `Result<?>` error propagation, and blocks gratuitous `.clone()` spam.
+- ⚛️ **Next.js 14/15 & React (`rules/react-nextjs.md`)**: Enforces App Router Server/Client boundaries, Next.js 15 async request APIs (`await params`), `server-only` leak protection, Server Actions authorization guards, and hydration mismatch elimination.
+- 🦀 **Rust Industrial Safety (`rules/rust.md`)**: Strictly bans `.unwrap()` in production branches, enforces `Result<?>` error propagation, Tokio async executor starvation guards, and zero-copy borrowing patterns.
 - 🐍 **Python & FastAPI (`rules/python-fastapi.md`)**: Mandates strict type hints, Pydantic validation, and bans silent `except Exception: pass`.
 - 🤖 **Multi-Agent & MCP Protocols (`templates/AGENTS.md`)**: Context window anti-rot discipline, compacted hand-offs, sub-agent isolation, and safe Model Context Protocol (MCP) tool payload constraints.
 - 🎯 **Modern Cursor `.mdc` Rules**: All rules include YAML frontmatter (`description`, `globs`, `alwaysApply: false`) ready for Cursor's intelligent auto-attaching rule engine.
@@ -67,13 +68,14 @@ agent-arsenal/
 ├── rules/
 │   ├── CLAUDE.md           # Master rules for Claude Code & general harnesses
 │   ├── .cursorrules        # Optimized rules for Cursor IDE (root fallback)
+│   ├── mcp-server.md       # Model Context Protocol (MCP) server & tool discipline
 │   ├── typescript.md       # Strict typing, runtime validation & Node/Bun invariants
 │   ├── golang.md           # Concurrency, context & Go production discipline
 │   ├── database-sql.md     # Zero-downtime migrations & SQL invariants
 │   ├── svelte-sveltekit.md # Svelte 5 Runes & SvelteKit SSR invariants
 │   ├── vue-nuxt.md         # Vue 3 Composition API & Nuxt 3 SSR invariants
-│   ├── react-nextjs.md     # App Router & React invariants
-│   ├── rust.md             # Anti-unwrap & Rust safety rules
+│   ├── react-nextjs.md     # Next.js 15 App Router & Server Actions invariants
+│   ├── rust.md             # Anti-unwrap, async Tokio & Rust safety rules
 │   └── python-fastapi.md   # Strict typing & Python invariants
 ├── skills/
 │   ├── design-system/      # Apple/Vercel-level aesthetic taste engine

@@ -1,0 +1,102 @@
+---
+description: Model Context Protocol (MCP) server & tool implementation discipline, stdio transport safety, schema invariants, and context payload limits
+globs: **/*mcp*/**/*.{ts,js,py,go,rs},**/mcp.json,**/src/tools/**/*.{ts,js,py},**/server.{ts,js,py}
+alwaysApply: false
+---
+
+# Model Context Protocol (MCP) Server & Tool Production Invariants
+
+> Add these rules to your project if developing or maintaining MCP (Model Context Protocol) servers, tool plugins, resource providers, or agent extensions (Claude Code, Cursor, Windsurf, Pi, OpenCode).
+
+## 1. Stdio Transport Purity & Stream Safety
+- ❌ **TOTAL BAN ON `stdout` POLLUTION**:
+  - In stdio-based MCP servers, `stdout` is the dedicated transport channel for JSON-RPC messages. **ANY** unformatted text, diagnostic print, debug trace, or library log written to `stdout` corrupts the JSON-RPC byte stream and crashes the client connection (Claude Desktop, Cursor, Pi, etc.).
+  - **Always route logs to `stderr`**:
+    - TypeScript/Node: use `console.error(...)` or a logger configured strictly for `process.stderr`. Never use `console.log()`.
+    - Python: use `logging.basicConfig(stream=sys.stderr)` or `sys.stderr.write(...)`. Never use `print()` without `file=sys.stderr`.
+    - Go: use `log.SetOutput(os.Stderr)` or `fmt.Fprintln(os.Stderr, ...)`.
+  - Silence noisy third-party dependencies that write banners or status updates to `stdout`.
+- **Clean Process Lifecycle**:
+  - Handle `SIGINT` and `SIGTERM` cleanly. Close active file handles, drain pending database connections, and shut down child processes before terminating.
+  - Never call `process.exit(0)` prematurely while transport buffers are flushing.
+
+## 2. Strict Tool Schemas & Parameter Descriptions
+- **Mandatory Detailed `description` on Every Field**:
+  - LLMs do not see your implementation code; they decide when and how to call tools based solely on schema descriptions.
+  - Every tool parameter MUST include a clear `description` explaining valid formats (e.g., `"ISO-8601 string (e.g. 2025-01-01T00:00:00Z)"`, `"Absolute POSIX file path"`, `"UUID v4 identifier"`), valid ranges, and fallback defaults.
+- **Strict Schema Validation (Zod / Pydantic)**:
+  - Never accept open-ended untyped objects (`z.any()`, `z.record(z.any())`, `Dict[str, Any]`).
+  - Explicitly define enums for known discrete options:
+    ```ts
+    // ❌ AI Anti-Pattern: Vague and prone to hallucinated values
+    { status: z.string() }
+
+    // ✅ Production Discipline: Constrained enum with clear guidance
+    {
+      status: z.enum(['pending', 'running', 'completed', 'failed'])
+        .describe('Current execution phase to filter by. Defaults to all statuses if omitted.')
+    }
+    ```
+- **Safe Error Signaling (`isError: true`)**:
+  - Never throw unhandled exceptions out of tool execution handlers. An uncaught rejection terminates the MCP server process.
+  - When an operation fails (e.g., file not found, API rate limit, invalid argument), return a structured tool error response:
+    ```ts
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text",
+          text: `Error: Failed to read file '${path}': File not found. Verify path exists in project workspace.`
+        }
+      ]
+    };
+    ```
+
+## 3. Context Window Anti-Rot & Bounded Payload Limits
+- **Hard Payload Ceiling**:
+  - MCP tool responses are directly injected into the LLM context window. Never return raw multi-megabyte payloads, raw binary dumps, or unpaged 10,000-row database responses.
+  - Impose a strict response size limit (e.g., maximum ~20KB or ~4,000 tokens per call).
+- **Mandatory Projections & Pagination**:
+  - Always support projection (`fields: string[]`) and pagination (`limit: number`, `cursor?: string`).
+  - Set a safe default `limit` (e.g., 20 items, max 100 items).
+- **Summarization & Truncation Invariants**:
+  - When returning large logs, file searches, or tabular data, return the head/tail and append an explicit truncation notice:
+    ```text
+    [Showing first 50 of 1,240 matches. Use offset=50 or refine query filter to inspect more.]
+    ```
+
+## 4. Architectural Segregation: Tools vs Resources vs Prompts
+- **MCP Tools (`tools/call`)**:
+  - Use tools exclusively for dynamic actions, side-effects, computations, or parameterized searches.
+  - For destructive operations (file mutations, git pushes, database writes, external deletions), provide a `dryRun: boolean` parameter (defaulting to `false`) and return a clear preview of affected resources before executing.
+- **MCP Resources (`resources/read`)**:
+  - Use resources for read-only static or addressable assets (documentation, OpenAPI specs, project configurations, logs).
+  - Use standard URI schemes: `workspace://docs/api.json`, `config://environments/staging`.
+- **MCP Prompts (`prompts/get`)**:
+  - Use prompts for standardized multi-step agent workflows (e.g., code review templates, incident post-mortem analysis).
+
+## 5. Security, Path Traversal & Injection Immunity
+- **Path Traversal Immunity**:
+  - When a tool accepts file paths or directory paths, resolve them against an allowed workspace root (`path.resolve(allowedRoot, userPath)`).
+  - Verify that the resolved path starts with the allowed root directory:
+    ```ts
+    const safePath = path.resolve(WORKSPACE_ROOT, inputPath);
+    if (!safePath.startsWith(WORKSPACE_ROOT)) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: "Security Error: Path traversal outside workspace root is blocked." }]
+      };
+    }
+    ```
+- **Subprocess Execution Safety**:
+  - Never execute commands via string concatenation or shell interpolation (`exec(\`git log \${branch}\`)`).
+  - Always pass discrete argument arrays using `execFile` or `spawn` without shell wrappers:
+    ```ts
+    // ❌ AI Vulnerability: Shell injection
+    exec(`git log ${branchName}`);
+
+    // ✅ Production Discipline: Safe argument vector
+    execFile('git', ['log', '--', branchName]);
+    ```
+- **Secret Hygiene**:
+  - Mask credentials, authorization headers, and API keys before logging or returning payloads to the agent.
