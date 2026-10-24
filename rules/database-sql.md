@@ -196,6 +196,44 @@ alwaysApply: false
   - Always profile queries using `EXPLAIN (ANALYZE, BUFFERS, VERBOSE)` rather than raw wall-clock duration.
   - Inspect `Buffers: shared hit=... read=... dirtied=...`. A query that appears fast on warm cache (`shared hit=50000`) but reads 50,000 pages will grind the database to a halt when cache evictions occur or cold storage reads are required.
 
+## 10. Concurrency Isolation, Partial Status Indexes & Extended Statistics
+- **Lost Update Prevention in Read-Modify-Write Cycles**:
+  - Under PostgreSQL's default `READ COMMITTED` isolation level, two concurrent transactions executing `SELECT balance ...` followed by `UPDATE accounts SET balance = balance - 50` will silently overwrite each other, causing money or inventory duplication.
+  - Mitigate with one of three proven strategies:
+    1. **Atomic In-Database Arithmetic**:
+       ```sql
+       UPDATE accounts SET balance = balance - 50 WHERE id = 42 AND balance >= 50;
+       ```
+    2. **Pessimistic Row Locks (`SELECT ... FOR UPDATE`)**:
+       ```sql
+       SELECT balance FROM accounts WHERE id = 42 FOR UPDATE;
+       ```
+    3. **Optimistic Concurrency Control (OCC) with Monotonic Version**:
+       ```sql
+       UPDATE accounts SET balance = 150, version = version + 1
+       WHERE id = 42 AND version = 3; -- If rows_affected == 0, abort and retry
+       ```
+- **Partial Indexing on High-Turnover Status Queues**:
+  - In task queues, order systems, or event tables, 98% of rows are in terminal states (`completed`, `archived`, `cancelled`).
+  - ❌ **NEVER index the entire table on `(status, created_at)`**:
+    - A 20-million-row index consumes gigabytes of RAM and slows down every single write.
+  - Use a targeted partial index covering ONLY active/pending states:
+    ```sql
+    CREATE INDEX idx_orders_active_queue ON orders (created_at)
+    WHERE status IN ('pending', 'processing');
+    ```
+    This reduces index size by 98% (e.g., from 800MB to 12MB), fitting entirely within CPU L3 cache or RAM buffers for lightning-fast polling.
+- **Correlated Column Statistics (`CREATE STATISTICS`)**:
+  - The PostgreSQL query planner assumes columns are statistically independent. When querying correlated columns (e.g., `WHERE make = 'Audi' AND model = 'R8'`), the planner multiplies individual selectivities, estimating 1 row instead of 50,000.
+  - This gross underestimation triggers catastrophic query plans (e.g., choosing a Nested Loop with 50,000 index lookups over an efficient Hash Join or Bitmap Scan).
+  - Fix by defining explicit multivariate extended statistics:
+    ```sql
+    CREATE STATISTICS stat_car_make_model (dependencies, ndistinct)
+    ON make, model FROM vehicles;
+    ANALYZE vehicles;
+    ```
+
+
 
 
 

@@ -148,5 +148,22 @@ alwaysApply: false
 - **Accessible Focus Trap & Focus Restoration**:
   - Modal dialogues and slide-over drawers MUST trap keyboard focus within the dialog container while open.
   - Upon closing, focus MUST be returned programmatically to the element that triggered the dialog, preserving keyboard navigation flow for screen readers and power users.
+- **`useAsyncData` Key Deduplication Invariant**:
+  - In Nuxt 3, `useAsyncData` uses its first argument as the deduplication cache key across SSR and client hydration:
+    ```ts
+    // ❌ Broken: Omitting unique key or dynamic parameters causes cross-route cache collisions
+    const { data } = await useAsyncData(() => $fetch(`/api/posts/${route.params.id}`))
+
+    // ✅ Invariant: Parameterized unique cache key
+    const { data } = await useAsyncData(
+      `post:${route.params.id}`,
+      () => $fetch(`/api/posts/${route.params.id}`),
+      { watch: [() => route.params.id] }
+    )
+    ```
+- **Custom Directive Event Listener Cleanup**:
+  - Custom directives attached to `window` or `document` (e.g. `v-click-outside`, `v-shortcut`) MUST remove all event listeners in the `unmounted(el)` hook.
+  - Failing to remove listeners retains detached DOM trees indefinitely, creating silent single-page application memory leaks.
+
 
 

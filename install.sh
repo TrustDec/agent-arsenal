@@ -68,7 +68,7 @@ echo "   - CLAUDE.md & .cursorrules (Anti-hallucination & minimal surgical diffs
 echo "   - Universal mirrors: .windsurfrules, .clinerules, .github/copilot-instructions.md"
 echo "   - .cursor/rules/*.mdc (Modern modular Cursor rules with glob triggers)"
 echo "   - AGENTS.md (Multi-agent collaboration & MCP context protocols)"
-echo "   - .agents/rules/* (Background Jobs & Durable Workflows, Agent Context & Memory Architecture, Auth/OAuth 2.1 & Identity, Redis Caching, Kafka & Event Streaming, gRPC & Protobuf, WebSockets & Real-Time, Observability & Telemetry, Web Performance & Core Web Vitals, Testing Discipline, CI/CD GitHub Actions, Terraform & IaC, Kubernetes/Cloud-Native, Distributed Systems/API, AI/RAG, Security/AppSec, Docker, TypeScript, Go, SQL, Svelte 5/Kit, Vue/Nuxt, React/Next.js, Rust, Python, MCP Server)"
+echo "   - .agents/rules/* (Edge Computing & Serverless Workers, Background Jobs & Durable Workflows, Agent Context & Memory Architecture, Auth/OAuth 2.1 & Identity, Redis Caching, Kafka & Event Streaming, gRPC & Protobuf, WebSockets & Real-Time, Observability & Telemetry, Web Performance & Core Web Vitals, Testing Discipline, CI/CD GitHub Actions, Terraform & IaC, Kubernetes/Cloud-Native, Distributed Systems/API, AI/RAG, Security/AppSec, Docker, TypeScript, Go, SQL, Svelte 5/Kit, Vue/Nuxt, React/Next.js, Rust, Python, MCP Server)"
 echo "   - .agents/skills/design-system (Apple/Vercel grade UI aesthetics)"
 echo "   - .agents/skills/code-discipline (Industrial verification discipline)"
 echo "   - .agents/skills/context-engineering (KV cache prefix preservation & memory bank discipline)"

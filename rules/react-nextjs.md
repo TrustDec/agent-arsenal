@@ -84,3 +84,46 @@ alwaysApply: false
 - **Stable Keys in Dynamic Lists**:
   - Always provide unique, stable keys when rendering collections (`key={item.id}`).
   - ❌ **NEVER** use array indices (`key={index}`) when list items can be re-ordered, filtered, or deleted.
+
+## 6. Server Secret Taint Defense & Non-Blocking Transitions
+- **Server Secret Leak Prevention via React Taint APIs**:
+  - In React 19 / Next.js 15, protect sensitive tokens, API secrets, and raw user records from accidentally crossing the server-to-client component boundary using React Taint APIs:
+    ```ts
+    import 'server-only';
+    import { experimental_taintUniqueValue, experimental_taintObjectReference } from 'react';
+
+    export async function getSecureUserData(userId: string) {
+      const user = await db.user.findUnique({ where: { id: userId } });
+      if (!user) return null;
+
+      // ❌ Throws immediate error if this string or object is ever passed to a Client Component
+      experimental_taintUniqueValue('Do not leak API key to client', user, user.stripeApiKey);
+      experimental_taintObjectReference('Do not pass raw user entity to client', user);
+
+      return user;
+    }
+    ```
+- **Non-Blocking Transitions with `useTransition`**:
+  - Wrap route updates, tab switches, and Server Action triggers in `startTransition` to prevent UI freezing:
+    ```tsx
+    const [isPending, startTransition] = useTransition();
+
+    function handleTabSwitch(tab: string) {
+      startTransition(async () => {
+        setActiveTab(tab);
+        await updateServerPreference(tab);
+      });
+    }
+    ```
+  - Keeps the browser responsive to immediate user inputs (clicks, keyboard navigation) while the background transition renders.
+
+## 7. Frontend Taste, Tactile Restraint & Accessible Dialogues
+- **Apple/Vercel Aesthetic Restraint**:
+  - Deep neutral surfaces (`bg-zinc-950 text-zinc-100 border-zinc-800/60`), subtle 1px micro-borders, and optical kerning (`tracking-tight` on headings).
+  - Absolute ban on amateur neon-purple gradients, oversized `rounded-3xl` bubble cards, and fake placeholder text.
+  - Tactile interactive feedback: `active:scale-[0.98] transition-all duration-75 ease-out`.
+  - Tooltips MUST have an intentional open delay (150–200ms) to prevent visual flashing when sweeping the cursor across dense layouts.
+- **Accessible Focus Trap & Keyboard Navigation**:
+  - All modal dialogs and slide-over panels MUST trap keyboard focus within the dialog container while mounted.
+  - Pressing `Escape` must dismiss the dialog and restore keyboard focus to the originating trigger button.
+

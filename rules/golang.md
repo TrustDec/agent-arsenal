@@ -246,5 +246,50 @@ alwaysApply: false
   - Avoid returning pointers for small structs ($\le 64$ bytes with no internal pointers, e.g. `Point{X, Y int}`). Returning pointers forces stack escape to the heap, generating needless GC sweep pressure.
   - Run `go build -gcflags="-m"` during performance optimization to prove variables stay on the stack.
 
+## 9. sync.Pool Memory Discipline, Channel Ownership & Atomic Swaps
+- **`sync.Pool` Memory Retention & Capacity Ceiling**:
+  - `sync.Pool` eliminates allocation overhead for high-frequency short-lived objects (e.g. byte buffers, JSON decoders).
+  - ❌ **NEVER return byte slices to `sync.Pool` without resetting length**:
+    ```go
+    var bufPool = sync.Pool{
+        New: func() any {
+            return bytes.NewBuffer(make([]byte, 0, 4096))
+        },
+    }
+
+    buf := bufPool.Get().(*bytes.Buffer)
+    buf.Reset() // MANDATORY: reset buffer before use or before Put
+    defer func() {
+        // CEILING GUARD: discard abnormally large buffers (>64KB) to avoid memory pinning
+        if buf.Cap() <= 65536 {
+            bufPool.Put(buf)
+        }
+    }()
+    ```
+  - **Pointer Zeroing**: Before returning a struct to `sync.Pool`, zero any pointer fields (`s.Data = nil`). Retained pointers prevent GC from freeing the referenced data, causing silent heap leaks.
+- **Channel Direction Typing & Ownership Principle**:
+  - ALWAYS specify channel directions in function signatures (`<-chan Task` for read-only consumers, `chan<- Task` for write-only producers) to catch architectural direction errors at compile time.
+  - **The Channel Ownership Rule**: The goroutine that writes to/creates a channel OWNS it. The owner is the SOLE entity permitted to call `close()`.
+  - ❌ **NEVER close a channel from the receiver side, and NEVER close a channel with multiple concurrent writers**:
+    - Writing to or closing a closed channel causes an immediate unrecoverable `panic: send on closed channel`.
+    - For multiple senders, coordinate shutdown via `context.Context` cancellation or a dedicated `sync.Once` wrapper.
+- **Mutex Copy Prevention & `atomic.Pointer[T]` (Go 1.19+)**:
+  - Structs containing `sync.Mutex` or `sync.RWMutex` MUST ALWAYS be passed by pointer (`*Server`), never by value (`Server`). Passing by value creates a shallow copy of the internal mutex lock state, breaking mutual exclusion and triggering `go vet` (`copylocks`).
+  - For read-heavy shared data structures that update infrequently (e.g. dynamic routing tables, feature flags, configuration snapshots), avoid lock contention using `atomic.Pointer[Config]`:
+    ```go
+    type ConfigManager struct {
+        cfg atomic.Pointer[AppConfig]
+    }
+
+    func (m *ConfigManager) Get() *AppConfig {
+        return m.cfg.Load() // Lock-free atomic pointer read
+    }
+
+    func (m *ConfigManager) Update(newCfg *AppConfig) {
+        m.cfg.Store(newCfg) // Atomic pointer swap; readers see newCfg immediately
+    }
+    ```
+
+
 
 

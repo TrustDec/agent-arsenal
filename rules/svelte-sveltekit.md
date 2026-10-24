@@ -173,5 +173,38 @@ alwaysApply: false
       }
     </script>
     ```
+- **Svelte 5 Snippets over Legacy Slots**:
+  - In Svelte 5, `<slot>` is completely deprecated. Use typed Snippets for flexible, parameter-safe component composition:
+    ```svelte
+    <script lang="ts">
+      import type { Snippet } from 'svelte';
+      let { children, header }: { children: Snippet; header?: Snippet<[string]> } = $props();
+    </script>
+
+    {#if header}
+      {@render header('Section Title')}
+    {/if}
+    {@render children()}
+    ```
+- **Untracked Reactive Reads with `untrack()`**:
+  - In `$effect()` or `$derived.by()`, when you need to inspect a reactive value without registering it as an active dependency, wrap the read in `untrack()`:
+    ```svelte
+    $effect(() => {
+      // Runs only when `count` changes; reading `analyticsId` will NOT re-trigger this effect
+      sendAnalytics(count, untrack(() => analyticsId));
+    });
+    ```
+- **SvelteKit Streaming Data in `PageServerLoad`**:
+  - Stream slow, non-critical database queries by returning un-awaited Promises from `+page.server.ts`:
+    ```ts
+    export const load: PageServerLoad = async () => {
+      return {
+        criticalUser: await getUser(), // Blocks SSR until ready
+        streamedFeed: getSlowFeed(),    // Streams concurrently without blocking initial HTML
+      };
+    };
+    ```
+  - In the template, use `<svelte:boundary>` and Svelte 5 snippets to render instant skeletons while the stream resolves.
+
 
 
