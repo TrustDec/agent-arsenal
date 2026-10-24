@@ -717,3 +717,65 @@ alwaysApply: false
         return job.Execute()
     }
     ```
+
+---
+
+## 15. Lock-Free Atomic Pointers, Go 1.22+ Loop Scope Invariants & Two-Phase Drain
+- **Wait-Free Dynamic Config Reloads with `atomic.Pointer[T]` (Go 1.19+)**:
+  - ❌ **The `sync.RWMutex` Cache Line Bouncing Bottleneck**: Protecting dynamic routing tables, feature flags, or rate limiter tiers with `sync.RWMutex.RLock()` triggers CPU cache coherence invalidation across multicore CPUs when handling hundreds of thousands of read requests per second.
+  - ✅ **Production Invariant**: Use `atomic.Pointer[T]` for wait-free, zero-lock atomic reads and atomic pointer swapping on hot paths:
+    ```go
+    import "sync/atomic"
+
+    type ServerConfig struct {
+        RateLimit int
+        Flags     map[string]bool
+    }
+
+    type ConfigManager struct {
+        cfg atomic.Pointer[ServerConfig]
+    }
+
+    func NewConfigManager(initial *ServerConfig) *ConfigManager {
+        cm := &ConfigManager{}
+        cm.cfg.Store(initial)
+        return cm
+    }
+
+    func (cm *ConfigManager) Get() *ServerConfig {
+        // Zero-lock, wait-free pointer load:
+        return cm.cfg.Load()
+    }
+
+    func (cm *ConfigManager) Reload(newCfg *ServerConfig) {
+        // Atomic pointer swap:
+        cm.cfg.Store(newCfg)
+    }
+    ```
+- **Go 1.22+ Loop Variable Scope Discipline & Backward Compatibility**:
+  - ❌ **The Multi-Goroutine Pointer Capture Bug**: In Go < 1.22, variables declared by `for k, v := range` share a single memory address across iterations, causing goroutines or closures to capture only the last element. Even with Go 1.22 fixing per-iteration scoping for standard loops, taking pointers to loop variables (`&val`) in libraries targeting older Go toolchains or CGo bindings still causes pointer aliasing bugs.
+  - ✅ **Production Invariant**: In cross-compatible codebases or when passing elements into slice of pointers, explicitly clone or bind per iteration:
+    ```go
+    items := []string{"a", "b", "c"}
+    ptrs := make([]*string, len(items))
+
+    for i := range items {
+        val := items[i] // Explicit local copy for absolute compiler version invariance
+        ptrs[i] = &val
+    }
+    ```
+- **Two-Phase Graceful Shutdown (Drain Phase vs Termination Phase)**:
+  - ❌ **The Abrupt In-Flight Request Cancellation Trap**: Closing the database connection pool immediately upon receiving `SIGTERM` causes in-flight HTTP requests to fail with `sql: database is closed` during active checkout or billing mutations.
+  - ✅ **Production Invariant**: Implement a two-phase drain sequence: first stop accepting new ingress connections and wait for active requests to finish, then gracefully flush and close stateful resources (database pools, Kafka producers):
+    ```go
+    // Phase 1: Stop ingress and drain in-flight requests (e.g. 15s budget):
+    if err := httpServer.Shutdown(drainCtx); err != nil {
+        slog.Error("http server drain error", "err", err)
+    }
+
+    // Phase 2: Now that zero HTTP handlers are executing, close DB pools:
+    if err := dbPool.Close(); err != nil {
+        slog.Error("database pool close error", "err", err)
+    }
+    ```
+

@@ -581,3 +581,74 @@ alwaysApply: false
       <p class="error">Failed to load statistics.</p>
     {/await}
     ```
+
+---
+
+## 10. Svelte 5 `$bindable` Contracts, SvelteKit `use:enhance` & Ephemeral Snapshot State
+- **Explicit Two-Way Prop Contracts with `$bindable()` (Svelte 5)**:
+  - ❌ **The Read-Only Prop Binding Error**: In Svelte 5, component props are immutable by default. Attempting `bind:value` on a child prop without declaring it as `$bindable()` causes compile-time errors or broken reactivity.
+  - ✅ **Production Invariant**: Explicitly mark two-way bindable props using `$bindable()` with fallback defaults:
+    ```svelte
+    <!-- src/lib/components/NumberInput.svelte -->
+    <script lang="ts">
+      let {
+        value = $bindable(0),
+        min = 0,
+        max = 100,
+      }: { value?: number; min?: number; max?: number } = $props();
+    </script>
+
+    <input
+      type="number"
+      {min}
+      {max}
+      bind:value
+      class="rounded-lg border px-3 py-2"
+    />
+    ```
+- **SvelteKit Form Actions with Progressive Enhancement (`use:enhance`)**:
+  - ❌ **The JavaScript-Dependent Form Submission**: Submitting forms via client-side `fetch` breaks when JavaScript is loading or blocked, and loses native form validation, browser autofill, and automatic CSRF handling.
+  - ✅ **Production Invariant**: Use standard HTML forms enhanced progressively with `use:enhance` for optimistic updates and automatic hydration:
+    ```svelte
+    <script lang="ts">
+      import { enhance } from '$app/forms';
+      let isSubmitting = $state(false);
+    </script>
+
+    <form
+      method="POST"
+      action="?/createInvoice"
+      use:enhance={() => {
+        isSubmitting = true;
+        return async ({ update }) => {
+          isSubmitting = false;
+          await update();
+        };
+      }}
+    >
+      <input type="text" name="customerName" required />
+      <button type="submit" disabled={isSubmitting}>
+        {isSubmitting ? 'Creating...' : 'Create Invoice'}
+      </button>
+    </form>
+    ```
+- **Ephemeral State Preservation across Navigation with `snapshot`**:
+  - ❌ **The Lost Multi-Step Filter / Form State**: When a user navigates away from a deep search or multi-step form to view a detail page and hits browser Back, standard `$state` is reset to defaults, destroying user inputs.
+  - ✅ **Production Invariant**: Export a `snapshot` object in `+page.svelte` to preserve ephemeral state in session history:
+    ```svelte
+    <script lang="ts">
+      import type { Snapshot } from './$types';
+
+      let searchQuery = $state('');
+      let filterTag = $state('all');
+
+      export const snapshot: Snapshot<{ searchQuery: string; filterTag: string }> = {
+        capture: () => ({ searchQuery, filterTag }),
+        restore: (values) => {
+          searchQuery = values.searchQuery;
+          filterTag = values.filterTag;
+        },
+      };
+    </script>
+    ```
+

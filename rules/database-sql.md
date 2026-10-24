@@ -486,3 +486,45 @@ alwaysApply: false
     ALTER TABLE orders ADD COLUMN notes TEXT;
     ```
     If another long-running query is holding a lock, the migration fails immediately without cascading into a site-wide queuing outage.
+
+---
+
+## 16. Heap-Only Tuple (`HOT`) Updates, Partition Pruning & Lock Ordering
+- **PostgreSQL Heap-Only Tuple (`HOT`) Updates & `fillfactor` Optimization**:
+  - ❌ **The Index Write Amplification Catastrophe**: By default (`fillfactor = 100`), PostgreSQL fills table pages to 100% capacity. Any `UPDATE` statement creates a new row tuple in a different disk page and must update EVERY index on the table, generating massive WAL traffic and disk I/O bottlenecks.
+  - ✅ **Production Invariant**: For high-frequency update tables (e.g., counters, sessions, payment states), set `fillfactor = 80 ~ 90` and ensure frequently updated columns are not indexed. This enables **Heap-Only Tuple (HOT)** updates, modifying rows within the same page without updating any indexes:
+    ```sql
+    ALTER TABLE user_sessions SET (fillfactor = 85);
+    VACUUM FULL user_sessions; -- Apply page reorganization
+    ```
+    Verify HOT optimization efficiency via `pg_stat_user_tables`:
+    ```sql
+    SELECT relname, n_tup_upd, n_tup_hot_upd,
+           round((n_tup_hot_upd::numeric / NULLIF(n_tup_upd, 0)) * 100, 2) AS hot_ratio
+    FROM pg_stat_user_tables
+    WHERE n_tup_upd > 1000;
+    ```
+- **Declarative Partitioning & Zero-Cost Partition Pruning Invariant**:
+  - ❌ **The Missing Partition Key Scan Penalty**: Creating monthly partitions on audit logs or ledger entries (`PARTITION BY RANGE (created_at)`), but issuing queries that filter only by `account_id` without `created_at`, forces PostgreSQL to execute a full sequential scan across every single child partition.
+  - ✅ **Production Invariant**: Always include the partition key in all query filters to enable **Partition Pruning**:
+    ```sql
+    -- ✅ Scans only 1 partition (orders_2026_10):
+    SELECT id, amount, status FROM orders
+    WHERE created_at >= '2026-10-01' AND created_at < '2026-11-01'
+      AND account_id = :acc_id;
+    ```
+    Retire historical data instantly via `ALTER TABLE orders DETACH PARTITION orders_2023_01; DROP TABLE orders_2023_01;` instead of running `DELETE FROM orders WHERE ...`, freeing gigabytes of disk in milliseconds with zero autovacuum debt.
+- **Deterministic Multi-Row Lock Ordering to Eliminate Deadlocks**:
+  - ❌ **The Interleaved Lock Deadlock**: Transaction 1 updates rows in order `[ID: 10, ID: 20]`, while Transaction 2 concurrently updates rows in order `[ID: 20, ID: 10]`. Both transactions acquire one row lock and block waiting for the other, triggering `ERROR: deadlock detected`.
+  - ✅ **Production Invariant**: Always sort IDs ascending in application logic or in SQL before acquiring row-level locks or executing bulk updates:
+    ```sql
+    -- Batch update with deterministic ascending lock acquisition:
+    UPDATE accounts
+    SET balance = balance + v.delta
+    FROM (
+        SELECT unnest($1::uuid[]) AS id, unnest($2::bigint[]) AS delta
+        ORDER BY 1 ASC
+    ) AS v
+    WHERE accounts.id = v.id;
+    ```
+

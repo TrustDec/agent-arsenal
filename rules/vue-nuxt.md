@@ -459,3 +459,59 @@ alwaysApply: false
     }
     </script>
     ```
+
+---
+
+## 10. Nuxt 3 `useAsyncData` Dynamic Key Scoping, Custom Debounced Refs & Teleport Hydration
+- **Nuxt 3 `useAsyncData` Dynamic Cache Key Isolation**:
+  - ❌ **The Static Key Data Cross-Contamination Bug**: Using a static key like `useAsyncData('user-profile', () => fetchUser(route.params.id))` causes Nuxt to return cached profile data of user A when the client navigates to user B's profile page.
+  - ✅ **Production Invariant**: Always include dynamic parameters in the key string, or pass reactive getters to watch:
+    ```vue
+    <script setup lang="ts">
+    const route = useRoute();
+
+    // Key dynamically tracks param, refreshing automatically on route change:
+    const { data: user, status } = await useAsyncData(
+      () => `user-${route.params.id}`,
+      () => $fetch(`/api/users/${route.params.id}`)
+    );
+    </script>
+    ```
+- **Performance Debouncing with Vue `customRef`**:
+  - ❌ **The Fragmented `watch` + `setTimeout` State Spaghetti**: Managing search debouncing via manual `watch` handlers and timer IDs creates race conditions with rapid typing and leaves dangling timeouts when components unmount.
+  - ✅ **Production Invariant**: Encapsulate debouncing into a reusable `customRef` that integrates seamlessly with `v-model`:
+    ```ts
+    import { customRef } from 'vue';
+
+    export function useDebouncedRef<T>(value: T, delay = 300) {
+      let timeout: ReturnType<typeof setTimeout>;
+      return customRef((track, trigger) => ({
+        get() {
+          track();
+          return value;
+        },
+        set(newValue: T) {
+          clearTimeout(timeout);
+          timeout = setTimeout(() => {
+            value = newValue;
+            trigger();
+          }, delay);
+        },
+      }));
+    }
+    ```
+- **Teleport SSR Target Mounting & Hydration Crash Prevention**:
+  - ❌ **The Missing Teleport Target Hydration Error**: Teleporting to an element (`<Teleport to="#drawer-portal">`) that is rendered later in the DOM tree or conditioned by a client-side flag causes SSR hydration failures (`Cannot find target element`).
+  - ✅ **Production Invariant**: Wrap dynamic teleports inside `<ClientOnly>` or verify the target element exists after mount:
+    ```vue
+    <template>
+      <ClientOnly>
+        <Teleport to="#modal-root">
+          <div class="modal-dialog">
+            <slot />
+          </div>
+        </Teleport>
+      </ClientOnly>
+    </template>
+    ```
+
