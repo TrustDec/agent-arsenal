@@ -289,6 +289,39 @@ alwaysApply: false
     ```
     `UNLOGGED` tables bypass WAL generation entirely, cutting write disk I/O in half and shielding replication streams from transient data bloat.
 
+## 13. PostgreSQL Advisory Locks, Autovacuum Tuning & Connection Pool Mathematical Sizing
+- **PostgreSQL Advisory Locks for Distributed Coordination**:
+  - Application workflows often require exclusive execution (e.g. running an hourly billing reconciliation or preventing concurrent balance settlement for a tenant) without locking an entire database table or creating dummy lock rows.
+  - ✅ **Transaction-Scoped Advisory Locks (`pg_advisory_xact_lock`)**:
+    ```sql
+    -- Blocks until the advisory lock for tenant hash is acquired; auto-released on COMMIT or ROLLBACK:
+    SELECT pg_advisory_xact_lock(hashtext('tenant:org_12345'));
+
+    -- Non-blocking try-lock: returns FALSE immediately if another worker is currently processing:
+    SELECT pg_try_advisory_xact_lock(hashtext('reconciliation:daily_20251025'));
+    ```
+  - Invariant: Always use `xact` variants (`pg_advisory_xact_lock`). Non-xact advisory locks (`pg_advisory_lock`) survive transaction commit and cause permanent lock leaks if the application crashes before executing `pg_advisory_unlock`.
+- **Autovacuum Bloat Tuning on High-Churn Tables**:
+  - Default PostgreSQL autovacuum triggers only when dead tuples exceed `50 + 20%` of the table (`autovacuum_vacuum_scale_factor = 0.2`). On a table with 20,000,000 rows, 4,000,000 dead rows accumulate before vacuum runs, causing massive table bloat, cache eviction, and sequential scan degradation.
+  - ✅ **Per-Table Autovacuum Aggressive Invariant**:
+    ```sql
+    -- For high-churn queue, session, or audit tables:
+    ALTER TABLE active_jobs SET (
+        autovacuum_vacuum_scale_factor = 0.02,  -- Trigger vacuum after 2% churn
+        autovacuum_vacuum_threshold = 1000,
+        autovacuum_vacuum_cost_limit = 2000     -- Increase I/O budget so vacuum finishes rapidly
+    );
+    ```
+- **Connection Pool Sizing: The Mathematical Little's Law Invariant**:
+  - ❌ **The "More Connections = Faster DB" Delusion**: Setting application connection pools to 100 or 500 connections per pod starves CPU caches, causes massive OS context-switching storms, and exhausts backend RAM.
+  - ✅ **The Spindle Formula (PostgreSQL & CockroachDB benchmark standard)**:
+    $$\text{Optimal Connections} = (\text{CPU Cores} \times 2) + \text{Effective Spindle Count}$$
+    On a modern 8-core NVMe server, the optimal pool size across *all* active application pods is typically **16 to 25 connections**.
+  - **Transaction Pooling with PgBouncer**:
+    - When hundreds of microservice instances or serverless workers connect, insert PgBouncer in `pool_mode = transaction`.
+    - Invariant: In transaction pooling, session-level constructs are prohibited: never use `PREPARE` without PgBouncer prepared statement support, never use `LISTEN`/`NOTIFY`, and ensure connections clean state between transactions.
+
+
 
 
 

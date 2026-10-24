@@ -219,6 +219,34 @@ alwaysApply: false
       }
     })
     ```
+- **`v-memo` Subtree Optimization for High-Density Virtual Lists & Tables**:
+  - In lists with hundreds of rows or data table cells, standard Virtual DOM diffing traverses every child VNode on each keystroke or unrelated state change.
+  - ✅ **Invariant**: Use `v-memo` to skip VDOM diffing entirely when row dependencies have not changed:
+    ```vue
+    <template>
+      <div 
+        v-for="item in items" 
+        :key="item.id" 
+        v-memo="[item.id === selectedId, item.status, item.updatedAt]"
+      >
+        <p>{{ item.name }} - {{ item.status }}</p>
+      </div>
+    </template>
+    ```
+- **Composable Lifecycle Cleanup with `onScopeDispose`**:
+  - ❌ **Anti-Pattern**: Attaching window event listeners, intervals, or WebSocket subscriptions inside composables without ensuring teardown when the calling component unmounts.
+  - ✅ **Production Invariant**: Use `onScopeDispose` inside headless composables. Unlike `onUnmounted`, `onScopeDispose` executes correctly whether invoked within a component setup, Pinia store, or custom effect scope:
+    ```ts
+    import { onScopeDispose } from 'vue';
+
+    export function useWindowResize(handler: () => void) {
+      window.addEventListener('resize', handler);
+      onScopeDispose(() => {
+        window.removeEventListener('resize', handler);
+      });
+    }
+    ```
+
 
 
 

@@ -272,6 +272,59 @@ alwaysApply: false
     // Or match by URL pattern:
     await invalidate((url) => url.pathname.startsWith('/api/orders'));
     ```
+- **Svelte 5 Snippets & Render Directives (`{#snippet}` & `{@render}`)**:
+  - ❌ **TOTAL BAN ON DEPRECATED `<slot />` AND `let:` DIRECTIVES**:
+    - Svelte 5 completely deprecates legacy slot syntax in favor of first-class snippets with typed arguments.
+  - ✅ **Production Invariant**: Use `{#snippet name(args)}` and `{@render name(args)}` for component composition:
+    ```svelte
+    <!-- List.svelte -->
+    <script lang="ts" generics="T">
+      import type { Snippet } from 'svelte';
+      let { items, row }: { items: T[]; row: Snippet<[T]> } = $props();
+    </script>
+
+    <ul>
+      {#each items as item}
+        <li>{@render row(item)}</li>
+      {/each}
+    </ul>
+
+    <!-- Consuming component -->
+    <List items={users}>
+      {#snippet row(user)}
+        <span>{user.name} ({user.email})</span>
+      {/snippet}
+    </List>
+    ```
+- **Optimistic UI with `use:enhance` and Svelte 5 `$state`**:
+  - Provide instant UI feedback for user actions (like toggling a todo or liking a post) with automatic rollback on server error:
+    ```svelte
+    <script lang="ts">
+      import { enhance } from '$app/forms';
+      let completed = $state(false);
+    </script>
+
+    <form 
+      method="POST" 
+      action="?/toggle" 
+      use:enhance={() => {
+        // 1. Optimistically flip UI state immediately before network request
+        const previous = completed;
+        completed = !completed;
+
+        return async ({ result, update }) => {
+          if (result.type === 'failure' || result.type === 'error') {
+            // 2. Roll back optimistic state on failure
+            completed = previous;
+          }
+          await update({ reset: false });
+        };
+      }}
+    >
+      <button type="submit">{completed ? 'Mark Incomplete' : 'Mark Complete'}</button>
+    </form>
+    ```
+
 
 
 
