@@ -361,6 +361,41 @@ alwaysApply: false
       </div>
     </template>
     ```
+- **Deterministic SSR Accessible IDs with `useId()` (Vue 3.5+ & Nuxt 3.10+)**:
+  - ❌ **The Hydration Mismatch Accessibility Trap**: Generating dynamic IDs using `Math.random()` or `nanoid()` inside components produces one ID during Node.js SSR and a mismatched ID during browser hydration, triggering `[Vue warn]: Hydration attribute mismatch on id` and breaking `<label for="...">` screen-reader bindings.
+  - ✅ **Production Invariant**: Always use the native `useId()` composable to guarantee deterministic, collision-free identifier generation across SSR and client hydration:
+    ```vue
+    <script setup lang="ts">
+    import { useId } from 'vue';
+
+    // Generates deterministic IDs like "v-0", matching exactly on server and client:
+    const inputId = useId();
+    const errorId = useId();
+    </script>
+
+    <template>
+      <div class="form-group">
+        <label :for="inputId">Work Email</label>
+        <input :id="inputId" type="email" :aria-describedby="errorId" />
+        <p :id="errorId" class="error-text">Please enter a valid company address.</p>
+      </div>
+    </template>
+    ```
+- **Custom Object Preservation with Nuxt Payload Reducers & Revivers**:
+  - ❌ **The Hydration Type-Degradation Bug**: Returning rich objects (e.g. `Set`, `Map`, `Decimal.js`, or custom classes) from `useAsyncData` causes Nuxt's SSR JSON payload serializer to downgrade them into plain strings or empty objects, leading to runtime crashes (`value.has is not a function`) on the client.
+  - ✅ **Production Invariant**: Register custom payload serializers with `definePayloadReducer` and `definePayloadReviver` in a Nuxt plugin:
+    ```ts
+    // plugins/payload-decimal.ts
+    import Decimal from 'decimal.js';
+
+    export default defineNuxtPlugin(() => {
+      // 1. Serialize on server:
+      definePayloadReducer('Decimal', (val) => val instanceof Decimal && val.toString());
+
+      // 2. Hydrate as genuine class instance on client:
+      definePayloadReviver('Decimal', (val) => new Decimal(val));
+    });
+    ```
 
 
 

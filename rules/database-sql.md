@@ -441,6 +441,30 @@ alwaysApply: false
       auto_explain.log_timing = 'off'         # Minimizes measurement overhead
       auto_explain.log_format = 'json'
       ```
+- **PostgreSQL Connection Pool Sizing & CPU Core Saturation Invariant**:
+  - ❌ **The `max_connections = 1000` Throughput Collapse**: PostgreSQL allocates an isolated OS process per client connection. Setting high connection counts (e.g. 500–1000) under concurrent load causes CPU thrashing, spinlock/latch contention, and TLB cache invalidation. Throughput plummets while query latency increases exponentially.
+  - ✅ **Production Invariant**:
+    - Calculate backend database connections using the empirical Little's Law formula:
+      $$\text{connections} = (2 \times \text{CPU cores}) + \text{effective disk spindle count}$$
+      An 8-core server achieves peak query throughput with ~16–25 active backend database connections.
+    - Deploy **PgBouncer** or **Odyssey** in front of PostgreSQL in `transaction` pooling mode to multiplex thousands of microservice clients into a compact, high-efficiency backend connection pool.
+- **Transaction ID (TXID) Wraparound Catastrophe & Autovacuum Tuning**:
+  - ❌ **The Emergency Read-Only Shutdown Trap**: PostgreSQL uses a 32-bit transaction counter (2.1 billion transactions). If autovacuum is throttled by conservative defaults on high-throughput databases, old row transaction IDs fail to freeze before reaching the 2-billion threshold. PostgreSQL enters a forced emergency read-only shutdown mode (`FATAL: database is not accepting commands to avoid wraparound data loss`) that requires manual single-user mode vacuuming during prolonged outages.
+  - ✅ **Production Invariant**:
+    - Unthrottle autovacuum for modern NVMe storage in `postgresql.conf`:
+      ```ini
+      autovacuum_max_workers = 5
+      autovacuum_vacuum_cost_limit = 2000   # Raised from default 200 to allow autovacuum to complete rapidly
+      autovacuum_vacuum_cost_delay = 2ms     # Reduced from default 20ms
+      autovacuum_freeze_max_age = 1000000000 # Freeze aggressively before reaching crisis
+      ```
+    - Monitor transaction age continuously with Prometheus/Datadog:
+      ```sql
+      SELECT datname, age(datfrozenxid) AS xid_age
+      FROM pg_database
+      WHERE datallowconn
+      ORDER BY xid_age DESC;
+      ```
 
 
 

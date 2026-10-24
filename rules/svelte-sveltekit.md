@@ -450,6 +450,53 @@ alwaysApply: false
 
     <textarea bind:value={comment} placeholder="Write draft..."></textarea>
     ```
+- **Svelte 5 Universal Reactivity Boundaries: Absolute Ban on Synchronous `$effect` Mutations**:
+  - ❌ **The Cascading Reactive Loop & Microtask Starvation**: Mutating a `$state` signal directly inside an `$effect` block synchronously triggers cascading re-renders, cyclic microtask scheduling, and runtime crashes (`Maximum update depth exceeded`).
+  - ✅ **Production Invariant**:
+    - Reserve `$effect` exclusively for leaf-node imperative side effects (DOM measurements, canvas rendering, third-party library lifecycle bridges, local storage synchronization).
+    - If a value depends on other reactive state, ALWAYS use `$derived` or `$derived.by`:
+      ```svelte
+      <script lang="ts">
+        let count = $state(0);
+
+        // ❌ NEVER DO THIS:
+        // let doubled = $state(0);
+        // $effect(() => { doubled = count * 2; });
+
+        // ✅ INVARIANT: Pure, zero-overhead derived calculation:
+        let doubled = $derived(count * 2);
+
+        // ✅ Complex derivations using derived.by:
+        let filteredItems = $derived.by(() => {
+          return items.filter(item => item.score > count);
+        });
+      </script>
+      ```
+- **SvelteKit Progressive Enhancement Form Actions & CSRF Defense**:
+  - ❌ **The JS-Only Form & CSRF Bypass Vulnerability**: Submitting forms via ad-hoc client-side `fetch` requires custom CSRF header plumbing. If JavaScript fails to load or an extension interferes, the form becomes completely inert.
+  - ✅ **Production Invariant**: Always use SvelteKit Form Actions with `use:enhance`. SvelteKit automatically enforces Origin header verification against Cross-Site Request Forgery (CSRF) and gracefully falls back to native standard POST when JavaScript is unavailable:
+    ```svelte
+    <script lang="ts">
+      import { enhance } from '$app/forms';
+
+      let isSubmitting = $state(false);
+    </script>
+
+    <form
+      method="POST"
+      action="?/updateProfile"
+      use:enhance={() => {
+        isSubmitting = true;
+        return async ({ update }) => {
+          await update();
+          isSubmitting = false;
+        };
+      }}
+    >
+      <input name="displayName" required />
+      <button type="submit" disabled={isSubmitting}>Save Profile</button>
+    </form>
+    ```
 
 
 

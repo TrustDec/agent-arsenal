@@ -616,6 +616,52 @@ alwaysApply: false
         return n, err
     }
     ```
+- **Graceful HTTP Server Shutdown & In-Flight Request Draining**:
+  - ❌ **The Abrupt Termination / Truncated Transaction Trap**: Relying on unhandled `SIGTERM` in containers or calling `os.Exit(0)` abruptly terminates the Go process, severing active client connections mid-write, truncating database transactions, and dropping in-flight HTTP requests.
+  - ✅ **Production Invariant**: Intercept OS signals via `signal.NotifyContext`, invoke `server.Shutdown(shutdownCtx)` with a dedicated timeout context (e.g., 15–30s), and ensure background worker pools finish processing before exiting:
+    ```go
+    ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+    defer stop()
+
+    srv := &http.Server{
+        Addr:         ":8080",
+        Handler:      router,
+        ReadTimeout:  10 * time.Second,
+        WriteTimeout: 30 * time.Second,
+        IdleTimeout:  120 * time.Second,
+    }
+
+    go func() {
+        if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+            log.Fatalf("listen failed: %v", err)
+        }
+    }()
+
+    <-ctx.Done() // Wait for SIGTERM or SIGINT
+    stop()       // Restore default signal handling
+
+    // Allow active connections up to 15s to finish processing:
+    shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+    defer cancel()
+
+    if err := srv.Shutdown(shutdownCtx); err != nil {
+        log.Printf("server forced to shutdown: %v", err)
+    }
+    ```
+- **Slice Memory Retention Leak via Sub-Slicing Large Buffers**:
+  - ❌ **The Pinned Backing Array Memory Leak**: Sub-slicing a small segment from a large slice (`token := hugeBuffer[10:30]`) pins the entire multi-megabyte backing array in memory. Even if `hugeBuffer` goes out of scope, the Go garbage collector CANNOT reclaim the underlying memory as long as `token` is alive.
+  - ✅ **Production Invariant**: Always clone small sub-slices with `slices.Clone` (Go 1.21+) or `append([]byte(nil), sub...)` to allow the large buffer to be garbage collected:
+    ```go
+    import "slices"
+
+    func extractHeaderToken(payload []byte) []byte {
+        // payload may be 10MB, but token is only 32 bytes:
+        rawToken := payload[16:48]
+
+        // INVARIANT: Clone the slice to allocate an isolated 32-byte backing array:
+        return slices.Clone(rawToken)
+    }
+    ```
 
 
 
