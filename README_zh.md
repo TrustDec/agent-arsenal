@@ -42,6 +42,8 @@
 - 🔷 **TypeScript 与 Node.js/Bun 生产级规范 (`rules/typescript.md`)**：全面严禁 `any` 与未经校验的暴力断言（`as T`）、I/O 边界强制使用 Zod/运行时 Schema 校验、根绝浮动 Promise（Floating Promise）、严禁非空断言感叹号（`!`）、强制可辨识联合类型（Discriminated Unions）消除不可能状态、防范 Node/Bun 事件监听器泄露与无上限 Map 内存暴涨。
 - 🐹 **Golang 并发与系统工程 (`rules/golang.md`)**：强制 `context.Context` 规范传递、`errgroup` 协同工作与严防 Goroutine 泄露、切片子切片内存截留排查、测试必带 `go test -race`、HTTP 响应体关闭前 Drain 排水排查、错误使用 `%w` 与 `errors.Is/As` 保持因果链、生产代码零 panic 与优雅停机。
 - 🗄️ **SQL 与数据库生产级安全 (`rules/database-sql.md`)**：严守 Expand & Contract 零停机迁移法、生产接口严禁 `SELECT *`、复合索引最左前缀原则、软删除部分索引（Partial Index）、PostgreSQL 并发建索引、SQL 参数化防注入、超短事务与严禁事务内发起网络 I/O。
+- ⚡ **Redis 与高并发缓存生产级规范 (`rules/redis-caching.md`)**：全面严禁生产环境执行 `KEYS *` 阻塞主事件循环（强制游标式 `SCAN`/`SSCAN` 分批）、大键异步内存释放（`UNLINK` 替代阻塞式 `DEL`）、基于 Singleflight 与 XFetch 概率性提前过期根治缓存击穿（Stampede）、强制 TTL 动态抖动（Jitter）消灭缓存雪崩、防范缓存穿透（空值短期缓存与 Bloom Filter）、原子令牌校验 Lua 脚本安全释放分布式锁、基于有序集合（ZSET）的滑动窗口限流器，以及 Cache-Aside 事务提交后失效（Delete over Update）一致性原则。
+- 📊 **可观测性、OpenTelemetry 与生产遥测规范 (`rules/observability-telemetry.md`)**：全面严禁生产代码裸写 Print（强制结构化 JSON 日志）、敏感数据脱敏防线（请求头/密码/Token/卡号自动过滤）、Prometheus 标签基数爆炸防御（绝对严禁将 user_id/order_id/动态路径放入 metric labels 炸毁 TSDB）、Counter/Gauge/Histogram 四大黄金信号指标语义、跨进程/跨网络 W3C `traceparent` 链路上下文透传、OpenTelemetry Span 完整生命周期闭环与显式错误状态标记（`StatusCode.ERROR`），以及存活/就绪探针解耦（`/livez` 绝不探测外部数据库）。
 - 💚 **Vue 3 与 Nuxt 3 响应式与 SSR 严苛守则 (`rules/vue-nuxt.md`)**：强制 `<script setup lang="ts">`、适配 Vue 3.5+ 响应式 Props 解构与 `useTemplateRef()`、使用 `onWatcherCleanup()` 规范清理、严禁覆写 `reactive()` 对象引用、绝对严禁在 Nuxt SSR 模块作用域声明可变状态（根治多租户跨请求数据串扰重大漏洞）、Nitro 服务端接口强制 `readValidatedBody` 运行时校验、Pinia 状态解构必配 `storeToRefs` 与生命周期副作用必须卸载。
 - 🧡 **Svelte 5 Runes 与 SvelteKit 生产级守则 (`rules/svelte-sveltekit.md`)**：全面废弃 Svelte 3/4 旧语法，强制使用 Svelte 5 符文（Runes: `$state`, `$derived`, `$props`），严禁滥用 `$effect()` 造成多轮重渲染/死循环，消灭 SSR 水合不匹配，原生 Form Actions 渐进增强（`use:enhance`）与 `.svelte.ts` 模块级防 SSR 用户间数据泄漏。
 - ⚛️ **Next.js 14/15 与 React 生产架构 (`rules/react-nextjs.md`)**：严格划分 App Router 服务端组件与客户端组件边界、适配 Next.js 15 异步请求 API（`await params`）、强制 `server-only` 防密钥泄露、Server Actions 权限与 Zod 校验，根除 Hydration 水合不匹配。
@@ -86,6 +88,8 @@ agent-arsenal/
 │   ├── typescript.md       # 严格类型、运行时校验与 Node/Bun 生产准则
 │   ├── golang.md           # Go 并发安全、生命周期与系统级规范
 │   ├── database-sql.md     # 数据库零停机迁移、索引与事务准则
+│   ├── redis-caching.md    # Redis 缓存穿透击穿雪崩、分布式锁与 BigKey 防护
+│   ├── observability-telemetry.md # OpenTelemetry 链路追踪、Prometheus 与日志
 │   ├── svelte-sveltekit.md # Svelte 5 Runes 与 SvelteKit 生产规范
 │   ├── vue-nuxt.md         # Vue 3 响应式规范与 Nuxt 3 SSR 准则
 │   ├── react-nextjs.md     # Next.js 15 App Router 与 Server Actions 生产边界
