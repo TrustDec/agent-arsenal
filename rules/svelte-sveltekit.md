@@ -410,6 +410,47 @@ alwaysApply: false
       <p class="error">Failed to load recommendations.</p>
     {/await}
     ```
+- **Internal Service Auth & Request Rewriting with `handleFetch`**:
+  - ❌ **The SSR Cookie / Header Loss Trap**: When a SvelteKit `load` function on the server calls `fetch('/api/v1/user')`, the browser's incoming cookies and authorization headers are NOT automatically attached to internal sub-requests, causing spurious 401 Unauthorized errors during SSR.
+  - ✅ **Production Invariant**: Implement `handleFetch` in `src/hooks.server.ts` to forward authorization headers and route requests to internal service addresses directly:
+    ```ts
+    // src/hooks.server.ts
+    import type { HandleFetch } from '@sveltejs/kit';
+
+    export const handleFetch: HandleFetch = async ({ event, request, fetch }) => {
+      // If fetching an internal API route from server-side load:
+      if (request.url.startsWith('https://api.internal.example.com')) {
+        // Forward incoming Authorization or Cookie header:
+        const token = event.cookies.get('session_token');
+        if (token) {
+          request.headers.set('Authorization', `Bearer ${token}`);
+        }
+      }
+
+      return fetch(request);
+    };
+    ```
+- **Transient UI & Scroll Preservation with SvelteKit `snapshot`**:
+  - ❌ Users filling out an uncommitted form navigate away, press the browser back button, and find their inputs completely wiped.
+  - ✅ **Production Invariant**: Use the `snapshot` API to preserve and restore ephemeral DOM/state across client-side history navigation:
+    ```svelte
+    <!-- src/routes/draft/+page.svelte -->
+    <script lang="ts">
+      import type { Snapshot } from './$types';
+
+      let comment = $state('');
+
+      export const snapshot: Snapshot<string> = {
+        capture: () => comment,
+        restore: (value) => {
+          comment = value;
+        }
+      };
+    </script>
+
+    <textarea bind:value={comment} placeholder="Write draft..."></textarea>
+    ```
+
 
 
 

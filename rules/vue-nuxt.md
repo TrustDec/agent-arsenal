@@ -316,6 +316,52 @@ alwaysApply: false
       }
     );
     ```
+- **Reactivity Overhead Optimization with `shallowRef` & `shallowReactive`**:
+  - ❌ **The Deep Proxy Memory Inflation Trap**: Wrapping a 10,000-row array of complex nested objects in `ref()` or `reactive()` causes Vue to recursively walk every property and wrap each nested object in a `Proxy`. This can increase memory consumption by 3–5x and block the main thread for 100ms+ during initial ingestion.
+  - ✅ **Production Invariant**:
+    - For large immutable collections (e.g. data tables, GeoJSON, chart datasets, markdown ASTs), ALWAYS use `shallowRef`:
+    ```vue
+    <script setup lang="ts">
+    import { shallowRef } from 'vue';
+
+    interface HeavyRecord {
+      id: string;
+      meta: Record<string, unknown>;
+    }
+
+    // Only .value assignment is reactive; nested properties are not wrapped in Proxies:
+    const records = shallowRef<HeavyRecord[]>([]);
+
+    async function loadData() {
+      const response = await fetchLargeCatalog();
+      // Whole-replacement triggers reactivity cleanly without nested proxy overhead:
+      records.value = response;
+    }
+    </script>
+    ```
+- **Granular Error Boundaries with `<NuxtErrorBoundary>` & `onErrorCaptured`**:
+  - ❌ Letting an unhandled exception in a non-critical sub-component (e.g., a recommendations sidebar or comments widget) crash the entire page with a fatal full-screen Nuxt error page (`error.vue`).
+  - ✅ **Production Invariant**:
+    - Isolate volatile widgets using `<NuxtErrorBoundary>`:
+    ```vue
+    <template>
+      <div class="product-layout">
+        <ProductMainDetails :product="product" />
+
+        <NuxtErrorBoundary>
+          <!-- If recommendations fail, only this section displays error fallback -->
+          <RecommendedProducts :category-id="product.categoryId" />
+          <template #error="{ error, clearError }">
+            <div class="p-4 border border-rose-500/20 bg-rose-500/5 rounded-lg">
+              <p class="text-sm text-rose-400">Could not load recommendations.</p>
+              <button @click="clearError" class="text-xs text-rose-300 underline mt-1">Retry</button>
+            </div>
+          </template>
+        </NuxtErrorBoundary>
+      </div>
+    </template>
+    ```
+
 
 
 

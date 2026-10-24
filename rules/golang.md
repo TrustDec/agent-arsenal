@@ -576,6 +576,47 @@ alwaysApply: false
         r.table.Store(next)
     }
     ```
+- **Unbounded HTTP Request Body Memory Defense with `http.MaxBytesReader`**:
+  - ❌ **The OOM Denial-of-Service Payload Trap**: Calling `json.NewDecoder(r.Body).Decode(&payload)` or `io.ReadAll(r.Body)` on untrusted HTTP requests allows an attacker to stream multi-gigabyte payloads directly into the server's heap memory, triggering rapid Out-Of-Memory (OOM) killer terminations.
+  - ✅ **Production Invariant**: Always wrap `r.Body` with `http.MaxBytesReader` before reading or decoding:
+    ```go
+    const maxBodyBytes = 1 << 20 // 1MB ceiling
+
+    func handleCreateUser(w http.ResponseWriter, r *http.Request) {
+        // Enforce strict memory ceiling; returns http.MaxBytesError if exceeded:
+        r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+
+        var req CreateUserRequest
+        dec := json.NewDecoder(r.Body)
+        dec.DisallowUnknownFields() // Reject unexpected payload fields
+
+        if err := dec.Decode(&req); err != nil {
+            var maxBytesErr *http.MaxBytesError
+            if errors.As(err, &maxBytesErr) {
+                http.Error(w, "request payload exceeds 1MB limit", http.StatusRequestEntityTooLarge)
+                return
+            }
+            http.Error(w, "invalid request json", http.StatusBadRequest)
+            return
+        }
+    }
+    ```
+- **Premature Finalizer and Garbage Collection Defense with `runtime.KeepAlive`**:
+  - ❌ **The Premature Finalizer / File Descriptor Reclaim Bug**: When wrapping Cgo pointers, raw OS file descriptors (`uintptr`), or types with finalizers (`runtime.SetFinalizer`), the Go garbage collector can sweep the enclosing Go struct while a concurrent method call on the underlying raw handle is still in-flight!
+  - ✅ **Production Invariant**: Call `runtime.KeepAlive(obj)` immediately after the native system call to guarantee the parent Go object remains reachable throughout the call:
+    ```go
+    type SafeHandle struct {
+        fd uintptr
+    }
+
+    func (h *SafeHandle) ReadDirect(buf []byte) (int, error) {
+        n, err := syscallRead(h.fd, buf)
+        // Ensure h is NOT garbage collected or finalized before syscallRead completes:
+        runtime.KeepAlive(h)
+        return n, err
+    }
+    ```
+
 
 
 

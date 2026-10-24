@@ -412,6 +412,36 @@ alwaysApply: false
     WHERE task_queue.id = next_job.id
     RETURNING task_queue.*;
     ```
+- **PostgreSQL `work_mem` Sizing & Transaction-Scoped Allocation**:
+  - ❌ **The Global `work_mem` OOM Catastrophe**: Setting `work_mem = '512MB'` globally in `postgresql.conf` causes server-wide Linux OOM-killer crashes. `work_mem` is NOT allocated per connection or per query—it is allocated **per sort/hash operation within each query execution plan node**. A single complex query with 4 sorts and 2 hash joins can consume `6 * 512MB = 3GB` of RAM. Under 50 concurrent connections, the instance crashes instantly.
+  - ✅ **Production Invariant**: Keep global `work_mem` conservative (e.g., `16MB` to `64MB`) to safeguard OLTP operations. For heavy analytical or batch jobs, elevate `work_mem` strictly within the dedicated session or transaction scope:
+    ```sql
+    BEGIN;
+    -- Elevate memory strictly for this analytical transaction:
+    SET LOCAL work_mem = '256MB';
+
+    SELECT customer_id, SUM(amount), DENSE_RANK() OVER (ORDER BY SUM(amount) DESC)
+    FROM transactions
+    WHERE created_at >= NOW() - INTERVAL '30 days'
+    GROUP BY customer_id;
+
+    COMMIT; -- Automatically resets work_mem back to server default
+    ```
+- **Production Query Bottleneck Diagnostics with `track_io_timing` & `auto_explain`**:
+  - ❌ Running manual `EXPLAIN (ANALYZE, BUFFERS)` requires reproducing production traffic manually and cannot diagnose transient spikes or lock contention in real-time.
+  - ✅ **Production Invariant**:
+    - Enable `track_io_timing = on` in `postgresql.conf` (negligible CPU overhead on modern hypervisors, reveals whether queries are CPU-bound or disk I/O-bound in `pg_stat_database`).
+    - Use `auto_explain` to log execution plans of slow queries automatically without modifying application code:
+      ```ini
+      # postgresql.conf
+      shared_preload_libraries = 'auto_explain'
+      auto_explain.log_min_duration = '500ms' # Log plans for queries taking >500ms
+      auto_explain.log_analyze = 'on'
+      auto_explain.log_buffers = 'on'
+      auto_explain.log_timing = 'off'         # Minimizes measurement overhead
+      auto_explain.log_format = 'json'
+      ```
+
 
 
 
