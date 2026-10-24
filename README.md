@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/TrustDec/agent-arsenal.svg?style=social)](https://github.com/TrustDec/agent-arsenal)
-[![Compatible With](https://img.shields.io/badge/Compatible%20with-Claude%20Code%20%7C%20Cursor%20%7C%20Pi%20%7C%20Codex%20%7C%20Windsurf-emerald.svg)]()
+[![Compatible With](https://img.shields.io/badge/Compatible%20with-Claude%20Code%20%7C%20Cursor%20%7C%20Windsurf%20%7C%20Copilot%20%7C%20Cline%20%7C%20Pi-emerald.svg)]()
 
 **Production-grade discipline and Apple/Vercel-level aesthetic taste for Coding Agents.**  
 *Stop AI hallucinations, breaking diffs, and ugly purple-gradient UI slop in 1 second.*
@@ -31,6 +31,8 @@
 
 Beyond core general rules, `agent-arsenal` includes plug-and-play rules for modern stacks and environments:
 
+- 🛡️ **Application Security & OWASP Defense (`rules/security-appsec.md`)**: Anti-SSRF guards with DNS pre-flight & private IP bans, absolute command injection / shell interpolation elimination, parameterized SQL invariants, path traversal immunity with canonical base checks, constant-time cryptographic comparison (`timingSafeEqual`), CSPRNG token discipline, and ReDoS prevention.
+- 🐳 **Docker & Container Production Invariants (`rules/docker-containers.md`)**: Multi-stage build isolation with minimal attack surfaces (`distroless`/`alpine`), absolute ban on running as root (`USER nonroot`), PID 1 signal forwarding (`tini`/exec form) for zero-downtime graceful shutdown, secret isolation via `--mount=type=secret`, same-layer package cache pruning, and deterministic healthchecks.
 - 🔌 **Model Context Protocol (MCP) Server Engineering (`rules/mcp-server.md`)**: Absolute ban on stdio `stdout` pollution (`console.log` / `print` breaks JSON-RPC byte framing), mandatory descriptive Zod/Pydantic schemas for LLM tool selection, bounded token payload ceilings with pagination/projections, graceful error handling (`isError: true`), and path traversal / shell injection immunity.
 - 🔷 **TypeScript & Runtime Discipline (`rules/typescript.md`)**: Total ban on `any` and unvalidated type assertions (`as T`), mandatory Zod/runtime validation at I/O boundaries, zero floating promises, non-null assertion (`!`) ban, discriminated unions, and safe Node/Bun stream & memory leak prevention.
 - 🐹 **Golang Concurrency & Systems (`rules/golang.md`)**: Context lifecycle propagation, zero goroutine leaks, `go test -race` invariants, explicit error wrapping, and HTTP response body drain requirements.
@@ -54,7 +56,7 @@ curl -fsSL https://raw.githubusercontent.com/TrustDec/agent-arsenal/main/install
 ```
 
 Or copy the files directly into your project root:
-- Copy `rules/CLAUDE.md` to `./CLAUDE.md`
+- Copy `rules/CLAUDE.md` to `./CLAUDE.md` (and `./.windsurfrules`, `./.clinerules`, `./.github/copilot-instructions.md`)
 - Copy `rules/.cursorrules` to `./.cursorrules` (and stack rules into `./.cursor/rules/*.mdc`)
 - Copy `skills/` to `./.agents/skills/`
 - Copy `templates/AGENTS.md` to `./AGENTS.md`
@@ -66,8 +68,10 @@ Or copy the files directly into your project root:
 ```text
 agent-arsenal/
 ├── rules/
-│   ├── CLAUDE.md           # Master rules for Claude Code & general harnesses
+│   ├── CLAUDE.md           # Master rules for Claude Code, Windsurf, Copilot, Cline
 │   ├── .cursorrules        # Optimized rules for Cursor IDE (root fallback)
+│   ├── security-appsec.md  # Application security, SSRF defense & OWASP invariants
+│   ├── docker-containers.md# Multi-stage builds, non-root user & container safety
 │   ├── mcp-server.md       # Model Context Protocol (MCP) server & tool discipline
 │   ├── typescript.md       # Strict typing, runtime validation & Node/Bun invariants
 │   ├── golang.md           # Concurrency, context & Go production discipline
@@ -82,7 +86,7 @@ agent-arsenal/
 │   └── code-discipline/    # Staff Engineer verification protocol
 ├── templates/
 │   └── AGENTS.md           # Multi-agent collaboration & MCP context protocols
-└── install.sh              # 1-click installer (Cursor .mdc, Claude Code, Pi, OpenCode)
+└── install.sh              # 1-click installer (Cursor, Claude Code, Windsurf, Copilot, Pi)
 ```
 
 ---

@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/TrustDec/agent-arsenal.svg?style=social)](https://github.com/TrustDec/agent-arsenal)
-[![兼容生态](https://img.shields.io/badge/兼容生态-Claude%20Code%20%7C%20Cursor%20%7C%20Pi%20%7C%20Codex%20%7C%20Windsurf-emerald.svg)]()
+[![兼容生态](https://img.shields.io/badge/兼容生态-Claude%20Code%20%7C%20Cursor%20%7C%20Windsurf%20%7C%20Copilot%20%7C%20Cline%20%7C%20Pi-emerald.svg)]()
 
 **专为 Coding Agents 打造的工业级工程防暴走规范与审美设计系统。**  
 *一秒终结 AI 瞎改文件、虚假修复、以及高饱和土味渐变 UI。*
@@ -31,6 +31,8 @@
 
 除了通用的防幻觉规则外，现已全面补充主流技术栈与现代协议规范：
 
+- 🛡️ **应用安全与 OWASP 防御规范 (`rules/security-appsec.md`)**：严打 Agent 随手写出的 SSRF 漏洞（强制 DNS 预解析与内网私有 IP/云元数据 169.254 封禁）、命令拼接与 Shell 注入绝对防御、SQL 参数化与动态列白名单校验、路径遍历根目录规范校验、密码/签名常量时间比较（`timingSafeEqual` 防时序侧信道攻击）、CSPRNG 密码学安全随机数与 ReDoS 正则灾难性回溯免疫。
+- 🐳 **Docker 与容器化生产级规范 (`rules/docker-containers.md`)**：强制多阶段构建（Multi-Stage）收敛攻击面（`distroless`/`alpine`）、生产环境严禁 root 用户运行（`USER nonroot`）、PID 1 信号转发与轻量 Init（`tini`/Exec 格式）杜绝优雅关机超时死进程、BuildKit Secret 挂载防密钥硬编码至镜像层、同层包管理器缓存清理与真实健康检查。
 - 🔌 **Model Context Protocol (MCP) 服务端与工具规范 (`rules/mcp-server.md`)**：全面严禁 stdio 传输下的 `stdout` 杂质输出（`console.log` / `print` 会彻底打崩 JSON-RPC 字节流致客户端断联）、工具入参强制配备详尽 Schema `description` 引导 Agent 决策、严格上限控制与分页防 Context 爆炸、错误统一走 `{ isError: true }` 优雅降级，以及路径遍历白名单与 Shell 注入绝对防御。
 - 🔷 **TypeScript 与 Node.js/Bun 生产级规范 (`rules/typescript.md`)**：全面严禁 `any` 与未经校验的暴力断言（`as T`）、I/O 边界强制使用 Zod/运行时 Schema 校验、根绝浮动 Promise（Floating Promise）、严禁非空断言感叹号（`!`）、强制可辨识联合类型（Discriminated Unions）消除不可能状态、防范 Node/Bun 事件监听器泄露与无上限 Map 内存暴涨。
 - 🐹 **Golang 并发与系统工程 (`rules/golang.md`)**：强制 `context.Context` 规范传递、严防 Goroutine 泄露、测试必带 `go test -race`、HTTP 响应体关闭前 Drain 排水排查、错误严格包装与生产代码零 panic。
@@ -54,7 +56,7 @@ curl -fsSL https://raw.githubusercontent.com/TrustDec/agent-arsenal/main/install
 ```
 
 或者直接按需复制到你的项目：
-- 复制 `rules/CLAUDE.md` 到你的项目根目录
+- 复制 `rules/CLAUDE.md` 到你的项目根目录（以及 `./.windsurfrules`, `./.clinerules`, `./.github/copilot-instructions.md`）
 - 复制 `rules/.cursorrules` 到你的项目根目录（或将规则作为 `.mdc` 存入 `.cursor/rules/`）
 - 复制 `skills/` 到你的 `.agents/skills/`
 - 复制 `templates/AGENTS.md` 到你的 `AGENTS.md`
@@ -66,8 +68,10 @@ curl -fsSL https://raw.githubusercontent.com/TrustDec/agent-arsenal/main/install
 ```text
 agent-arsenal/
 ├── rules/
-│   ├── CLAUDE.md           # Claude Code 与通用 Harness 主规则
+│   ├── CLAUDE.md           # Claude Code, Windsurf, Copilot, Cline 主规则
 │   ├── .cursorrules        # Cursor 经典根目录规则
+│   ├── security-appsec.md  # 应用安全、SSRF 防御与 OWASP 严苛守则
+│   ├── docker-containers.md# 容器化多阶段构建、无 root 运行与优雅停机规范
 │   ├── mcp-server.md       # Model Context Protocol (MCP) 服务端与工具生产规范
 │   ├── typescript.md       # 严格类型、运行时校验与 Node/Bun 生产准则
 │   ├── golang.md           # Go 并发安全、生命周期与系统级规范
@@ -82,7 +86,7 @@ agent-arsenal/
 │   └── code-discipline/    # Staff Engineer 外科手术式工程验证协议
 ├── templates/
 │   └── AGENTS.md           # 多 Agent 协同编排与 MCP 上下文管理规范
-└── install.sh              # 1 键极速安装脚本（支持 Cursor .mdc, Claude Code, Pi 等）
+└── install.sh              # 1 键极速安装脚本（支持 Cursor, Claude Code, Windsurf, Copilot 等）
 ```
 
 ---

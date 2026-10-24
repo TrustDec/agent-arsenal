@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Agent Arsenal - 1-Second Setup for Claude Code, Cursor, Pi & OpenCode
+# Agent Arsenal - 1-Second Setup for Claude Code, Cursor, Windsurf, Copilot, Cline, Pi & OpenCode
 set -e
 
 TARGET_DIR="${1:-.}"
@@ -33,11 +33,17 @@ echo "⚡ Installing Agent Arsenal rules into: $TARGET_DIR"
 mkdir -p "$TARGET_DIR/.agents/skills"
 mkdir -p "$TARGET_DIR/.agents/rules"
 mkdir -p "$TARGET_DIR/.cursor/rules"
+mkdir -p "$TARGET_DIR/.github"
 
 # Copy Master Harness Rules
 cp "$SOURCE_DIR/rules/CLAUDE.md" "$TARGET_DIR/CLAUDE.md"
 cp "$SOURCE_DIR/rules/.cursorrules" "$TARGET_DIR/.cursorrules"
 cp "$SOURCE_DIR/templates/AGENTS.md" "$TARGET_DIR/AGENTS.md"
+
+# Universal Harness Mirrors (Windsurf, Cline/Roo Code, GitHub Copilot)
+cp "$SOURCE_DIR/rules/CLAUDE.md" "$TARGET_DIR/.windsurfrules"
+cp "$SOURCE_DIR/rules/CLAUDE.md" "$TARGET_DIR/.clinerules"
+cp "$SOURCE_DIR/rules/CLAUDE.md" "$TARGET_DIR/.github/copilot-instructions.md"
 
 # Copy Specialized Language & Stack Rules (Modern Cursor .mdc format with globs frontmatter)
 for rule_file in "$SOURCE_DIR"/rules/*.md; do
@@ -55,11 +61,12 @@ cp -r "$SOURCE_DIR/skills/design-system" "$TARGET_DIR/.agents/skills/"
 cp -r "$SOURCE_DIR/skills/code-discipline" "$TARGET_DIR/.agents/skills/"
 
 echo "✅ Done! Injected:"
-echo "   - CLAUDE.md (Anti-hallucination & minimal surgical diffs)"
-echo "   - .cursorrules & .cursor/rules/*.mdc (Modern modular Cursor rules with glob triggers)"
+echo "   - CLAUDE.md & .cursorrules (Anti-hallucination & minimal surgical diffs)"
+echo "   - Universal mirrors: .windsurfrules, .clinerules, .github/copilot-instructions.md"
+echo "   - .cursor/rules/*.mdc (Modern modular Cursor rules with glob triggers)"
 echo "   - AGENTS.md (Multi-agent collaboration & MCP context protocols)"
-echo "   - .agents/rules/* (TypeScript, Go, SQL, Svelte 5/Kit, Vue/Nuxt, React/Next.js, Rust, Python, MCP Server)"
+echo "   - .agents/rules/* (Security/AppSec, Docker, TypeScript, Go, SQL, Svelte 5/Kit, Vue/Nuxt, React/Next.js, Rust, Python, MCP Server)"
 echo "   - .agents/skills/design-system (Apple/Vercel grade UI aesthetics)"
 echo "   - .agents/skills/code-discipline (Industrial verification discipline)"
 echo ""
-echo "Restart your Claude Code / Cursor / Pi session to activate."
+echo "Restart your Claude Code / Cursor / Windsurf / Copilot / Pi session to activate."
