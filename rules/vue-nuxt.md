@@ -85,3 +85,38 @@ alwaysApply: false
     ```
 - **Error Propagation**:
   - ❌ **NEVER throw raw strings or generic `new Error()`**: Throw `createError({ statusCode: 400, statusMessage: 'Invalid input' })` to guarantee proper HTTP status codes and JSON error formatting.
+
+## 6. Modern Component Architecture, Frontend Taste & Accessibility (a11y)
+- **Accessibility (a11y) & Keyboard Navigation**:
+  - All interactive elements (modals, dropdowns, accordions, comboboxes) MUST support keyboard navigation (Tab, Shift+Tab, Escape to close, Enter/Space to activate) and maintain visible focus rings (`focus-visible:ring-2 focus-visible:outline-none`).
+  - Use headless accessible component primitives (Radix Vue / Reka UI) rather than building un-accessible custom div-based widgets.
+  - Ensure custom icons and image buttons include descriptive `aria-label` attributes.
+- **Teleport SSR Hydration Safety**:
+  - In Nuxt SSR, teleporting directly to document body (`<Teleport to="body">`) during initial server render causes hydration mismatch errors because the server HTML has not mounted client document targets.
+  - Wrap Teleport components in `<ClientOnly>` or guard rendering with a client-mounted flag:
+    ```vue
+    <script setup lang="ts">
+    const isMounted = ref(false)
+    onMounted(() => { isMounted.value = true })
+    </script>
+
+    <template>
+      <Teleport to="body" v-if="isMounted">
+        <div class="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm" role="dialog" aria-modal="true">
+          <!-- Modal Content -->
+        </div>
+      </Teleport>
+    </template>
+    ```
+- **Image Optimization & CLS Elimination**:
+  - Always use `<NuxtImg>` or `<NuxtPicture>` for user-facing media to automatically generate modern formats (AVIF, WebP), responsive `srcset` breakpoints, and blur placeholders.
+  - Always specify explicit `width` and `height` attributes or CSS `aspect-ratio` to eradicate Cumulative Layout Shift.
+- **GPU-Accelerated Transitions**:
+  - Always use `mode="out-in"` on `<Transition>` to ensure the exiting component completely leaves before the entering component enters, preventing simultaneous dual-element layout jumps:
+    ```vue
+    <Transition name="fade" mode="out-in">
+      <component :is="activeComponent" />
+    </Transition>
+    ```
+  - Animate strictly GPU-composited properties (`transform`, `opacity`). Never animate layout dimensions (`width`, `height`, `margin`, `padding`).
+

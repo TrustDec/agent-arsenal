@@ -99,3 +99,30 @@ alwaysApply: false
     ```
 - **Store Subscriptions**:
   - If consuming legacy Svelte stores or RxJS Observables, use the auto-subscription syntax (`$store`) only in `.svelte` files, or ensure manual `.subscribe()` calls have paired `unsubscribe()` teardowns.
+
+## 6. Modern UI Architecture, Frontend Taste & Accessibility (a11y)
+- **Accessibility (a11y) & Headless Primitives**:
+  - Build interactive widgets (modals, popovers, dropdowns, command palettes) with accessible headless primitives (Bits UI / Melt UI) rather than non-standard div wrappers.
+  - Interactive elements must maintain visible keyboard focus indicators (`focus-visible:ring-2 focus-visible:outline-none`) and appropriate ARIA attributes (`aria-expanded`, `aria-haspopup`, `aria-selected`).
+- **Seamless Page Transitions via View Transitions API**:
+  - In SvelteKit, leverage native browser View Transitions inside `+layout.svelte` using `onNavigate()` for smooth, zero-jank page transitions:
+    ```svelte
+    <script lang="ts">
+      import { onNavigate } from '$app/navigation';
+
+      onNavigate((navigation) => {
+        if (!document.startViewTransition) return;
+        return new Promise((resolve) => {
+          document.startViewTransition(async () => {
+            resolve();
+            await navigation.complete;
+          });
+        });
+      });
+    </script>
+    ```
+- **Responsive Media & `@sveltejs/enhanced-img`**:
+  - Use `@sveltejs/enhanced-img` for image assets to automatically generate modern formats (AVIF, WebP), responsive `srcset` breakpoints, and intrinsic dimensions at build time, completely eliminating Cumulative Layout Shift (CLS).
+- **Snippet Composition over Prop Drilling**:
+  - Leverage Svelte 5 snippets (`{#snippet row(item)}...{/snippet}`) for template slot composition rather than passing deeply nested rendering callbacks or unwieldy configuration objects. Snippets keep view presentation declarative and close to where data lives.
+

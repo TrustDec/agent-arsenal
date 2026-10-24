@@ -141,4 +141,30 @@ alwaysApply: false
     ```
   - Purging historical partitions via `DROP TABLE audit_logs_2024_01` is an instantaneous $O(1)$ DDL operation with zero vacuum overhead or WAL spikes, completely replacing high-risk batch deletes.
 
+## 8. Index Architecture, Covering Indexes (INCLUDE) & Key Safety
+- **PostgreSQL Index-Only Scans with Covering Indexes (`INCLUDE`)**:
+  - When an endpoint frequently queries specific columns along with filter predicates, add non-key columns to the index payload using `INCLUDE`:
+    ```sql
+    -- Eliminates table heap page lookups entirely (pure Index-Only Scan):
+    CREATE INDEX idx_orders_customer_status ON orders (customer_id, status) INCLUDE (total_cents, created_at);
+    ```
+  - Unlike multi-column index keys, `INCLUDE` columns are stored only at the leaf level, reducing B-tree traversal overhead and index bloat.
+- **Sequential UUIDv7 over Random UUIDv4**:
+  - ❌ **TOTAL BAN on random UUIDv4 as primary keys on high-insert tables**: UUIDv4 inserts randomly across the entire B-Tree, shattering page locality, inducing constant B-Tree page splits, and causing massive cache thrashing in `shared_buffers`.
+  - Use time-ordered sequential UUIDs (**UUIDv7**) or BigInt/Snowflake IDs for clustered insert efficiency. UUIDv7 appends sequentially at the right edge of the index while maintaining 128-bit global uniqueness.
+- **Mandatory Foreign Key Indexing**:
+  - Relational databases (PostgreSQL/MySQL) DO NOT automatically create indexes on foreign key referencing columns.
+  - ❌ **Missing FK indexes cause full-table share locks** on the child table whenever a referenced row in the parent table is updated or deleted:
+    ```sql
+    -- MANDATORY for all foreign key relationships:
+    CREATE INDEX idx_order_items_order_id ON order_items (order_id);
+    ```
+- **Partial Unique Indexes for Soft-Delete Tables**:
+  - Standard unique constraints (`UNIQUE (email)`) break when soft-deleting users (`deleted_at IS NOT NULL`), preventing re-registration with the same email.
+  - Enforce uniqueness exclusively for active rows via partial unique indexes:
+    ```sql
+    CREATE UNIQUE INDEX uq_users_active_email ON users (email) WHERE deleted_at IS NULL;
+    ```
+
+
 

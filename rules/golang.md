@@ -163,3 +163,49 @@ alwaysApply: false
   - ❌ **NEVER use `+` or `fmt.Sprintf` in high-frequency loops**:
   - Use `strings.Builder` and pre-allocate capacity via `builder.Grow(estimatedLen)` to eradicate intermediate heap allocations and GC pressure.
 
+## 7. High-Performance Allocations, Structured Logging & Interface Safety
+- **Slice & Map Capacity Pre-Allocation**:
+  - ❌ **NEVER append in a loop to a zero-capacity slice or insert into an un-sized map** when the upper bound is known:
+    ```go
+    // ❌ Triggers multiple array re-allocations and GC copying:
+    var results []Item
+    for _, id := range ids { results = append(results, fetch(id)) }
+
+    // ✅ Pre-allocate capacity: exactly 1 allocation
+    results := make([]Item, 0, len(ids))
+    for _, id := range ids { results = append(results, fetch(id)) }
+    ```
+- **High-Performance Structured Logging (`log/slog` in Go 1.21+)**:
+  - Prefer Go 1.21+ standard library `log/slog` over third-party loggers or unformatted `log.Printf`.
+  - Use strongly-typed attribute constructors (`slog.String()`, `slog.Int64()`, `slog.Duration()`, `slog.Time()`) instead of loosely-typed key-value pairs (`slog.Any()`). Typed attributes avoid reflection and runtime heap allocations on hot execution paths:
+    ```go
+    // ✅ Zero-allocation typed attributes:
+    logger.InfoContext(ctx, "order processed successfully",
+        slog.String("order_id", orderID),
+        slog.Int64("latency_ms", elapsed.Milliseconds()),
+    )
+    ```
+- **Nil Interface Conversion Trap**:
+  - An interface containing a typed `nil` pointer is NOT `nil`:
+    ```go
+    var buf *bytes.Buffer = nil
+    var r io.Reader = buf
+    if r != nil {
+        // Evaluates to TRUE! r contains type information (*bytes.Buffer), causing nil dereference panics
+    }
+    ```
+  - Always return an untyped `nil` explicitly when returning errors or interfaces:
+    ```go
+    func getReader() io.Reader {
+        var buf *bytes.Buffer
+        if condition {
+            buf = bytes.NewBuffer(data)
+            return buf
+        }
+        return nil // ✅ Explicit untyped nil
+    }
+    ```
+- **Zero-Allocation String/Byte Conversions (Go 1.20+)**:
+  - In extreme high-throughput network or message parsing, avoid allocating a new string when converting read-only byte slices using `unsafe.String(unsafe.SliceData(b), len(b))` with strict lifetime verification. When returning data outside the caller's stack lifecycle, always copy or use `strings.Clone(s)` to prevent pinning large temporary network buffers.
+
+
