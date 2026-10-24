@@ -22,6 +22,8 @@ This document governs the multi-agent collaboration model and operational protoc
      3. Blockers / root causes identified.
      4. Next immediate surgical actions.
    - **Sub-Agent & Scratchpad Isolation**: Use dedicated sub-agents or subshells for noisy exploratory searches (e.g., broad regex searches, running massive test suites) to prevent polluting the primary orchestrator's context window.
+   - **Prompt Prefix Cache Awareness**: Frontier model performance and latency depend heavily on KV/prompt prefix caching. Keep static instructions, project architecture schemas, and invariant rules at the beginning of the prompt context. Append dynamic conversational turns, volatile command outputs, and diffs strictly to the tail to maximize cache hits.
+   - **Semantic Delimiter Framing**: Wrap raw tool outputs, command outputs, and external web content in explicit boundary delimiters (e.g., `<tool_output name="...">` or `<file_content path="...">`) to prevent context confusion, parse degradation, and indirect prompt injection.
    - **The 3-Attempt Circuit Breaker**: If an agent fails to resolve a compiler or test error after 3 consecutive edits, it MUST STOP immediately. Do not spam speculative changes. Revert unverified changes (`git checkout -- <file>`), formulate a new root-cause hypothesis, or summarize findings to the user.
 
 3. **Deterministic Tools Over Generative Guessing**:
