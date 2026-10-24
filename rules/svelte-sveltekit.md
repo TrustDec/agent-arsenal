@@ -498,11 +498,86 @@ alwaysApply: false
     </form>
     ```
 
+---
 
+## 9. Svelte 5 Class Stores, Snippet Composition (`{@render}`) & Streaming Promises
+- **Universal Svelte 5 State Classes in `.svelte.ts`**:
+  - ❌ **The Svelte 4 Writable Store Boilerplate Trap**: Using `writable()`, `$derived` wrappers, and manual subscription cleanup in shared utility modules creates verbose boilerplate and memory leak risks.
+  - ✅ **Production Invariant**: Encapsulate complex business state in TypeScript classes with `$state` and getters inside `.svelte.ts` files:
+    ```ts
+    // src/lib/stores/cart.svelte.ts
+    export class CartState {
+      items = $state<{ id: string; price: number; quantity: number }[]>([]);
 
+      total = $derived(
+        this.items.reduce((sum, item) => sum + item.price * item.quantity, 0)
+      );
 
+      addItem(id: string, price: number) {
+        const existing = this.items.find((i) => i.id === id);
+        if (existing) {
+          existing.quantity += 1;
+        } else {
+          this.items.push({ id, price, quantity: 1 });
+        }
+      }
+    }
+    ```
+- **Type-Safe Snippets & Composition (`{#snippet}` and `{@render}`)**:
+  - ❌ **The Deprecated Slot Syntax**: In Svelte 5, `<slot>` and `let:prop` are deprecated. Relying on legacy slots causes deprecation warnings and prevents fine-grained prop typing.
+  - ✅ **Production Invariant**: Use `{#snippet}` and `{@render}` for flexible, type-safe template composition:
+    ```svelte
+    <script lang="ts">
+      import type { Snippet } from 'svelte';
 
+      interface Props {
+        header: Snippet<[{ title: string }]>;
+        children: Snippet;
+      }
 
+      let { header, children }: Props = $props();
+    </script>
 
+    <div class="card">
+      <header>
+        {@render header({ title: 'Workspace Dashboard' })}
+      </header>
+      <main>
+        {@render children()}
+      </main>
+    </div>
+    ```
+- **SvelteKit Deferred Streaming with Server Promises (`{#await}`)**:
+  - ❌ **The Slow SSR TTFB Bottleneck**: Awaiting slow secondary API queries (e.g. recommendations, analytics, heavy joins) in `+page.server.ts` blocks the entire server response, inflating Time to First Byte (TTFB) to multiple seconds.
+  - ✅ **Production Invariant**: Return un-awaited promises from `load` functions to stream fast HTML immediately, rendering skeletons with `{#await}` while the slow data streams over HTTP:
+    ```ts
+    // src/routes/dashboard/+page.server.ts
+    export const load = async ({ fetch }) => {
+      // Fast critical data (awaited):
+      const user = await fetch('/api/user').then((r) => r.json());
 
+      // Slow non-critical data (streamed un-awaited promise):
+      const slowStatsPromise = fetch('/api/heavy-stats').then((r) => r.json());
 
+      return {
+        user,
+        streamed: { stats: slowStatsPromise },
+      };
+    };
+    ```
+    ```svelte
+    <!-- src/routes/dashboard/+page.svelte -->
+    <script lang="ts">
+      let { data } = $props();
+    </script>
+
+    <h1>Welcome, {data.user.name}</h1>
+
+    {#await data.streamed.stats}
+      <div class="skeleton-loader">Loading analytics...</div>
+    {:then stats}
+      <div class="stats-panel">{stats.revenueToday}</div>
+    {:catch error}
+      <p class="error">Failed to load statistics.</p>
+    {/await}
+    ```

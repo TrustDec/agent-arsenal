@@ -663,12 +663,57 @@ alwaysApply: false
     }
     ```
 
+---
 
+## 14. Non-Blocking Metric Emission, Struct Memory Packing & Worker Pool Resilience
+- **Non-Blocking Metric / Telemetry Emission with `select default`**:
+  - ❌ **The Blocking Telemetry Backpressure Trap**: Sending metrics, audit events, or analytics pings over a synchronous or buffered channel using `ch <- event` blocks critical user transactions whenever the downstream collector or disk is momentarily saturated.
+  - ✅ **Production Invariant**: Always use a non-blocking `select` with a `default` case and an atomic dropped-event counter:
+    ```go
+    var droppedMetrics uint64
 
-
-
-
-
-
-
-
+    func RecordMetricNonBlocking(ch chan<- MetricEvent, evt MetricEvent) {
+        select {
+        case ch <- evt:
+            // Successfully queued
+        default:
+            // Channel saturated; drop event rather than blocking caller:
+            atomic.AddUint64(&droppedMetrics, 1)
+        }
+    }
+    ```
+- **Struct Memory Alignment & Padding Invariant (`fieldalignment`)**:
+  - ❌ **The Unaligned Padding Waste**: On 64-bit architectures, fields are aligned to 8-byte boundaries. Interleaving small types (`bool`, `int16`) between pointers or `int64` introduces 7 bytes of dead padding per field, inflating struct size and reducing CPU L1/L2 cache efficiency:
+    ```go
+    // ❌ Inefficient layout: 32 bytes (11 bytes of dead padding)
+    type BadStruct struct {
+        flagA bool   // 1 byte + 7 bytes padding
+        id    int64  // 8 bytes
+        flagB bool   // 1 byte + 7 bytes padding
+        count int64  // 8 bytes
+    }
+    ```
+  - ✅ **Production Invariant**: Order struct fields in descending order of size (8-byte, 4-byte, 2-byte, 1-byte) or audit struct packing with `fieldalignment`:
+    ```go
+    // ✅ Optimal layout: 24 bytes (0 padding bytes wasted)
+    type GoodStruct struct {
+        id    int64  // 8 bytes
+        count int64  // 8 bytes
+        flagA bool   // 1 byte
+        flagB bool   // 1 byte + 6 bytes trailing alignment
+    }
+    ```
+- **Worker Pool Panic Boundary & Resilient Task Execution**:
+  - ❌ **The Unhandled Worker Panic Process Crash**: In a concurrent worker pool (`errgroup` or custom workers), an unexpected nil pointer or out-of-bounds slice access in a single incoming job panics the goroutine and crashes the entire Go application.
+  - ✅ **Production Invariant**: Encapsulate individual task execution in an isolated recovery boundary:
+    ```go
+    func SafeExecuteJob(job Job) (err error) {
+        defer func() {
+            if r := recover(); r != nil {
+                slog.Error("worker task panic recovered", "panic", r, "stack", string(debug.Stack()))
+                err = fmt.Errorf("task panicked: %v", r)
+            }
+        }()
+        return job.Execute()
+    }
+    ```

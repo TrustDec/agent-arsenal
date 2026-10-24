@@ -466,13 +466,23 @@ alwaysApply: false
       ORDER BY xid_age DESC;
       ```
 
+---
 
+## 15. Zero-Downtime Enum Evolution, Safe `NOT NULL` Defaults & DDL Queue Starvation Defense
+- **Zero-Downtime PostgreSQL Enum Evolution**:
+  - ❌ **The In-Transaction `ALTER TYPE ADD VALUE` Trap**: In PostgreSQL, `ALTER TYPE ... ADD VALUE` cannot be committed inside an active multi-statement transaction block if the new enum value is used within that same transaction, triggering `ERROR: ALTER TYPE ... ADD VALUE cannot be executed from a function or multi-command string`.
+  - ✅ **Production Invariant**: Execute `ALTER TYPE ... ADD VALUE IF NOT EXISTS 'new_val';` as an isolated, standalone autocommit statement before running application migrations that insert rows referencing the new enum value.
+- **Safe `NOT NULL` Columns with Defaults**:
+  - ❌ **The Volatile Default Full-Table Rewrite Freeze**: In PostgreSQL 11+, adding a column with a constant default (`DEFAULT 0` or `DEFAULT 'pending'`) is metadata-only ($O(1)$) and avoids table rewrites. However, using a volatile default function (e.g. `DEFAULT clock_timestamp()`, `DEFAULT gen_random_uuid()` without immutable wrapper) forces an immediate full table rewrite under an `ACCESS EXCLUSIVE` table lock, halting all client queries.
+  - ✅ **Production Invariant**: Verify that defaults are strictly compile-time immutable constants, or add the column as nullable first, populate via chunked batches, and then attach `CHECK (col IS NOT NULL) NOT VALID` followed by `VALIDATE CONSTRAINT`.
+- **Lock Queue Starvation & Explicit DDL `lock_timeout` Guard**:
+  - ❌ **The Cascading Connection Saturation Outage**: When a DDL migration requests `ACCESS EXCLUSIVE` lock on a busy table, PostgreSQL puts the DDL statement in the lock wait queue. ALL subsequent incoming `SELECT`, `INSERT`, and `UPDATE` queries on that table queue up BEHIND the DDL lock request. In seconds, client connection pools saturate and the entire application crashes.
+  - ✅ **Production Invariant**: ALWAYS configure explicit `lock_timeout` before executing DDL migrations:
+    ```sql
+    -- Abort DDL if table lock cannot be acquired within 2 seconds:
+    SET lock_timeout = '2s';
+    SET statement_timeout = '10s';
 
-
-
-
-
-
-
-
-
+    ALTER TABLE orders ADD COLUMN notes TEXT;
+    ```
+    If another long-running query is holding a lock, the migration fails immediately without cascading into a site-wide queuing outage.

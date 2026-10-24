@@ -397,11 +397,65 @@ alwaysApply: false
     });
     ```
 
+---
 
+## 9. Modern `defineModel` Ergonomics, Shallow Ref Performance & SSR Browser Isolation
+- **Modern Declarative Two-Way Binding with `defineModel` (Vue 3.4+)**:
+  - ❌ **The Verbose Prop/Emit Boilerplate**: Writing manual `props: ['modelValue']` and `emit('update:modelValue', val)` boilerplate creates synchronization bugs, missing type definitions, and bloated component code.
+  - ✅ **Production Invariant**: Use Vue 3.4+ `defineModel()` for fully type-safe, bidirectional reactive models:
+    ```vue
+    <script setup lang="ts">
+    // Two-way bound model with modifiers and default value:
+    const model = defineModel<string>({ default: '', required: false });
+    const isVisible = defineModel<boolean>('visible', { default: false });
+    </script>
 
+    <template>
+      <input v-model="model" type="text" />
+      <button @click="isVisible = !isVisible">Toggle</button>
+    </template>
+    ```
+- **`shallowRef` & `markRaw` for Massive Datasets & Heavy Third-Party Instances**:
+  - ❌ **The Deep Reactive Proxy Memory Bloat**: Wrapping large collections (e.g. 50,000 data table rows, GeoJSON features) or complex third-party class instances (Monaco Editor, Chart.js, Three.js scenes) in standard `ref()` or `reactive()` forces Vue to recursively proxy every nested property, causing multi-megabyte heap allocation spikes and sluggish frame rates.
+  - ✅ **Production Invariant**: Use `shallowRef()` for large immutable collections and `markRaw()` for non-reactive third-party objects:
+    ```vue
+    <script setup lang="ts">
+    import { shallowRef, markRaw, onMounted } from 'vue';
+    import * as monaco from 'monaco-editor';
 
+    // Shallow ref tracks only reference replacement (.value = newArray):
+    const largeDataset = shallowRef<DataPoint[]>([]);
 
+    let editorInstance: monaco.editor.IStandaloneCodeEditor | null = null;
 
+    onMounted(() => {
+      const container = document.getElementById('editor')!;
+      // Mark as raw to prevent Vue reactivity proxying:
+      editorInstance = markRaw(
+        monaco.editor.create(container, { value: '// code', language: 'typescript' })
+      );
+    });
+    </script>
+    ```
+- **SSR Browser API Isolation & `import.meta.client` Guards**:
+  - ❌ **The SSR Server Crash on `window` / `localStorage`**: Referencing `window`, `document`, `navigator`, or `localStorage` directly in `<script setup>` top-level scope crashes the Node/Nitro SSR server with `ReferenceError: window is not defined` during SSR page rendering.
+  - ✅ **Production Invariant**: Gate browser-only APIs behind `import.meta.client` or defer execution to `onMounted()`:
+    ```vue
+    <script setup lang="ts">
+    import { ref, onMounted } from 'vue';
 
+    const theme = ref<string>('light');
 
+    // Safe: onMounted only executes on client:
+    onMounted(() => {
+      theme.value = localStorage.getItem('user-theme') ?? 'light';
+    });
 
+    function saveTheme(newTheme: string) {
+      theme.value = newTheme;
+      if (import.meta.client) {
+        localStorage.setItem('user-theme', newTheme);
+      }
+    }
+    </script>
+    ```
