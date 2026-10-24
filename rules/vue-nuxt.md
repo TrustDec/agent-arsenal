@@ -120,3 +120,33 @@ alwaysApply: false
     ```
   - Animate strictly GPU-composited properties (`transform`, `opacity`). Never animate layout dimensions (`width`, `height`, `margin`, `padding`).
 
+## 7. Frontend Taste, Optimistic Updates & Reactive Performance
+- **Optimistic UI Updates with Rollback**:
+  - For high-frequency interactive actions (likes, toggles, task completion), update the local reactive state immediately before the network request resolves, with explicit rollback on error:
+    ```ts
+    async function toggleFavorite(itemId: string) {
+      const item = items.value.find(i => i.id === itemId)
+      if (!item) return
+      const previousState = item.isFavorite
+      item.isFavorite = !previousState // Immediate optimistic feedback
+
+      try {
+        await $fetch(`/api/items/${itemId}/favorite`, { method: 'POST' })
+      } catch (err) {
+        item.isFavorite = previousState // Rollback on failure
+        toast.error('Failed to update favorite status')
+      }
+    }
+    ```
+- **Micro-Interactions & Hover Delay Ergonomics**:
+  - ❌ **NEVER trigger tooltips or popovers with zero delay**: Instant hover triggers create visual clutter as the user sweeps their cursor across the viewport.
+  - Implement a 150–200ms open delay on tooltips and 0ms close delay (`delayDuration: 150` in Radix Vue / Reka UI).
+  - Use tactile active states (`active:scale-[0.98] transition-transform duration-75`) on buttons to give physical feedback upon click.
+- **`shallowRef` for Large Data Grids & Virtualized Lists**:
+  - When rendering data tables or infinite scroll feeds containing hundreds or thousands of rows, wrap the collection in `shallowRef([])`.
+  - Vue's deep reactivity creates a reactive Proxy for every single row and cell, consuming massive heap memory and stalling scroll performance. Replace the array reference wholesale when data updates: `items.value = newItems`.
+- **Accessible Focus Trap & Focus Restoration**:
+  - Modal dialogues and slide-over drawers MUST trap keyboard focus within the dialog container while open.
+  - Upon closing, focus MUST be returned programmatically to the element that triggered the dialog, preserving keyboard navigation flow for screen readers and power users.
+
+

@@ -166,5 +166,36 @@ alwaysApply: false
     CREATE UNIQUE INDEX uq_users_active_email ON users (email) WHERE deleted_at IS NULL;
     ```
 
+## 9. DDL Lock Timeouts, Advisory Locks & Connection Pool Mathematics
+- **Mandatory DDL Lock & Statement Timeouts**:
+  - ❌ **NEVER run DDL migrations without setting `lock_timeout` and `statement_timeout` first**:
+    ```sql
+    -- MANDATORY migration transaction wrapper:
+    BEGIN;
+    SET LOCAL lock_timeout = '2s';
+    SET LOCAL statement_timeout = '5s';
+
+    ALTER TABLE users ADD COLUMN is_verified boolean DEFAULT false;
+    COMMIT;
+    ```
+  - Without `lock_timeout`, an `ALTER TABLE` requiring an `ACCESS EXCLUSIVE` lock will wait indefinitely behind an active long query. All subsequent reads/writes queue up behind the pending lock, instantly exhausting the entire database connection pool and causing a cascading outage.
+- **PostgreSQL Advisory Locks for Single-Worker Coordination**:
+  - For coordinating distributed schema migrations or singleton background jobs across multiple application instances, use transaction-level advisory locks:
+    ```sql
+    -- Returns true immediately if lock is acquired; false if another worker holds it:
+    SELECT pg_try_advisory_xact_lock(hashtext('migration_lock_schema_v42'));
+    ```
+  - `pg_try_advisory_xact_lock` releases automatically when the transaction completes (commit or rollback), eliminating orphaned locks even if the worker pod crashes.
+- **Connection Pool Sizing Mathematics (Little's Law)**:
+  - ❌ **NEVER set application connection pools to hundreds of connections**:
+    - PostgreSQL processes are OS processes, not lightweight threads. 500 connections competing for CPU cores degrade throughput via catastrophic context-switching overhead and disk I/O thrashing.
+  - Sizing baseline:
+    $$\text{Connections} \approx (2 \times \text{CPU Cores}) + \text{Disk Spindles/IOPS Factor}$$
+    For an 8-core database server, a pool size of 20–30 connections per service handles peak load far faster and more reliably than 200 unmanaged connections.
+- **Query Plan Deep Inspection (`EXPLAIN (ANALYZE, BUFFERS)`)**:
+  - Always profile queries using `EXPLAIN (ANALYZE, BUFFERS, VERBOSE)` rather than raw wall-clock duration.
+  - Inspect `Buffers: shared hit=... read=... dirtied=...`. A query that appears fast on warm cache (`shared hit=50000`) but reads 50,000 pages will grind the database to a halt when cache evictions occur or cold storage reads are required.
+
+
 
 

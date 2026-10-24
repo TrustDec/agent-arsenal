@@ -208,4 +208,43 @@ alwaysApply: false
 - **Zero-Allocation String/Byte Conversions (Go 1.20+)**:
   - In extreme high-throughput network or message parsing, avoid allocating a new string when converting read-only byte slices using `unsafe.String(unsafe.SliceData(b), len(b))` with strict lifetime verification. When returning data outside the caller's stack lifecycle, always copy or use `strings.Clone(s)` to prevent pinning large temporary network buffers.
 
+## 8. Singleflight Stampede Suppression, Context Loop Checks & Profiling Security
+- **Singleflight Duplicate Call Suppression**:
+  - In high-throughput services, simultaneous cache misses for the same key trigger a thundering herd on primary databases.
+  - Use `golang.org/x/sync/singleflight` to coalesce duplicate in-flight requests into a single execution:
+    ```go
+    var requestGroup singleflight.Group
+
+    func FetchUserData(ctx context.Context, userID string) (*UserData, error) {
+        val, err, _ := requestGroup.Do(userID, func() (any, error) {
+            return queryDatabaseForUser(ctx, userID)
+        })
+        if err != nil {
+            return nil, err
+        }
+        return val.(*UserData), nil
+    }
+    ```
+- **Context Cancellation Checks in Iterative Batch Loops**:
+  - In long-running batch processors, ETL loops, or queue consumers, ALWAYS check `ctx.Err()` at the beginning of each iteration:
+    ```go
+    for _, item := range batch {
+        if err := ctx.Err(); err != nil {
+            return fmt.Errorf("batch execution aborted: %w", err)
+        }
+        if err := process(ctx, item); err != nil {
+            return err
+        }
+    }
+    ```
+  - Without this check, a canceled request continues burning CPU and database I/O across thousands of remaining items.
+- **Pprof Endpoint Security Invariant**:
+  - ❌ **NEVER register `net/http/pprof` directly on the public default HTTP mux (`http.DefaultServeMux`)**:
+    - Importing `_ "net/http/pprof"` automatically registers profiling endpoints (`/debug/pprof/`) on `http.DefaultServeMux`, exposing heap dumps, goroutine stack traces, and environment tokens to the internet.
+  - Expose pprof exclusively on an unexposed, internal loopback listener (e.g. `127.0.0.1:6060` or Kubernetes internal management port) protected by mTLS or authentication.
+- **Escape Analysis & Stack vs Heap Semantics**:
+  - Avoid returning pointers for small structs ($\le 64$ bytes with no internal pointers, e.g. `Point{X, Y int}`). Returning pointers forces stack escape to the heap, generating needless GC sweep pressure.
+  - Run `go build -gcflags="-m"` during performance optimization to prove variables stay on the stack.
+
+
 

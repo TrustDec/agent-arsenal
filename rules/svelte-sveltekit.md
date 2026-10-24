@@ -126,3 +126,52 @@ alwaysApply: false
 - **Snippet Composition over Prop Drilling**:
   - Leverage Svelte 5 snippets (`{#snippet row(item)}...{/snippet}`) for template slot composition rather than passing deeply nested rendering callbacks or unwieldy configuration objects. Snippets keep view presentation declarative and close to where data lives.
 
+## 7. Frontend Taste, Optimistic Mutations & Reactive Invariants
+- **Untracked Reads with `untrack()`**:
+  - When you need to read a reactive value inside an `$effect()` or `$derived()` WITHOUT subscribing to its changes, use `untrack()`:
+    ```svelte
+    <script lang="ts">
+      import { untrack } from 'svelte';
+      let page = $state(1);
+      let query = $state('');
+
+      $effect(() => {
+        // Re-runs only when `query` changes, reading the current `page` without subscribing:
+        console.log(`Search for: ${query} on page:`, untrack(() => page));
+      });
+    </script>
+    ```
+- **Optimistic UI Mutations in SvelteKit Form Actions**:
+  - With SvelteKit's `use:enhance`, update local list or card state instantly, then reconcile or rollback if the server responds with a validation or transaction error:
+    ```svelte
+    <form method="POST" action="?/deleteItem" use:enhance={() => {
+      const removedIndex = items.findIndex(i => i.id === targetId);
+      const [removedItem] = items.splice(removedIndex, 1); // Optimistic immediate deletion
+
+      return async ({ result, update }) => {
+        if (result.type === 'failure' || result.type === 'error') {
+          items.splice(removedIndex, 0, removedItem); // Rollback on failure
+        }
+        await update({ reset: false });
+      };
+    }}>
+      <button type="submit">Delete</button>
+    </form>
+    ```
+- **Physics-Based Transitions (`svelte/motion`) vs Mechanical Easing**:
+  - For drag, pan, or floating indicators (active tab indicator pill), use `spring()` from `svelte/motion` rather than rigid CSS linear transitions. Natural damping and stiffness produce an organic, Apple/Vercel-tier tactile feel.
+- **Focus Restoration & Keyboard Dialog Ergonomics**:
+  - When dismissing modals, popovers, or sheets via `Escape` or backdrop clicks, programmatically restore keyboard focus to the triggering element:
+    ```svelte
+    <script lang="ts">
+      let triggerButton: HTMLButtonElement | null = null;
+      let isOpen = $state(false);
+
+      function closeModal() {
+        isOpen = false;
+        triggerButton?.focus();
+      }
+    </script>
+    ```
+
+
