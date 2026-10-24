@@ -376,6 +376,41 @@ alwaysApply: false
   - ✅ **Production Security Invariant**:
     - All database queries, secret token operations, and mutations MUST be defined strictly in `+page.server.ts` or `+server.ts`.
     - Universal `+page.ts` should only be used when fetching publicly cacheable data or executing client-side redirects.
+- **Streaming Non-Blocking Deferred Promises in SvelteKit `load`**:
+  - ❌ **The Waterfall TTFB Bottleneck**: Awaiting slow third-party analytics or recommendation calls directly in `load` blocks the HTTP response from starting, causing high Time To First Byte (TTFB).
+  - ✅ **Production Invariant**: Return the unresolved promise directly without `await` to let SvelteKit stream the page shell immediately, resolving data client-side with `{#await}`:
+    ```ts
+    // src/routes/dashboard/+page.server.ts
+    export const load: PageServerLoad = async ({ locals }) => {
+      return {
+        // Critical data awaited immediately for fast SSR shell:
+        user: await locals.auth.getUser(),
+        // Non-critical data streamed asynchronously via unawaited promise:
+        recommendations: fetchPersonalizedRecommendations(locals.userId)
+      };
+    };
+    ```
+    ```svelte
+    <!-- src/routes/dashboard/+page.svelte -->
+    <script lang="ts">
+      let { data } = $props();
+    </script>
+
+    <h1>Welcome, {data.user.name}</h1>
+
+    {#await data.recommendations}
+      <div class="skeleton-loader">Loading recommendations...</div>
+    {:then items}
+      <ul>
+        {#each items as item}
+          <li>{item.title}</li>
+        {/each}
+      </ul>
+    {:catch error}
+      <p class="error">Failed to load recommendations.</p>
+    {/await}
+    ```
+
 
 
 

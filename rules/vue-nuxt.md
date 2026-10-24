@@ -294,6 +294,29 @@ alwaysApply: false
   - ✅ **Production Invariant**:
     - Use Nuxt/Vue `useId()` for deterministic, accessible HTML element IDs.
     - Wrap client-specific dynamic widgets (e.g. local time displays or browser viewport banners) in `<ClientOnly>` with a lightweight skeleton placeholder.
+- **Server Endpoint Caching & Multi-Tenant Isolation with `defineCachedEventHandler` (Nitro / Nuxt 3)**:
+  - ❌ **The Multi-Tenant Shared Cache Data Leak**: Wrapping an endpoint in `defineCachedEventHandler` without a customized `getKey` function causes Nitro to key caches strictly by route path. If User A requests `/api/dashboard`, User B will receive User A's cached private data.
+  - ✅ **Production Invariant**:
+    - Restrict `defineCachedEventHandler` strictly to public, unauthenticated data or supply explicit cache keys incorporating tenant context:
+    ```ts
+    // server/api/catalog.get.ts
+    export default defineCachedEventHandler(
+      async (event) => {
+        const query = getQuery(event);
+        return await fetchPublicProducts(query.category as string);
+      },
+      {
+        maxAge: 60 * 5, // Cache for 5 minutes
+        swr: true,      // Stale-While-Revalidate background refresh
+        name: 'public-catalog',
+        getKey: (event) => {
+          const query = getQuery(event);
+          return `cat:${query.category || 'all'}`;
+        }
+      }
+    );
+    ```
+
 
 
 

@@ -370,6 +370,49 @@ alwaysApply: false
     3. Backfill historical rows in chunks (`UPDATE users SET mobile = phone WHERE mobile IS NULL AND id BETWEEN ...`).
     4. Deploy application code reading and writing strictly to `mobile`.
     5. Drop the old column `phone` in a subsequent release after all old pods have terminated.
+- **Zero-Downtime `NOT NULL` Addition on Existing Large Tables**:
+  - In PostgreSQL 11+, adding a *new* column with a non-volatile default and `NOT NULL` (`ALTER TABLE users ADD COLUMN is_verified boolean DEFAULT false NOT NULL;`) is instantaneous because defaults are recorded in system catalogs without rewriting table rows.
+  - ❌ **The Existing Column Lock Trap**: Running `ALTER TABLE orders ALTER COLUMN user_id SET NOT NULL;` on a pre-existing column acquires an `ACCESS EXCLUSIVE` lock and forces a full sequential table scan to check for nulls, freezing live traffic.
+  - ✅ **Safe 3-Step Production Invariant**:
+    ```sql
+    -- Step 1: Add a NOT VALID check constraint (instant metadata update, no full scan)
+    ALTER TABLE orders
+      ADD CONSTRAINT orders_user_id_not_null
+      CHECK (user_id IS NOT NULL) NOT VALID;
+
+    -- Step 2: Validate existing data concurrently in background (does NOT block reads/writes)
+    ALTER TABLE orders
+      VALIDATE CONSTRAINT orders_user_id_not_null;
+
+    -- Step 3: Set column NOT NULL (PostgreSQL 12+ proves it via constraint instantly without table scan)
+    ALTER TABLE orders
+      ALTER COLUMN user_id SET NOT NULL;
+
+    -- Step 4: Drop redundant check constraint
+    ALTER TABLE orders
+      DROP CONSTRAINT orders_user_id_not_null;
+    ```
+- **High-Throughput Task Queues with `FOR UPDATE SKIP LOCKED`**:
+  - ❌ **The Worker Serialization Trap**: Using `SELECT ... FOR UPDATE LIMIT 1` causes all worker threads to wait on the exact same locked row, destroying horizontal concurrency.
+  - ✅ **Production Invariant**: Use `FOR UPDATE SKIP LOCKED` to allow worker processes to instantly claim distinct pending jobs in a single atomic CTE:
+    ```sql
+    WITH next_job AS (
+      SELECT id
+      FROM task_queue
+      WHERE status = 'pending' AND scheduled_at <= NOW()
+      ORDER BY priority DESC, id ASC
+      FOR UPDATE SKIP LOCKED
+      LIMIT 1
+    )
+    UPDATE task_queue
+    SET status = 'processing',
+        locked_by = 'worker_a',
+        started_at = NOW()
+    FROM next_job
+    WHERE task_queue.id = next_job.id
+    RETURNING task_queue.*;
+    ```
+
 
 
 

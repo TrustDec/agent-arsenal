@@ -531,6 +531,52 @@ alwaysApply: false
         Body:   pr,
     })
     ```
+- **Deadlock & Leak Defense in Channel Send Handoffs**:
+  - ❌ **The Abandoned Receiver Goroutine Leak Trap**: A producer spawns a background goroutine to send results across a channel `ch <- result`. If the consumer times out (`ctx.Done()`) or returns early due to an error before reading from `ch`, the producer blocks forever on `ch <- result`, leaking the goroutine, its stack memory, and all referenced heap objects.
+  - ✅ **Production Invariant**: Always guard channel sends with `select` against the enclosing context or lifecycle signal:
+    ```go
+    func produceAsync(ctx context.Context, ch chan<- Result, val Input) {
+        go func() {
+            res := compute(val)
+            select {
+            case ch <- res:
+                // Successfully handed off to receiver
+            case <-ctx.Done():
+                // Consumer abandoned or timed out; prevent permanent goroutine leak
+                slog.Warn("producer abandoned handoff due to context cancellation", "err", ctx.Err())
+            }
+        }()
+    }
+    ```
+- **Lock-Free Configuration & Routing Swaps with `atomic.Pointer[T]` (Go 1.19+)**:
+  - ❌ **RWMutex Reader Contention on Microsecond Hot Paths**: Protecting a frequently accessed routing table or configuration struct with `sync.RWMutex` causes CPU cache-line bouncing across hundreds of concurrent goroutines calling `RLock()`/`RUnlock()`.
+  - ✅ **Production Invariant**: Use `atomic.Pointer[T]` for zero-lock, pointer-swapping atomic updates:
+    ```go
+    type RoutingTable struct {
+        routes map[string]http.Handler
+    }
+
+    type Router struct {
+        table atomic.Pointer[RoutingTable]
+    }
+
+    func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+        // Zero-copy, lock-free pointer dereference:
+        current := r.table.Load()
+        if handler, ok := current.routes[req.URL.Path]; ok {
+            handler.ServeHTTP(w, req)
+            return
+        }
+        http.NotFound(w, req)
+    }
+
+    func (r *Router) ReloadRoutes(newRoutes map[string]http.Handler) {
+        // Prepare new immutable instance and swap atomically:
+        next := &RoutingTable{routes: newRoutes}
+        r.table.Store(next)
+    }
+    ```
+
 
 
 
