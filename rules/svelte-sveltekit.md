@@ -325,6 +325,59 @@ alwaysApply: false
     </form>
     ```
 
+---
+
+## 8. Effect Timing (`$effect.pre`), `untrack()` Dependency Isolation & Server Boundaries
+- **DOM Pre-Paint Measurements with `$effect.pre`**:
+  - `$effect()` executes *after* the DOM has been updated and painted. If you need to read or adjust DOM geometry *before* the browser paints (e.g., preserving scroll positions when prepending messages to a chat thread):
+    ```svelte
+    <script lang="ts">
+      let messages = $state<string[]>([]);
+      let container: HTMLElement;
+      let previousScrollHeight = 0;
+
+      $effect.pre(() => {
+        // Access messages to create dependency
+        messages;
+        if (container) {
+          previousScrollHeight = container.scrollHeight;
+        }
+      });
+
+      $effect(() => {
+        // After DOM updates, adjust scroll to prevent jump
+        if (container) {
+          container.scrollTop += container.scrollHeight - previousScrollHeight;
+        }
+      });
+    </script>
+    ```
+- **Intentional Dependency Exclusion with `untrack()`**:
+  - When an effect needs to read a reactive value without re-triggering whenever that specific value changes, wrap the read in `untrack()`:
+    ```svelte
+    <script lang="ts">
+      import { untrack } from 'svelte';
+
+      let { activeTab, telemetryToken }: { activeTab: string; telemetryToken: string } = $props();
+
+      $effect(() => {
+        // Effect tracks changes to activeTab:
+        const currentTab = activeTab;
+
+        // Reads telemetryToken WITHOUT re-running this effect when token refreshes:
+        const token = untrack(() => telemetryToken);
+
+        sendAnalytics(currentTab, token);
+      });
+    </script>
+    ```
+- **SvelteKit Server Security Boundaries (`+page.server.ts` vs `+page.ts`)**:
+  - ❌ **The Universal Load Secret Leak**: Placing database credentials, ORM queries (`db.query...`), or third-party secret API keys in `+page.ts` leaks private code and tokens into the browser client bundle because universal `load` runs on both server and client.
+  - ✅ **Production Security Invariant**:
+    - All database queries, secret token operations, and mutations MUST be defined strictly in `+page.server.ts` or `+server.ts`.
+    - Universal `+page.ts` should only be used when fetching publicly cacheable data or executing client-side redirects.
+
+
 
 
 

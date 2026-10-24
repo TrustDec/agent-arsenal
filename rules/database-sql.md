@@ -321,6 +321,57 @@ alwaysApply: false
     - When hundreds of microservice instances or serverless workers connect, insert PgBouncer in `pool_mode = transaction`.
     - Invariant: In transaction pooling, session-level constructs are prohibited: never use `PREPARE` without PgBouncer prepared statement support, never use `LISTEN`/`NOTIFY`, and ensure connections clean state between transactions.
 
+---
+
+## 14. Declarative Table Partitioning, Safe Constraint Addition (`NOT VALID`) & Zero-Downtime Column Evolution
+- **Declarative Range Partitioning for High-Volume Tables**:
+  - Tables with millions of time-series records, audit logs, or ledger events degrade B-tree indexes and cause huge autovacuum penalties.
+  - ✅ **Declarative Range Partitioning Invariant**:
+    ```sql
+    -- Parent partition table
+    CREATE TABLE audit_logs (
+        id bigint GENERATED ALWAYS AS IDENTITY,
+        event_name text NOT NULL,
+        created_at timestamptz NOT NULL,
+        payload jsonb
+    ) PARTITION BY RANGE (created_at);
+
+    -- Child partitions per month
+    CREATE TABLE audit_logs_2025_01 PARTITION OF audit_logs
+        FOR VALUES FROM ('2025-01-01 00:00:00+00') TO ('2025-02-01 00:00:00+00');
+    CREATE TABLE audit_logs_2025_02 PARTITION OF audit_logs
+        FOR VALUES FROM ('2025-02-01 00:00:00+00') TO ('2025-03-01 00:00:00+00');
+    ```
+  - **Instant Retention Purging**: Never run `DELETE FROM audit_logs WHERE created_at < NOW() - INTERVAL '1 year'`. It generates massive WAL churn, dead tuple bloat, and table locks. Simply drop or detach the old partition instantly:
+    ```sql
+    ALTER TABLE audit_logs DETACH PARTITION audit_logs_2024_01 CONCURRENTLY;
+    DROP TABLE audit_logs_2024_01;
+    ```
+  - **Partition Pruning**: Ensure queries filter by the partition key (`created_at`) so PostgreSQL scans only the relevant partition, bypassing 95%+ of table data.
+- **Two-Step Zero-Downtime Foreign Key & Check Constraints (`NOT VALID` -> `VALIDATE CONSTRAINT`)**:
+  - ❌ **The Direct Constraint Addition Outage**: Adding a foreign key directly on a 10M row table (`ALTER TABLE orders ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id);`) acquires an `ACCESS EXCLUSIVE` lock while sequentially scanning the entire table. It blocks ALL queries and causes connection pool starvation.
+  - ✅ **The Two-Step Production Invariant**:
+    ```sql
+    -- Step 1: Add constraint with NOT VALID (instant; acquires brief lock and validates new rows only)
+    ALTER TABLE orders
+      ADD CONSTRAINT fk_orders_user_id
+      FOREIGN KEY (user_id) REFERENCES users(id)
+      NOT VALID;
+
+    -- Step 2: Validate existing historical data in the background (SHARE UPDATE EXCLUSIVE lock; does NOT block reads/writes)
+    ALTER TABLE orders
+      VALIDATE CONSTRAINT fk_orders_user_id;
+    ```
+- **Zero-Downtime Column Renaming & Type Evolution (The Expand-Contract Pattern)**:
+  - ❌ Running `ALTER TABLE users RENAME COLUMN phone TO mobile;` immediately breaks older deployed application instances still querying `phone`.
+  - ✅ **Production Expansion Invariant**:
+    1. Add new column `mobile` as nullable.
+    2. Write to both `phone` and `mobile` in application code (or via sync trigger).
+    3. Backfill historical rows in chunks (`UPDATE users SET mobile = phone WHERE mobile IS NULL AND id BETWEEN ...`).
+    4. Deploy application code reading and writing strictly to `mobile`.
+    5. Drop the old column `phone` in a subsequent release after all old pods have terminated.
+
+
 
 
 

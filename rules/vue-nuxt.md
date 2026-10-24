@@ -247,6 +247,55 @@ alwaysApply: false
     }
     ```
 
+---
+
+## 8. Watcher Race Cancellation, Composable Ergonomics & Deterministic SSR
+- **Watcher Asynchronous Race Cancellation with `onWatcherCleanup` (Vue 3.5+)**:
+  - ❌ **The Asynchronous Stale Overwrite Trap**: When a watcher triggers an async fetch on search input, slow responses from an earlier keystroke can resolve *after* a newer keystroke, overwriting fresh data with stale results.
+  - ✅ **Vue 3.5+ Invariant**: Use `onWatcherCleanup` with `AbortController` to cancel in-flight operations when the watched value mutates:
+    ```vue
+    <script setup lang="ts">
+    import { ref, watch, onWatcherCleanup } from 'vue';
+
+    const searchQuery = ref('');
+    const searchResults = ref<Item[]>([]);
+
+    watch(searchQuery, async (newQuery) => {
+      const controller = new AbortController();
+      // Register cleanup callback invoked before the next watch execution or unmount:
+      onWatcherCleanup(() => controller.abort());
+
+      try {
+        const res = await fetch(`/api/search?q=${encodeURIComponent(newQuery)}`, {
+          signal: controller.signal
+        });
+        searchResults.value = await res.json();
+      } catch (err: any) {
+        if (err.name !== 'AbortError') throw err;
+      }
+    });
+    </script>
+    ```
+- **Composable Argument Flexibility with `toValue` & `MaybeRefOrGetter` (Vue 3.3+)**:
+  - Headless composables should flexibly accept plain values, `Ref<T>`, or getter functions `() => T`:
+    ```ts
+    import { toValue, computed, type MaybeRefOrGetter } from 'vue';
+
+    export function useFormattedCurrency(amount: MaybeRefOrGetter<number>) {
+      // toValue reactively normalizes plain values, refs, or getters
+      return computed(() => {
+        const val = toValue(amount);
+        return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val);
+      });
+    }
+    ```
+- **Deterministic SSR Hydration Hygiene**:
+  - ❌ **Total Ban on Non-Deterministic Invocations in SSR Templates**: Invoking `Math.random()`, `Date.now()`, `crypto.randomUUID()`, or checking `window.innerWidth` during setup or template execution generates differing markup between server and client, causing hydration mismatches.
+  - ✅ **Production Invariant**:
+    - Use Nuxt/Vue `useId()` for deterministic, accessible HTML element IDs.
+    - Wrap client-specific dynamic widgets (e.g. local time displays or browser viewport banners) in `<ClientOnly>` with a lightweight skeleton placeholder.
+
+
 
 
 
