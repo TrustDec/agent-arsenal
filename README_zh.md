@@ -46,6 +46,8 @@
 - ⚡ **Redis 与高并发缓存生产级规范 (`rules/redis-caching.md`)**：全面严禁生产环境执行 `KEYS *` 阻塞主事件循环（强制游标式 `SCAN`/`SSCAN` 分批）、大键异步内存释放（`UNLINK` 替代阻塞式 `DEL`）、基于 Singleflight 与 XFetch 概率性提前过期根治缓存击穿（Stampede）、强制 TTL 动态抖动（Jitter）消灭缓存雪崩、防范缓存穿透（空值短期缓存与 Bloom Filter）、原子令牌校验 Lua 脚本安全释放分布式锁、基于有序集合（ZSET）的滑动窗口限流器，以及 Cache-Aside 事务提交后失效（Delete over Update）一致性原则。
 - 📨 **Apache Kafka 与事件流生产级架构规范 (`rules/kafka-event-streaming.md`)**：强制开启幂等生产者（`enable.idempotence=true`）、严守 `acks=all` 与 `min.insync.replicas=2` 绝对防丢数据契约、分区键散列设计消灭倾斜热点分区、消费者 Poll 循环心跳守护（严防处理耗时超标 `max.poll.interval.ms` 触发再平衡雪崩）、全面严禁自动提交 Offset（`enable.auto.commit=false` 根除停机丢消息）、采用 `CooperativeStickyAssignor` 根治“全局停顿”再平衡风暴、三层非阻塞重试与死信队列（DLT）拓扑、Schema Registry 兼容性演进准则（BACKWARD/FULL），以及基于 `wakeup()` 与 Flush 的优雅停机闭环。
 - 📊 **可观测性、OpenTelemetry 与生产遥测规范 (`rules/observability-telemetry.md`)**：全面严禁生产代码裸写 Print（强制结构化 JSON 日志）、敏感数据脱敏防线（请求头/密码/Token/卡号自动过滤）、Prometheus 标签基数爆炸防御（绝对严禁将 user_id/order_id/动态路径放入 metric labels 炸毁 TSDB）、Counter/Gauge/Histogram 四大黄金信号指标语义、跨进程/跨网络 W3C `traceparent` 链路上下文透传、OpenTelemetry Span 完整生命周期闭环与显式错误状态标记（`StatusCode.ERROR`），以及存活/就绪探针解耦（`/livez` 绝不探测外部数据库）。
+- ⚡ **gRPC 与 Protocol Buffers 生产级规范 (`rules/grpc-protobuf.md`)**：二进制协议兼容性绝对保障、字段编号（Tag）一旦发布终生不可篡改复用、字段废弃强制 `reserved` 标记锁定、枚举项首位强制 `ENUM_TYPE_UNSPECIFIED = 0` 根除默认值语义伪造、proto3 `optional` 显式判空防踩坑、W3C `grpc-timeout` 超时截止时间链路逐级透传、标准 gRPC 状态码规范映射（`codes.InvalidArgument`/`codes.NotFound`/`codes.FailedPrecondition`）、基于 `google.rpc.Status` 与 `BadRequest.FieldViolation` 的强类型富错误模型、流式 RPC 队列背压与客户端断连即时退出、单例 `ClientConn` 连接复用、NAT/负载均衡长连接心跳保活与防刷屏配置（`KeepaliveEnforcementPolicy`），以及拦截器分层编排（Recovery 居首）。
+- 📡 **WebSockets、Server-Sent Events (SSE) 与实时流通信规范 (`rules/websockets-realtime.md`)**：协议选型架构矩阵（LLM Token 流与通知首选 SSE，双向交互/协同画布选用 WebSocket）、全面严禁客户端高频短轮询、原生 Ping/Pong 控制帧心跳守护与僵尸连接剔除、全抖动（Full Jitter）指数退避彻底免疫重连风暴、单调递增消息 ID 与服务端环形重放缓冲区保障断网重连无损补发、严格有界出站队列与慢消费者淘汰机制（防服务端堆积 OOM）、基于分布式 Pub/Sub（Redis Streams/NATS）跨节点多 Pod 扇出、滚动发布发送 WebSocket `1001 (Going Away)` 优雅断链避震，以及跨站 WebSocket 劫持（CSWSH）`Origin` 严格白名单校验。
 - 💚 **Vue 3 与 Nuxt 3 响应式与 SSR 严苛守则 (`rules/vue-nuxt.md`)**：强制 `<script setup lang="ts">`、适配 Vue 3.5+ 响应式 Props 解构与 `useTemplateRef()`、使用 `onWatcherCleanup()` 规范清理、严禁覆写 `reactive()` 对象引用、绝对严禁在 Nuxt SSR 模块作用域声明可变状态（根治多租户跨请求数据串扰重大漏洞）、Nitro 服务端接口强制 `readValidatedBody` 运行时校验、Pinia 状态解构必配 `storeToRefs` 与生命周期副作用必须卸载。
 - 🧡 **Svelte 5 Runes 与 SvelteKit 生产级守则 (`rules/svelte-sveltekit.md`)**：全面废弃 Svelte 3/4 旧语法，强制使用 Svelte 5 符文（Runes: `$state`, `$derived`, `$props`），严禁滥用 `$effect()` 造成多轮重渲染/死循环，消灭 SSR 水合不匹配，原生 Form Actions 渐进增强（`use:enhance`）与 `.svelte.ts` 模块级防 SSR 用户间数据泄漏。
 - ⚛️ **Next.js 14/15 与 React 生产架构 (`rules/react-nextjs.md`)**：严格划分 App Router 服务端组件与客户端组件边界、适配 Next.js 15 异步请求 API（`await params`）、强制 `server-only` 防密钥泄露、Server Actions 权限与 Zod 校验，根除 Hydration 水合不匹配。
@@ -93,6 +95,8 @@ agent-arsenal/
 │   ├── database-sql.md     # 数据库零停机迁移、索引与事务准则
 │   ├── redis-caching.md    # Redis 缓存穿透击穿雪崩、分布式锁与 BigKey 防护
 │   ├── kafka-event-streaming.md # Apache Kafka、再平衡防御、幂等生产者与 DLT 拓扑
+│   ├── grpc-protobuf.md    # gRPC 与 Protocol Buffers 兼容性与流式通信规范
+│   ├── websockets-realtime.md # WebSockets, SSE 实时流通信、心跳与重连抖动
 │   ├── observability-telemetry.md # OpenTelemetry 链路追踪、Prometheus 与日志
 │   ├── svelte-sveltekit.md # Svelte 5 Runes 与 SvelteKit 生产规范
 │   ├── vue-nuxt.md         # Vue 3 响应式规范与 Nuxt 3 SSR 准则

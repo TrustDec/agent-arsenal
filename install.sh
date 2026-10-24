@@ -68,7 +68,7 @@ echo "   - CLAUDE.md & .cursorrules (Anti-hallucination & minimal surgical diffs
 echo "   - Universal mirrors: .windsurfrules, .clinerules, .github/copilot-instructions.md"
 echo "   - .cursor/rules/*.mdc (Modern modular Cursor rules with glob triggers)"
 echo "   - AGENTS.md (Multi-agent collaboration & MCP context protocols)"
-echo "   - .agents/rules/* (Auth/OAuth 2.1 & Identity, Redis Caching, Kafka & Event Streaming, Observability & Telemetry, Testing Discipline, CI/CD GitHub Actions, Kubernetes/Cloud-Native, Distributed Systems/API, AI/RAG, Security/AppSec, Docker, TypeScript, Go, SQL, Svelte 5/Kit, Vue/Nuxt, React/Next.js, Rust, Python, MCP Server)"
+echo "   - .agents/rules/* (Auth/OAuth 2.1 & Identity, Redis Caching, Kafka & Event Streaming, gRPC & Protobuf, WebSockets & Real-Time, Observability & Telemetry, Testing Discipline, CI/CD GitHub Actions, Kubernetes/Cloud-Native, Distributed Systems/API, AI/RAG, Security/AppSec, Docker, TypeScript, Go, SQL, Svelte 5/Kit, Vue/Nuxt, React/Next.js, Rust, Python, MCP Server)"
 echo "   - .agents/skills/design-system (Apple/Vercel grade UI aesthetics)"
 echo "   - .agents/skills/code-discipline (Industrial verification discipline)"
 echo ""
