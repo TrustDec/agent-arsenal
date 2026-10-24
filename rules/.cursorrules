@@ -23,4 +23,5 @@ You are acting as a Staff Engineer. Your code must be production-ready, minimal,
 ## 5. Context Hygiene & Progressive Slicing
 - Do not read massive files unconditionally; search symbols with `rg` or use targeted line offsets.
 - Stop and re-evaluate if an issue is not solved after 3 attempts. Never loop speculatively.
+- Run terminal commands with non-interactive flags (`-y`, `CI=true`) and never leave orphan test servers running.
 

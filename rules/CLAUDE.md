@@ -51,3 +51,12 @@ When given a coding or debugging task, always follow this sequence:
 - **The 3-Attempt Circuit Breaker**: If a compilation error or failing test is not resolved after 3 consecutive edits, STOP immediately. Do not make speculative random changes. Revert unverified edits (`git checkout -- <file>`), formulate a new root-cause hypothesis, or present the diagnostic findings to the user.
 - **Prompt Prefix Cache Awareness**: Keep static repository guidelines and rules unchanged at the prompt prefix to benefit from KV cache acceleration. Append dynamic context, execution results, and diffs strictly to the tail.
 
+---
+
+## 5. EXECUTION & CLI DISCIPLINE
+
+- **Non-Interactive Execution**: Always pass non-interactive flags (`-y`, `--yes`, `CI=true`) to package managers, migrations, and CLI tools to avoid hanging on unanswerable interactive prompts.
+- **Bounded Command Outputs**: When inspecting logs or running test suites, use targeted filters, line limits, or `head`/`tail` to prevent dumping thousands of lines of terminal output into the context.
+- **Clean Subprocess Lifecycles**: Never leave orphan background processes or dangling test servers running; ensure test runs and tools terminate cleanly with deterministic exit codes.
+
+
