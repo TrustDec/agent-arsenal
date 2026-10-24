@@ -572,5 +572,69 @@ alwaysApply: false
     });
     </script>
     ```
+- **Nuxt 3 `useCookie` Security Hardening & Chunking Defense**:
+  - ❌ **The Plaintext & Truncated Cookie Hazard**: Storing authentication or session tokens in `useCookie('token')` without setting `httpOnly: true`, `secure: true`, and `sameSite: 'lax'` exposes tokens to client-side XSS exfiltration. Furthermore, cookies exceeding 4096 bytes are silently dropped or truncated by web browsers, triggering intermittent authentication loss.
+  - ✅ **Production Invariant**: Always enforce strict cookie security attributes, and keep payload sizes well below 4KB:
+    ```ts
+    const authToken = useCookie('auth_token', {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 60 * 60 * 24 * 7, // 7 days
+      path: '/',
+    });
+    ```
+- **Composable Memory Leak Defense with `onScopeDispose`**:
+  - ❌ **The Dangling Composable Listener Leak**: Setting up `window.addEventListener`, `setInterval`, or WebSocket connections inside custom Vue composables without registering cleanup callbacks causes massive event listener leaks and memory retention whenever calling components are unmounted.
+  - ✅ **Production Invariant**: Always bind cleanup to the active effect scope lifecycle using `onScopeDispose`:
+    ```ts
+    import { ref, onScopeDispose } from 'vue';
+
+    export function useNetworkStatus() {
+      const isOnline = ref(typeof navigator !== 'undefined' ? navigator.onLine : true);
+
+      const handleOnline = () => { isOnline.value = true; };
+      const handleOffline = () => { isOnline.value = false; };
+
+      if (typeof window !== 'undefined') {
+        window.addEventListener('online', handleOnline);
+        window.addEventListener('offline', handleOffline);
+
+        onScopeDispose(() => {
+          window.removeEventListener('online', handleOnline);
+          window.removeEventListener('offline', handleOffline);
+        });
+      }
+
+      return { isOnline };
+    }
+    ```
+- **`shallowRef` & `markRaw` for High-Overhead Heavy Instances**:
+  - ❌ **The Deep Reactive Proxy Performance Collapse**: Wrapping complex third-party instances (Mapbox GL, Leaflet, Three.js scenes, Monaco Editor, WebGL buffers) in `ref()` forces Vue to recursively inspect and wrap thousands of nested properties in reactive `Proxy` objects, causing severe CPU spikes and memory bloat.
+  - ✅ **Production Invariant**: Use `shallowRef` for instances and `markRaw` for raw classes to bypass reactive overhead:
+    ```vue
+    <script setup lang="ts">
+    import { shallowRef, onMounted, onScopeDispose, markRaw } from 'vue';
+    import * as monaco from 'monaco-editor';
+
+    const editorContainer = useTemplateRef<HTMLDivElement>('editorContainer');
+    const editorInstance = shallowRef<monaco.editor.IStandaloneCodeEditor | null>(null);
+
+    onMounted(() => {
+      if (editorContainer.value) {
+        editorInstance.value = markRaw(
+          monaco.editor.create(editorContainer.value, {
+            value: 'console.log("hello world");',
+            language: 'typescript',
+          })
+        );
+      }
+    });
+
+    onScopeDispose(() => {
+      editorInstance.value?.dispose();
+    });
+    </script>
+    ```
 
 

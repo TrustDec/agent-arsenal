@@ -828,5 +828,74 @@ alwaysApply: false
         return n, err
     }
     ```
+- **Loop `time.NewTimer` Starvation & Channel Draining Trap**:
+  - ❌ **The Leaked Timer Heap Accumulation**: Calling `time.After(d)` inside a tight loop creates a new `time.Timer` on every single iteration that cannot be garbage collected until the duration expires, rapidly accumulating millions of dead timer objects in heap memory. Calling `timer.Stop()` without draining `timer.C` can leave stale expired ticks in the channel.
+  - ✅ **Production Invariant**: Reuse a single `time.Timer` across iterations, and safely drain the channel if `Stop()` returns false:
+    ```go
+    timer := time.NewTimer(timeout)
+    defer timer.Stop()
+
+    for {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        case item := <-queue:
+            process(item)
+            if !timer.Stop() {
+                select {
+                case <-timer.C:
+                default:
+                }
+            }
+            timer.Reset(timeout)
+        case <-timer.C:
+            return errors.New("idle timeout reached")
+        }
+    }
+    ```
+- **Atomic File Writing via Temp File & Replace (`os.CreateTemp` + `Sync` + `Rename`)**:
+  - ❌ **The Zero-Byte File Corruption on Crash**: Calling `os.WriteFile(path, data, 0644)` truncates the destination file first before writing new bytes. If the machine crashes, loses power, or experiences a container `SIGKILL` during the write, the file is left at 0 bytes or corrupted with partial data.
+  - ✅ **Production Invariant**: Write to a temporary file in the same directory/filesystem, invoke `Sync()` to flush dirty OS page cache blocks to physical media, and atomically replace the destination via `os.Rename`:
+    ```go
+    func AtomicWriteFile(filename string, data []byte, perm os.FileMode) error {
+        dir := filepath.Dir(filename)
+        tmp, err := os.CreateTemp(dir, "tmp-*")
+        if err != nil {
+            return fmt.Errorf("create temp file: %w", err)
+        }
+        tmpName := tmp.Name()
+        defer os.Remove(tmpName) // Clean up on error
+
+        if _, err := tmp.Write(data); err != nil {
+            tmp.Close()
+            return fmt.Errorf("write temp: %w", err)
+        }
+        if err := tmp.Sync(); err != nil { // Force flush OS buffers to disk
+            tmp.Close()
+            return fmt.Errorf("fsync temp: %w", err)
+        }
+        if err := tmp.Close(); err != nil {
+            return fmt.Errorf("close temp: %w", err)
+        }
+        if err := os.Chmod(tmpName, perm); err != nil {
+            return fmt.Errorf("chmod temp: %w", err)
+        }
+        return os.Rename(tmpName, filename) // Atomic POSIX replacement
+    }
+    ```
+- **Context Deadline Remaining Budget Verification**:
+  - ❌ **The Blind Downstream Invocation on Expired Contexts**: Initiating expensive network RPCs or database transactions when the context only has 2 milliseconds of deadline remaining will reliably fail midway, wasting server I/O and leaving half-executed downstream states.
+  - ✅ **Production Invariant**: Check the remaining deadline budget before initiating nested downstream calls:
+    ```go
+    func CallExternalGateway(ctx context.Context, payload []byte) error {
+        const minRequiredBudget = 100 * time.Millisecond
+        if deadline, ok := ctx.Deadline(); ok {
+            if time.Until(deadline) < minRequiredBudget {
+                return fmt.Errorf("insufficient context deadline budget remaining (%v): %w", time.Until(deadline), context.DeadlineExceeded)
+            }
+        }
+        return executeCall(ctx, payload)
+    }
+    ```
 
 

@@ -707,5 +707,81 @@ alwaysApply: false
       }
     </script>
     ```
+- **SvelteKit Server-Sent Events (SSE) Streaming & Connection Cleanup**:
+  - ❌ **The Dangling SSE Connection & Leaked Timer**: Returning a raw text stream without listening to client cancellation leaves infinite background tickers running and leaking memory on the Node/Bun server after the client closes the browser tab.
+  - ✅ **Production Invariant**: Implement native `ReadableStream` and listen to `request.signal.addEventListener('abort', ...)`:
+    ```ts
+    // src/routes/api/events/+server.ts
+    import type { RequestHandler } from './$types';
+
+    export const GET: RequestHandler = ({ request }) => {
+      let intervalId: ReturnType<typeof setInterval>;
+
+      const stream = new ReadableStream({
+        start(controller) {
+          intervalId = setInterval(() => {
+            const data = JSON.stringify({ timestamp: Date.now() });
+            controller.enqueue(`data: ${data}\n\n`);
+          }, 1000);
+
+          request.signal.addEventListener('abort', () => {
+            clearInterval(intervalId);
+            controller.close();
+          });
+        },
+        cancel() {
+          clearInterval(intervalId);
+        }
+      });
+
+      return new Response(stream, {
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+        },
+      });
+    };
+    ```
+- **Svelte 5 Rune `$inspect` Deep Diagnostics vs Zero Production Overhead**:
+  - ❌ **The Reactive Proxy Log Pollution**: Logging Svelte 5 `$state` proxies via `console.log(state)` prints cryptic internal reactive proxies instead of current snapshot values. Leaving console logs in production bundles bloats client assets.
+  - ✅ **Production Invariant**: Use the Svelte 5 `$inspect` rune with `.with(...)`. The Svelte compiler automatically strips all `$inspect(...)` calls in production builds (`NODE_ENV=production`):
+    ```svelte
+    <script lang="ts">
+      let formState = $state({ username: '', permissions: [] as string[] });
+
+      // Completely removed by the compiler in production builds:
+      $inspect(formState).with((type, val) => {
+        console.debug(`[FormState ${type}]`, val);
+      });
+    </script>
+    ```
+- **SvelteKit Progressive Enhancement Form Actions with Pending State UI Lockout**:
+  - ❌ **The Double-Click Transaction Duplication**: Users on slow mobile networks frequently tap submit buttons multiple times. Without disabling UI controls during in-flight form action mutations, duplicate backend mutations occur.
+  - ✅ **Production Invariant**: Use `use:enhance` with an optimistic pending lock:
+    ```svelte
+    <script lang="ts">
+      import { enhance } from '$app/forms';
+
+      let isSubmitting = $state(false);
+    </script>
+
+    <form
+      method="POST"
+      action="?/createInvoice"
+      use:enhance={() => {
+        isSubmitting = true;
+        return async ({ update }) => {
+          await update();
+          isSubmitting = false;
+        };
+      }}
+    >
+      <input type="text" name="customer" required />
+      <button type="submit" disabled={isSubmitting}>
+        {isSubmitting ? 'Processing...' : 'Create Invoice'}
+      </button>
+    </form>
+    ```
 
 

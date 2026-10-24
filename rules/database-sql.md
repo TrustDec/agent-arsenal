@@ -564,4 +564,27 @@ alwaysApply: false
     auto_explain.log_nested_statements = on
     ```
 
+---
+
+## 18. Sequence Integer Overflow (`INT4` -> `BIGINT`), `maintenance_work_mem` Sizing & Extended Statistics
+- **The PostgreSQL 2-Billion Integer (`INT4`) Serial Sequence Overflow Catastrophe**:
+  - ❌ **The Ticking Sequence Exhaustion Time Bomb**: Tables created with `SERIAL` or `INT4` auto-incrementing primary keys cap out at $2^{31}-1 = 2,147,483,647$. When the sequence hits the maximum value, all subsequent `INSERT` statements fail with `integer out of range`, triggering a total outage of critical production services. Executing `ALTER TABLE orders ALTER COLUMN id TYPE BIGINT;` on a 2-billion row table acquires an `ACCESS EXCLUSIVE` lock and rewrites the entire multi-hundred-gigabyte table on disk, causing hours of catastrophic downtime!
+  - ✅ **Production Invariant**: Always create primary keys with `BIGINT GENERATED ALWAYS AS IDENTITY` (or sequential UUIDv7). For migrating an existing active table approaching the `INT4` limit without downtime, use the expand-and-contract dual-column backfill pattern with a sync trigger.
+- **`maintenance_work_mem` Sizing & Parallel Index Workers**:
+  - ❌ **The Truncated Index Build & Thrashing Vacuum**: By default, `maintenance_work_mem` is only 64MB. Running `CREATE INDEX CONCURRENTLY` or `VACUUM` on a 100M row table with 64MB forces the process into multiple temporary disk spill sorting cycles, increasing index build duration by $5\times$ to $10\times$.
+  - ✅ **Production Invariant**: Tune `maintenance_work_mem` and `max_parallel_maintenance_workers` appropriately for index creation and autovacuum maintenance:
+    ```sql
+    -- For session performing heavy index builds:
+    SET maintenance_work_mem = '2GB';
+    SET max_parallel_maintenance_workers = 4;
+    CREATE INDEX CONCURRENTLY idx_orders_customer_created ON orders (customer_id, created_at DESC);
+    ```
+- **Extended Statistics on Correlated Columns (`CREATE STATISTICS`)**:
+  - ❌ **The Multiplication Assumption Estimation Catastrophe**: The query planner assumes column independence by default. For strongly correlated columns (e.g. `country = 'US'` and `state = 'CA'`), it multiplies their individual selectivities ($0.05 \times 0.05 = 0.0025$), drastically underestimating row counts by orders of magnitude and choosing devastating Nested Loop plans instead of Hash Joins.
+  - ✅ **Production Invariant**: Define multivariate extended statistics on correlated columns:
+    ```sql
+    CREATE STATISTICS stats_orders_country_state (dependencies, ndistinct) ON country, state FROM addresses;
+    ANALYZE addresses;
+    ```
+
 
