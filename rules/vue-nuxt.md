@@ -189,6 +189,37 @@ alwaysApply: false
   - Use Nitro storage (`useStorage('cache')`) or Redis for server caching, guaranteeing TTL eviction and multi-replica safety.
 - **Accessible Headless Primitives (Radix Vue / Reka UI)**:
   - For complex widgets (dialogs, dropdown menus, comboboxes, command palettes), use tested accessible headless primitives (e.g. Radix Vue / Reka UI) rather than rolling naive `v-if` divs. This guarantees ARIA role semantics, keyboard navigation (`ArrowDown`, `Home`, `End`, `Escape`), and focus restoration out of the box.
+- **Vue 3.5+ `useId()` Hydration-Safe ID Generation**:
+  - ❌ **NEVER use `Math.random()`, UUIDs, or client-incrementing counters** to generate HTML `id`, `for`, or `aria-describedby` attributes in SSR components. This triggers Vue hydration attribute mismatches.
+  - ✅ **Vue 3.5+ Invariant**: Use `useId()` to produce deterministic, collision-free IDs that match between server render and client hydration:
+    ```vue
+    <script setup lang="ts">
+    const emailInputId = useId()
+    const errorId = useId()
+    </script>
+
+    <template>
+      <label :for="emailInputId">Email Address</label>
+      <input :id="emailInputId" :aria-describedby="errorId" type="email" />
+      <span :id="errorId" class="error">Invalid email format</span>
+    </template>
+    ```
+- **Nuxt 3 Route Middleware Navigation Discipline**:
+  - In Nuxt route middleware (`defineNuxtRouteMiddleware`), ALWAYS return `navigateTo(to)` or `abortNavigation(error)`:
+    ```ts
+    // ❌ Broken: Omitting return causes concurrent race conditions and partial renders
+    export default defineNuxtRouteMiddleware((to) => {
+      if (!isAuthenticated) navigateTo('/login') // Dangling navigation!
+    })
+
+    // ✅ Invariant: Return the navigation promise
+    export default defineNuxtRouteMiddleware((to) => {
+      if (!isAuthenticated) {
+        return navigateTo('/login', { redirectCode: 302 })
+      }
+    })
+    ```
+
 
 
 

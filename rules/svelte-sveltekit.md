@@ -245,6 +245,34 @@ alwaysApply: false
     };
     ```
   - SvelteKit maps the failed response to `form` in `let { form } = $props()`, preserving user input and rendering accessible inline error messages without page reload.
+- **Svelte 5 `$derived.by()` Multi-Statement Derivations**:
+  - For complex derived values requiring branching, loops, or error handling, use `$derived.by()` with a closure:
+    ```svelte
+    <script lang="ts">
+      let items = $state<Item[]>([]);
+      // ✅ Invariant: $derived.by encapsulates multi-statement logic cleanly
+      let activeTotal = $derived.by(() => {
+        let sum = 0;
+        for (const item of items) {
+          if (item.active) sum += item.price;
+        }
+        return sum;
+      });
+    </script>
+    ```
+- **SvelteKit Granular Cache Invalidation (`invalidate` over `invalidateAll`)**:
+  - ❌ **NEVER invoke `invalidateAll()` as a lazy shortcut** after every mutation:
+    - `invalidateAll()` re-executes EVERY active `load` function in the current layout and page hierarchy, triggering waterfall queries and thrashing server cache.
+  - ✅ **Invariant**: Target the specific dependency using `invalidate(url)` or predicate matcher:
+    ```ts
+    import { invalidate } from '$app/navigation';
+
+    // Target only the relevant data dependency:
+    await invalidate('/api/cart');
+    // Or match by URL pattern:
+    await invalidate((url) => url.pathname.startsWith('/api/orders'));
+    ```
+
 
 
 

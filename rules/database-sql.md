@@ -263,6 +263,33 @@ alwaysApply: false
   - `REPEATABLE READ`: Guarantees a consistent snapshot at the start of the transaction. If two concurrent transactions modify the same row, the second fails with SQLSTATE `40001` (`could not serialize access due to concurrent update`).
   - **Application Retry Loop Invariant**: When running under `REPEATABLE READ` or `SERIALIZABLE`, the application layer MUST wrap database transactions in an idempotent retry loop with jittered backoff to handle transient serialization errors automatically.
 
+## 12. Row-Level Security (RLS) Performance, JSONB GIN Operator Invariants & WAL Amplification
+- **Row-Level Security (RLS) Query Planner Traps & `security_invoker`**:
+  - PostgreSQL RLS policies (`CREATE POLICY ... USING (tenant_id = current_setting('app.tenant_id'))`) are dynamically injected into every query execution plan.
+  - ❌ **The Unindexed RLS Policy Disaster**: If the policy expression column (`tenant_id`) is not indexed as the leftmost column in table indexes, EVERY query—regardless of user-specified filters—degrades into a catastrophic full table sequential scan.
+  - **PostgreSQL 15+ View Security Invariant**: When defining views over RLS-enabled tables, ALWAYS specify `WITH (security_invoker = true)`:
+    ```sql
+    CREATE VIEW active_tenant_users WITH (security_invoker = true) AS
+    SELECT id, email, created_at FROM users WHERE status = 'active';
+    ```
+    Without `security_invoker = true`, PostgreSQL defaults to checking permissions as the view creator (`security_definer` semantics), silently bypassing RLS and leaking multi-tenant data.
+- **JSONB GIN Operator Class Selection (`jsonb_ops` vs `jsonb_path_ops`)**:
+  - Default `CREATE INDEX USING gin (payload)` uses `jsonb_ops`, which indexes every key, value, and nested element separately to support `@>`, `?` (key exists), `?|`, and `?&`.
+  - For containment-only queries (`WHERE payload @> '{"status": "paid"}'`), ALWAYS specify `jsonb_path_ops`:
+    ```sql
+    CREATE INDEX idx_orders_payload_containment ON orders USING gin (payload jsonb_path_ops);
+    ```
+    `jsonb_path_ops` hashes full paths (key-value pairs) together, producing an index that is **up to 70% smaller** and substantially faster for containment scans.
+  - **Targeted B-Tree Expression Indexing**: If querying a specific JSON field frequently (`payload->>'account_id' = :id`), do NOT use GIN. Create a standard B-tree expression index: `CREATE INDEX idx_orders_account ON orders ((payload->>'account_id'))`.
+- **Write-Ahead Log (WAL) Volume Defense with `UNLOGGED` Tables**:
+  - High-frequency bulk ingestion, temporary ETL staging, and ephemeral queue processing generate colossal WAL disk write volume, triggering replication lag on read replicas and disk IOPS throttling.
+  - **The `UNLOGGED` Invariant**: For temporary processing tables or bulk staging pipelines where durability across unexpected database crashes is unnecessary:
+    ```sql
+    CREATE UNLOGGED TABLE staging_events ( ... );
+    ```
+    `UNLOGGED` tables bypass WAL generation entirely, cutting write disk I/O in half and shielding replication streams from transient data bloat.
+
+
 
 
 

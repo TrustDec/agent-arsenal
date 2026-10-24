@@ -324,7 +324,52 @@ alwaysApply: false
   - Run `go build -gcflags="-m"` to inspect compiler escape decisions. Ensure critical inner-loop types (state machines, coordinates, parsers) stay allocated on the goroutine stack.
 - **Slice Growth & Amortized Pre-allocation (`growslice`)**:
   - Go's runtime reallocation doubles capacity up to 256 elements, then switches to a smooth transition towards 1.25x growth. Frequent reallocations cause memory copy overhead and GC fragmentation.
-  - When batch size is known or estimable, ALWAYS pre-allocate slice capacity: `make([]T, 0, expectedCap)`. Never append repeatedly to an unallocated `nil` slice in performance-critical code paths.
+  - When batch size is known or estimable, ALWAYS pre-allocate slice capacity: `make([]T, 0, expectedCap)` or use `slices.Grow(slice, n)` (Go 1.21+). Never append repeatedly to an unallocated `nil` slice in performance-critical code paths.
+
+## 11. Range-Over-Func Iterators (Go 1.23+), Sub-Slice Memory Leaks & Transport Connection Reuse
+- **Go 1.23+ Standard Iterators (`iter.Seq` & `iter.Seq2`)**:
+  - Implement custom iterators using Go 1.23's standard `iter.Seq[V]` or `iter.Seq2[K, V]` instead of returning pre-allocated slices or using channels for synchronous traversal:
+    ```go
+    // ✅ Zero allocation, lazy, memory-safe collection traversal:
+    func (c *Container[T]) All() iter.Seq2[int, T] {
+        return func(yield func(int, T) bool) {
+            for i, item := range c.items {
+                // MANDATORY: If yield returns false, the caller break'd out of loop; STOP immediately
+                if !yield(i, item) {
+                    return
+                }
+            }
+        }
+    }
+    ```
+  - Invariant: Always check the boolean returned by `yield()`. Continuing to yield after `false` violates the iterator contract and causes panics or undefined loop behavior.
+- **Sub-Slice Backing Array Memory Retention Trap**:
+  - ❌ **NEVER retain a tiny slice extracted from a massive buffer without cloning**:
+    ```go
+    // ❌ Memory Leak: Retains the entire 50MB backing array in heap memory forever
+    func readHeader(largePayload []byte) []byte {
+        return largePayload[:16] 
+    }
+
+    // ✅ Production Invariant: Clone the sub-slice so GC can collect the 50MB buffer
+    func readHeader(largePayload []byte) []byte {
+        return bytes.Clone(largePayload[:16]) // Go 1.20+ bytes.Clone or slices.Clone
+    }
+    ```
+- **HTTP Transport Connection Reuse & Response Drain Invariant**:
+  - ❌ **NEVER call `resp.Body.Close()` without draining remaining bytes**:
+    ```go
+    resp, err := client.Do(req)
+    if err != nil {
+        return err
+    }
+    // MANDATORY DRAIN: If the body is not completely read to EOF, the HTTP Transport 
+    // CANNOT reuse the underlying TCP/TLS connection and terminates it with RST/FIN
+    _, _ = io.Copy(io.Discard, resp.Body)
+    defer resp.Body.Close()
+    ```
+  - **`MaxIdleConnsPerHost` Tuning**: The standard `http.DefaultTransport` sets `MaxIdleConnsPerHost = 2`. In high-throughput microservices making 1,000 req/sec to a backend, 99.8% of requests open and close raw TCP connections. Always configure a custom `&http.Transport{MaxIdleConnsPerHost: 100, MaxIdleConns: 1000, IdleConnTimeout: 90 * time.Second}`.
+
 
 
 
