@@ -31,6 +31,7 @@
 
 除了通用的防幻觉规则外，现已全面补充主流技术栈与现代协议规范：
 
+- 🔐 **身份认证、OAuth 2.1 与 Token 生产级安全守则 (`rules/auth-identity.md`)**：全面严禁使用 `localStorage`/`sessionStorage` 存放敏感鉴权 Token（彻底杜绝 XSS 凭证外泄劫持）、强制 `__Host-` 前缀 / `HttpOnly` / `SameSite=Lax/Strict` 加固 Cookie 规范、JWT 算法硬编码白名单锁定（彻底根绝 `alg: "none"` 与 RS256/HS256 公钥混淆伪造攻击）、基于 Token Family 的单次刷新令牌轮转（RTR）与重放攻击自动熔断作废整组会话、OAuth 2.1 全面强制 PKCE（`S256` 算法）、CSRF `state` 与 OIDC `nonce` 强校验、严禁重定向 URI 通配符（强制全路径严格匹配）、越权访问（BOLA/IDOR）多租户强制数据作用域（`WHERE tenant_id`）约束，以及 WebAuthn/Passkey 单调递增签名计数器克隆检测。
 - 🧪 **测试工程规范与反脆弱验证守则 (`rules/testing-discipline.md`)**：全面严禁硬编码 `sleep` 随缘等待（强制条件轮询与 Fake Timers 虚拟时间推进）、基于事务 Rollback 与独立数据库实例根治测试状态互相污染、坚决打击“给 Mock 写测试”的伪测试反模式、强制核心业务配备表驱动测试（Table-Driven）与边界极限值矩阵覆盖、严禁未 `await` 的浮动异步断言，以及多协程/线程竞争检测（`-race`）。
 - 🚀 **CI/CD 自动化与 GitHub Actions 安全守则 (`rules/cicd-github-actions.md`)**：第三方 Actions 强制 40 位完整 SHA Hash 锁定（防语义化版本标签篡改发动供应链投毒）、全面根除 Bash 行内直接插值 `${{ github.event... }}` 导致的远程命令注入重大漏洞、强制顶层 `permissions: contents: read` 最小权限原则、严防 `pull_request_target` 触发器下检出不可信 Fork PR 代码导致仓库密钥泄露的著名安全陷阱，以及全链路 OIDC 短期凭证置换。
 - 🌐 **高可用 API 设计与分布式系统规范 (`rules/api-distributed-systems.md`)**：强制状态变更接口幂等性规范（`Idempotency-Key` 原子预占与 SHA-256 请求体哈希校验防篡改）、全抖动指数退避根绝重试风暴（Thundering Herd）、熔断器状态机（Closed/Open/Half-Open 探针机制）、W3C `traceparent` 与 OpenTelemetry 分布式链路追踪透传、基于事务性发件箱（Transactional Outbox）根除双写数据不一致灾难、RFC 7807 Problem Details 统一错误响应，以及分布式滑动窗口限流与优雅过载保护。
@@ -78,6 +79,7 @@ agent-arsenal/
 ├── rules/
 │   ├── CLAUDE.md           # Claude Code, Windsurf, Copilot, Cline 主规则
 │   ├── .cursorrules        # Cursor 经典根目录规则
+│   ├── auth-identity.md    # OAuth 2.1, JWT 鉴权安全、Token 轮转与身份准则
 │   ├── testing-discipline.md # 测试工程规范、防 Flaky 与反伪测试准则
 │   ├── cicd-github-actions.md # Actions 供应链加固、命令注入免疫与 CI 安全
 │   ├── api-distributed-systems.md # 高可用 API 设计、幂等性与分布式追踪规范

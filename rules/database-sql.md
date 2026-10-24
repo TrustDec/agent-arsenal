@@ -81,3 +81,30 @@ alwaysApply: false
   - `idle_in_transaction_session_timeout`: Kill transactions abandoned by crashed application pods or leaked connections (e.g., `SET idle_in_transaction_session_timeout = '10s'`).
   - `max_open_conns` and `max_idle_conns`: Prevent connection spikes from crashing database clusters.
   - `conn_max_lifetime`: Recycle stale connections to handle DNS failovers and load balancer recycles cleanly.
+
+## 6. Concurrency Control, Advisory Locks & Safe Chunking
+- **Optimistic Concurrency Control (OCC) Over Heavy Locks**:
+  - For high-read, low-contention entities (e.g. inventory counters, profile updates), avoid heavy pessimistic locks (`SELECT FOR UPDATE`). Use version checking:
+    ```sql
+    UPDATE inventory 
+    SET quantity = quantity - 1, version = version + 1 
+    WHERE id = :item_id AND version = :expected_version;
+    ```
+    If 0 rows are updated, notify the application layer to reload and retry.
+- **PostgreSQL Advisory Locks for Distributed Jobs**:
+  - Prevent concurrent cron runners or migration containers from colliding by leveraging application-level advisory locks:
+    ```sql
+    SELECT pg_try_advisory_lock(hashtext('nightly_billing_reconciliation'));
+    -- Returns TRUE if lock acquired; FALSE if already running elsewhere
+    ```
+- **Chunked Deletion for Historical Data (Anti-WAL Blowup)**:
+  - ❌ **NEVER run unbounded large deletes** (`DELETE FROM logs WHERE created_at < NOW() - INTERVAL '90 days'`). A single query deleting millions of rows locks the table, exhausts memory, and generates massive WAL write spikes.
+  - Delete in bounded batches with pauses to allow replication and vacuuming:
+    ```sql
+    -- Batch loop in application / migration script:
+    DELETE FROM logs 
+    WHERE id IN (
+      SELECT id FROM logs WHERE created_at < NOW() - INTERVAL '90 days' LIMIT 2000
+    );
+    ```
+

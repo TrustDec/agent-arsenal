@@ -31,6 +31,7 @@
 
 Beyond core general rules, `agent-arsenal` includes plug-and-play rules for modern stacks and environments:
 
+- 🔐 **Authentication, OAuth 2.1 & Identity Security (`rules/auth-identity.md`)**: Absolute ban on `localStorage` / `sessionStorage` token storage (prevents XSS exfiltration), hardened `__Host-` / `HttpOnly` / `SameSite=Lax/Strict` cookie enforcement, JWT algorithm pinning (eliminates `alg: none` and RS256/HS256 public key confusion exploits), refresh token rotation (RTR) with automatic token family breach invalidation, mandatory OAuth 2.1 PKCE (`S256`), CSRF `state` and OIDC `nonce` validation, exact-match redirect URI whitelisting, Broken Object Level Authorization (BOLA/IDOR) tenant scoping guards, and WebAuthn/Passkeys monotonic signature counter verification.
 - 🧪 **Testing Discipline & Anti-Flakiness Invariants (`rules/testing-discipline.md`)**: Absolute ban on arbitrary `sleep` timeouts, clock virtualization (`fakeTimers`) for temporal logic, hermetic test isolation with per-test transaction rollback, multi-worker test database partitioning, elimination of "testing the mock" antipatterns, strict table-driven boundary matrices, and zero unhandled floating promises in async tests.
 - 🚀 **CI/CD Automation & GitHub Actions Security (`rules/cicd-github-actions.md`)**: Full 40-character SHA pinning for third-party actions to prevent supply-chain hijacking, absolute elimination of script injection via intermediate environment variable mapping, top-level `permissions: contents: read` least privilege enforcement, elimination of the dangerous `pull_request_target` fork checkout trap, and OIDC cloud federation over static long-lived credentials.
 - 🌐 **Resilient API Design & Distributed Systems (`rules/api-distributed-systems.md`)**: Mandatory `Idempotency-Key` contracts with atomic reservation & SHA-256 payload checksum validation, retry storm immunity with full-jitter exponential backoff, circuit breaker state machines (Closed/Open/Half-Open), W3C `traceparent` OpenTelemetry distributed context propagation, elimination of the Dual-Write trap via the Transactional Outbox pattern, RFC 7807 Problem Details error formatting, and distributed sliding-window rate limiting.
@@ -78,6 +79,7 @@ agent-arsenal/
 ├── rules/
 │   ├── CLAUDE.md           # Master rules for Claude Code, Windsurf, Copilot, Cline
 │   ├── .cursorrules        # Optimized rules for Cursor IDE (root fallback)
+│   ├── auth-identity.md    # OAuth 2.1, JWT security, token rotation & session invariants
 │   ├── testing-discipline.md # Anti-flakiness, hermetic isolation & test engineering
 │   ├── cicd-github-actions.md # Action SHA pinning, script injection & CI/CD safety
 │   ├── api-distributed-systems.md # Resilient APIs, idempotency & distributed tracing
