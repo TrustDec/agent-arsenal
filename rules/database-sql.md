@@ -108,3 +108,37 @@ alwaysApply: false
     );
     ```
 
+## 7. PostgreSQL Hardening, PgBouncer & Storage Safety
+- **PgBouncer Transaction Pooling Mode Invariants**:
+  - In transaction pooling mode (standard in RDS Proxy, Supabase, Neon, and high-concurrency PgBouncer setups), database connections are returned to the pool immediately upon transaction completion (`COMMIT` / `ROLLBACK`).
+  - ❌ **NEVER rely on session-level state**:
+    - Avoid session-level `SET timezone` or `SET search_path` (leaks into other tenants' queries).
+    - ❌ **NEVER use session advisory locks** (`pg_advisory_lock`); ALWAYS use transaction-scoped advisory locks: `pg_advisory_xact_lock()`.
+    - ❌ **NEVER use `LISTEN` / `NOTIFY`** on transaction-pooled connections; use dedicated direct connections or message brokers (Redis/Kafka).
+    - Disable client-side unnamed prepared statements or configure `binary_parameters=yes` / `server_reset_query`.
+- **JSONB Indexing Hygiene (GIN vs Expression Indexes)**:
+  - ❌ **NEVER query large unstructured JSONB columns with sequential scans**:
+    - For `@>` containment filtering, build a GIN index with `jsonb_path_ops` (produces 50-70% smaller index size and faster lookup than default `jsonb_ops`):
+      ```sql
+      CREATE INDEX idx_events_payload ON events USING GIN (payload jsonb_path_ops);
+      ```
+    - For specific frequently-queried keys, prefer deterministic B-Tree expression indexes or generated columns over blanket GIN indexing:
+      ```sql
+      CREATE INDEX idx_events_customer_id ON events (((payload->>'customer_id')::uuid));
+      ```
+- **Transaction ID (XID) Wraparound & Autovacuum Discipline**:
+  - PostgreSQL uses 32-bit transaction IDs; running out of IDs causes catastrophic forced shutdown into read-only mode to prevent data corruption.
+  - ❌ **NEVER disable autovacuum (`autovacuum = off`)**.
+  - Monitor `age(datfrozenxid)` in Prometheus/metrics and alert when `age > 1,000,000,000`. Tune `autovacuum_vacuum_cost_limit` (e.g. 2000) and `autovacuum_cost_delay` (e.g. 2ms) to prevent vacuum starvation on high-write databases.
+- **Declarative Range Partitioning for Append-Only Datasets**:
+  - For tables projected to exceed 50M-100M rows (audit logs, time-series events, webhook logs), use declarative partitioning:
+    ```sql
+    CREATE TABLE audit_logs (
+      id uuid NOT NULL,
+      created_at timestamptz NOT NULL,
+      payload jsonb
+    ) PARTITION BY RANGE (created_at);
+    ```
+  - Purging historical partitions via `DROP TABLE audit_logs_2024_01` is an instantaneous $O(1)$ DDL operation with zero vacuum overhead or WAL spikes, completely replacing high-risk batch deletes.
+
+

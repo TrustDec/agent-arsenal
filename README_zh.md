@@ -31,6 +31,7 @@
 
 除了通用的防幻觉规则外，现已全面补充主流技术栈与现代协议规范：
 
+- 🧠 **Agent 上下文工程、KV Cache 缓存优化与记忆体系 (`rules/context-memory-engineering.md`)**：针对 Claude 3.5/3.7、GPT-4o、Gemini 等前沿模型强制 Prompt 前缀（Prefix）KV 缓存确定性（严禁在前缀插入动态时间戳或波动态指标，达成 10 倍延迟降级与 75-90% 成本削减）、三层渐进式渐次暴露法则（AST 符号/路径检索 -> 按行切片只读审查 -> 彻底重构才允许读取整文件）、持久化记忆库协议（`ACTIVE_CONTEXT.md` / `SYSTEM_PATTERNS.md` 跨会话防失忆）、Sub-agent 隔离与 5 行密集结构化摘要交接（根除单体 Agent 上下文污染与“迷失于中间”衰减）、严格 XML 语义边界隔离（`<file_content>`, `<tool_output>` 防间接提示词注入劫持），以及连续 3 次调试失败强制熔断回滚机制。
 - 🔐 **身份认证、OAuth 2.1 与 Token 生产级安全守则 (`rules/auth-identity.md`)**：全面严禁使用 `localStorage`/`sessionStorage` 存放敏感鉴权 Token（彻底杜绝 XSS 凭证外泄劫持）、强制 `__Host-` 前缀 / `HttpOnly` / `SameSite=Lax/Strict` 加固 Cookie 规范、JWT 算法硬编码白名单锁定（彻底根绝 `alg: "none"` 与 RS256/HS256 公钥混淆伪造攻击）、基于 Token Family 的单次刷新令牌轮转（RTR）与重放攻击自动熔断作废整组会话、OAuth 2.1 全面强制 PKCE（`S256` 算法）、CSRF `state` 与 OIDC `nonce` 强校验、严禁重定向 URI 通配符（强制全路径严格匹配）、越权访问（BOLA/IDOR）多租户强制数据作用域（`WHERE tenant_id`）约束，以及 WebAuthn/Passkey 单调递增签名计数器克隆检测。
 - 🧪 **测试工程规范与反脆弱验证守则 (`rules/testing-discipline.md`)**：全面严禁硬编码 `sleep` 随缘等待（强制条件轮询与 Fake Timers 虚拟时间推进）、基于事务 Rollback 与独立数据库实例根治测试状态互相污染、坚决打击“给 Mock 写测试”的伪测试反模式、强制核心业务配备表驱动测试（Table-Driven）与边界极限值矩阵覆盖、严禁未 `await` 的浮动异步断言，以及多协程/线程竞争检测（`-race`）。
 - 🚀 **CI/CD 自动化与 GitHub Actions 安全守则 (`rules/cicd-github-actions.md`)**：第三方 Actions 强制 40 位完整 SHA Hash 锁定（防语义化版本标签篡改发动供应链投毒）、全面根除 Bash 行内直接插值 `${{ github.event... }}` 导致的远程命令注入重大漏洞、强制顶层 `permissions: contents: read` 最小权限原则、严防 `pull_request_target` 触发器下检出不可信 Fork PR 代码导致仓库密钥泄露的著名安全陷阱，以及全链路 OIDC 短期凭证置换。
@@ -42,8 +43,8 @@
 - 🏗️ **Terraform 与基础设施即代码 (IaC) 生产级规范 (`rules/terraform-iac.md`)**：远程 Backend 状态文件强加密与 DynamoDB 原子分布式状态锁、有状态核心资源强制 `lifecycle { prevent_destroy = true }` 避免误删毁灭性灾难、热更资源 `create_before_destroy = true` 规避下线瞬断窗口、IAM 策略严禁通配符（`Action: "*"` 与 `Resource: "*"` 绝对红线）、非公开端口严禁 `0.0.0.0/0` 全网暴露、S3 存储桶强制开启四项防公开访问保护与 KMS 桶密钥加密、敏感变量声明 `sensitive = true` 杜绝日志脱敏穿透，以及悲观提供商版本锁定 (`~> 5.40`) 与入参 `validation` 强校验。
 - 🔌 **Model Context Protocol (MCP) 服务端与工具规范 (`rules/mcp-server.md`)**：全面严禁 stdio 传输下的 `stdout` 杂质输出（`console.log` / `print` 会彻底打崩 JSON-RPC 字节流致客户端断联）、工具入参强制配备详尽 Schema `description` 引导 Agent 决策、严格上限控制与分页防 Context 爆炸、错误统一走 `{ isError: true }` 优雅降级，以及路径遍历白名单与 Shell 注入绝对防御。
 - 🔷 **TypeScript 与 Node.js/Bun 生产级规范 (`rules/typescript.md`)**：全面严禁 `any` 与未经校验的暴力断言（`as T`）、I/O 边界强制使用 Zod/运行时 Schema 校验、根绝浮动 Promise（Floating Promise）、严禁非空断言感叹号（`!`）、强制可辨识联合类型（Discriminated Unions）消除不可能状态、防范 Node/Bun 事件监听器泄露与无上限 Map 内存暴涨。
-- 🐹 **Golang 并发与系统工程 (`rules/golang.md`)**：强制 `context.Context` 规范传递、`errgroup` 协同工作与严防 Goroutine 泄露、切片子切片内存截留排查、测试必带 `go test -race`、HTTP 响应体关闭前 Drain 排水排查、错误使用 `%w` 与 `errors.Is/As` 保持因果链、生产代码零 panic 与优雅停机。
-- 🗄️ **SQL 与数据库生产级安全 (`rules/database-sql.md`)**：严守 Expand & Contract 零停机迁移法、生产接口严禁 `SELECT *`、复合索引最左前缀原则、软删除部分索引（Partial Index）、PostgreSQL 并发建索引、SQL 参数化防注入、超短事务与严禁事务内发起网络 I/O。
+- 🐹 **Golang 并发与系统工程 (`rules/golang.md`)**：强制 `context.Context` 规范传递、`errgroup` 协同工作与严防 Goroutine 泄露、切片子切片内存截留排查、测试必带 `go test -race`、HTTP 响应体关闭前 Drain 排水排查、错误使用 `%w` 与 `errors.Is/As` 保持因果链、生产代码零 panic 与优雅停机、容器环境配置 `GOMEMLIMIT` 与 `GOGC` 步调规避 cgroup OOM Kill 崩溃、64 位结构体字段降序内存对齐（节约 20-40% 内存空间）、Go 1.21+ `sync.OnceFunc` 懒加载单例，以及后台 Goroutine 必须配备 `defer recover()` 恐慌防线。
+- 🗄️ **SQL 与数据库生产级安全 (`rules/database-sql.md`)**：严守 Expand & Contract 零停机迁移法、生产接口严禁 `SELECT *`、复合索引最左前缀原则、软删除部分索引（Partial Index）、PostgreSQL 并发建索引、SQL 参数化防注入、超短事务与严禁事务内发起网络 I/O、PgBouncer 事务连接池模式安全禁令（禁会话级状态与强制 `pg_advisory_xact_lock`）、JSONB GIN `jsonb_path_ops` 与表达式索引选型、PostgreSQL 事务 ID (XID) 回卷 Autovacuum 防线，以及海量数据表声明式 Range 分区瞬间清理。
 - ⚡ **Redis 与高并发缓存生产级规范 (`rules/redis-caching.md`)**：全面严禁生产环境执行 `KEYS *` 阻塞主事件循环（强制游标式 `SCAN`/`SSCAN` 分批）、大键异步内存释放（`UNLINK` 替代阻塞式 `DEL`）、基于 Singleflight 与 XFetch 概率性提前过期根治缓存击穿（Stampede）、强制 TTL 动态抖动（Jitter）消灭缓存雪崩、防范缓存穿透（空值短期缓存与 Bloom Filter）、原子令牌校验 Lua 脚本安全释放分布式锁、基于有序集合（ZSET）的滑动窗口限流器，以及 Cache-Aside 事务提交后失效（Delete over Update）一致性原则。
 - 📨 **Apache Kafka 与事件流生产级架构规范 (`rules/kafka-event-streaming.md`)**：强制开启幂等生产者（`enable.idempotence=true`）、严守 `acks=all` 与 `min.insync.replicas=2` 绝对防丢数据契约、分区键散列设计消灭倾斜热点分区、消费者 Poll 循环心跳守护（严防处理耗时超标 `max.poll.interval.ms` 触发再平衡雪崩）、全面严禁自动提交 Offset（`enable.auto.commit=false` 根除停机丢消息）、采用 `CooperativeStickyAssignor` 根治“全局停顿”再平衡风暴、三层非阻塞重试与死信队列（DLT）拓扑、Schema Registry 兼容性演进准则（BACKWARD/FULL），以及基于 `wakeup()` 与 Flush 的优雅停机闭环。
 - 📊 **可观测性、OpenTelemetry 与生产遥测规范 (`rules/observability-telemetry.md`)**：全面严禁生产代码裸写 Print（强制结构化 JSON 日志）、敏感数据脱敏防线（请求头/密码/Token/卡号自动过滤）、Prometheus 标签基数爆炸防御（绝对严禁将 user_id/order_id/动态路径放入 metric labels 炸毁 TSDB）、Counter/Gauge/Histogram 四大黄金信号指标语义、跨进程/跨网络 W3C `traceparent` 链路上下文透传、OpenTelemetry Span 完整生命周期闭环与显式错误状态标记（`StatusCode.ERROR`），以及存活/就绪探针解耦（`/livez` 绝不探测外部数据库）。
@@ -82,6 +83,7 @@ agent-arsenal/
 ├── rules/
 │   ├── CLAUDE.md           # Claude Code, Windsurf, Copilot, Cline 主规则
 │   ├── .cursorrules        # Cursor 经典根目录规则
+│   ├── context-memory-engineering.md # Agent 上下文工程、KV 缓存与记忆体系
 │   ├── auth-identity.md    # OAuth 2.1, JWT 鉴权安全、Token 轮转与身份准则
 │   ├── testing-discipline.md # 测试工程规范、防 Flaky 与反伪测试准则
 │   ├── cicd-github-actions.md # Actions 供应链加固、命令注入免疫与 CI 安全
@@ -107,7 +109,8 @@ agent-arsenal/
 │   └── python-fastapi.md   # Python 严格类型提示与 FastAPI 生产规范
 ├── skills/
 │   ├── design-system/      # Apple/Vercel 级审美与 UI 设计系统
-│   └── code-discipline/    # Staff Engineer 外科手术式工程验证协议
+│   ├── code-discipline/    # Staff Engineer 外科手术式工程验证协议
+│   └── context-engineering/# KV cache prefix 保护与记忆库协议
 ├── templates/
 │   └── AGENTS.md           # 多 Agent 协同编排与 MCP 上下文管理规范
 └── install.sh              # 1 键极速安装脚本（支持 Cursor, Claude Code, Windsurf, Copilot 等）

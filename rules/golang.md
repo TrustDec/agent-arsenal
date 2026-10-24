@@ -131,3 +131,35 @@ alwaysApply: false
       log.Printf("server forced to shutdown: %v", err)
   }
   ```
+
+## 6. GC Tuning, Struct Memory Layout & Goroutine Panic Boundaries
+- **Container Memory Limits & GC Pacing (`GOMEMLIMIT` & `GOGC`)**:
+  - In containerized workloads (Kubernetes, ECS), Go's runtime default GC triggers when heap size doubles, making it blind to cgroup memory limits and triggering abrupt OOM kills.
+  - Set `GOMEMLIMIT` to ~85-90% of the container's hard memory limit (e.g., `GOMEMLIMIT=900MiB` for a 1GiB pod) and tune `GOGC` (default 100) to balance GC CPU overhead against memory pressure under traffic spikes.
+- **Struct Memory Alignment & Field Ordering**:
+  - On 64-bit architectures, struct fields are padded to 8-byte word boundaries.
+  - Order struct fields by descending size (pointers, `int64`, `float64` first; `int32`, `int16` middle; `bool`, `byte` last) to eliminate padding holes. For slices of millions of structs, proper alignment cuts memory footprint by 20–40%.
+- **`sync.OnceFunc` & Thread-Safe Lazy Initialization (Go 1.21+)**:
+  - Prefer Go 1.21+ functional once primitives (`sync.OnceFunc`, `sync.OnceValue`, `sync.OnceValues`) over manual `sync.Once` and outer-scoped closure variables. They automatically propagate panics and simplify thread-safe lazy singletons.
+- **Goroutine Panic Boundary Protection**:
+  - ❌ **NEVER spawn a background goroutine without panic recovery**: An unhandled panic in ANY spawned goroutine instantly crashes the entire Go process, bypassing HTTP recovery middleware.
+  - Enforce safe worker recovery wrappers for async goroutines:
+    ```go
+    func SafeGo(logger *slog.Logger, fn func()) {
+        go func() {
+            defer func() {
+                if r := recover(); r != nil {
+                    logger.Error("recovered from unhandled goroutine panic",
+                        "error", r,
+                        "stack", string(debug.Stack()),
+                    )
+                }
+            }()
+            fn()
+        }()
+    }
+    ```
+- **Zero-Allocation String Concatenation**:
+  - ❌ **NEVER use `+` or `fmt.Sprintf` in high-frequency loops**:
+  - Use `strings.Builder` and pre-allocate capacity via `builder.Grow(estimatedLen)` to eradicate intermediate heap allocations and GC pressure.
+
