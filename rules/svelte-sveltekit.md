@@ -205,6 +205,47 @@ alwaysApply: false
     };
     ```
   - In the template, use `<svelte:boundary>` and Svelte 5 snippets to render instant skeletons while the stream resolves.
+- **Svelte 5 `$bindable()` Runes Discipline**:
+  - In Svelte 5, two-way bindings via `bind:prop` are strictly prohibited on component props unless the component explicitly declares the prop with `$bindable()`:
+    ```svelte
+    <script lang="ts">
+      // ✅ Explicit two-way binding contract with optional fallback default
+      let { value = $bindable(''), disabled = false }: { value?: string; disabled?: boolean } = $props();
+    </script>
+    <input bind:value {disabled} />
+    ```
+  - This prevents accidental child-to-parent mutation leaks and guarantees an explicit contract at the component boundary.
+- **Universal Cross-Component Reactivity with `.svelte.ts`**:
+  - Replace legacy Svelte 3/4 `writable()` / `readable()` stores with native runes inside `.svelte.ts` modules:
+    ```ts
+    // theme.svelte.ts
+    class ThemeState {
+      current = $state<'light' | 'dark'>('dark');
+
+      toggle() {
+        this.current = this.current === 'dark' ? 'light' : 'dark';
+      }
+    }
+    export const theme = new ThemeState();
+    ```
+  - Any Svelte component importing `theme` reacts to `theme.current` changes automatically with zero manual subscriptions or `$` prefix dereferencing.
+- **Form Action Validation Ergonomics with `fail()`**:
+  - In `+page.server.ts` actions, never return raw unstatused objects on client validation errors:
+    ```ts
+    import { fail } from '@sveltejs/kit';
+
+    export const actions = {
+      default: async ({ request }) => {
+        const data = await request.formData();
+        const email = data.get('email');
+        if (!email || typeof email !== 'string') {
+          return fail(400, { email, missing: true, message: 'Valid email address is required.' });
+        }
+      }
+    };
+    ```
+  - SvelteKit maps the failed response to `form` in `let { form } = $props()`, preserving user input and rendering accessible inline error messages without page reload.
+
 
 
 

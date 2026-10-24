@@ -164,6 +164,32 @@ alwaysApply: false
 - **Custom Directive Event Listener Cleanup**:
   - Custom directives attached to `window` or `document` (e.g. `v-click-outside`, `v-shortcut`) MUST remove all event listeners in the `unmounted(el)` hook.
   - Failing to remove listeners retains detached DOM trees indefinitely, creating silent single-page application memory leaks.
+- **Vue 3.4+ `defineModel()` Two-Way Binding Invariant**:
+  - In Vue 3.4+, ALWAYS use `defineModel()` for two-way component bindings.
+  - Ban verbose legacy `defineProps(['modelValue'])` and `defineEmits(['update:modelValue'])` boilerplate:
+    ```vue
+    <script setup lang="ts">
+    // ✅ Vue 3.4+ Invariant: Typed two-way reactive model with modifiers
+    const count = defineModel<number>('count', { default: 0 })
+    const [modelValue, modelModifiers] = defineModel<string>({
+      set(val) {
+        return modelModifiers.trim ? val.trim() : val
+      }
+    })
+    </script>
+    ```
+- **Nuxt Server Handlers & Nitro Middleware Memory Hygiene**:
+  - Event handlers in `server/api/` or `server/middleware/` run inside persistent Node.js/Nitro worker processes.
+  - ❌ **NEVER declare mutable caches or append unpruned listeners at top-level module scope**:
+    ```ts
+    // ❌ Memory Leak: userTokens grows unbounded across all tenant requests
+    const userTokens = new Map<string, string>()
+    export default defineEventHandler((event) => { ... })
+    ```
+  - Use Nitro storage (`useStorage('cache')`) or Redis for server caching, guaranteeing TTL eviction and multi-replica safety.
+- **Accessible Headless Primitives (Radix Vue / Reka UI)**:
+  - For complex widgets (dialogs, dropdown menus, comboboxes, command palettes), use tested accessible headless primitives (e.g. Radix Vue / Reka UI) rather than rolling naive `v-if` divs. This guarantees ARIA role semantics, keyboard navigation (`ArrowDown`, `Home`, `End`, `Escape`), and focus restoration out of the box.
+
 
 
 

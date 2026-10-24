@@ -290,6 +290,43 @@ alwaysApply: false
     }
     ```
 
+## 10. Modern Error Joining (`errors.Join`), Context `AfterFunc` & Escape Optimization
+- **Clean Multiple Error Aggregation (`errors.Join` in Go 1.20+)**:
+  - In batch operations or multi-resource cleanup where multiple errors must be recorded without short-circuiting:
+    ```go
+    var errs []error
+    for _, res := range resources {
+        if err := res.Close(); err != nil {
+            errs = append(errs, fmt.Errorf("failed closing resource %s: %w", res.ID(), err))
+        }
+    }
+    return errors.Join(errs...)
+    ```
+  - Unlike custom string concatenation, `errors.Join` preserves full compatibility with `errors.Is` and `errors.As` across every joined error in the chain.
+- **Context Cancellation Callbacks (`context.AfterFunc` in Go 1.21+)**:
+  - Prefer `context.AfterFunc(ctx, callback)` over spawning a dedicated background goroutine that blocks on `<-ctx.Done()` just to trigger a cleanup action:
+    ```go
+    // ✅ Replaces wasteful "listener goroutine":
+    stop := context.AfterFunc(ctx, func() {
+        conn.SetReadDeadline(time.Now()) // Interrupt blocked socket read cleanly
+    })
+    defer stop() // Unregisters callback if work finishes before context cancellation
+    ```
+- **Heap Escape Analysis & Interface Boxing Defense**:
+  - Boxing a concrete struct into `any` or an interface forces a heap allocation if the compiler cannot prove the value does not escape the stack:
+    ```go
+    // ❌ Causes heap allocation per call:
+    func logMetric(val any) { ... }
+
+    // ✅ Zero allocation: pass concrete types or generics
+    func logMetric[T constraints.Integer | constraints.Float](val T) { ... }
+    ```
+  - Run `go build -gcflags="-m"` to inspect compiler escape decisions. Ensure critical inner-loop types (state machines, coordinates, parsers) stay allocated on the goroutine stack.
+- **Slice Growth & Amortized Pre-allocation (`growslice`)**:
+  - Go's runtime reallocation doubles capacity up to 256 elements, then switches to a smooth transition towards 1.25x growth. Frequent reallocations cause memory copy overhead and GC fragmentation.
+  - When batch size is known or estimable, ALWAYS pre-allocate slice capacity: `make([]T, 0, expectedCap)`. Never append repeatedly to an unallocated `nil` slice in performance-critical code paths.
+
+
 
 
 

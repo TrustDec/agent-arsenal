@@ -233,6 +233,37 @@ alwaysApply: false
     ANALYZE vehicles;
     ```
 
+## 11. pgvector Production Invariants, MVCC Bloat Defense & Transaction Anomalies
+- **pgvector Index Selection & Invariants (HNSW vs IVFFlat)**:
+  - For AI embeddings and vector search in PostgreSQL:
+    - **Use HNSW (Hierarchical Navigable Small World)** as default for production:
+      ```sql
+      CREATE INDEX idx_items_embedding ON items 
+      USING hnsw (embedding vector_cosine_ops) 
+      WITH (m = 16, ef_construction = 64);
+      ```
+    - HNSW maintains high query recall without rebuilding the index after new inserts (unlike IVFFlat which degrades as cluster centers drift).
+    - **Index Construction Memory**: Boost `SET maintenance_work_mem = '2GB';` before building vector indexes on large tables to prevent spilling graph building to disk.
+    - **Distance Operator Discipline**:
+      - Cosine distance: `<=>` (uses `vector_cosine_ops`). If vectors are pre-normalized to unit length, use Inner Product `<#>` (`vector_ip_ops`) for up to 3x faster index searches.
+      - Euclidean L2 distance: `<->` (`vector_l2_ops`).
+    - **Runtime Query Recall Tuning**: Configure `SET hnsw.ef_search = 100;` before executing vector queries to trade search latency for higher recall.
+- **PostgreSQL MVCC Dead Tuple Bloat & Autovacuum Tuning**:
+  - PostgreSQL updates and deletes do not overwrite in place; they write new row versions (tuples) and mark old ones dead.
+  - On high-churn tables (queues, active sessions, real-time metrics), default autovacuum thresholds (20% of table) trigger too late, causing table bloat and cache thrashing:
+    ```sql
+    ALTER TABLE active_jobs SET (
+      autovacuum_vacuum_scale_factor = 0.05,
+      autovacuum_vacuum_threshold = 1000
+    );
+    ```
+  - ❌ **NEVER allow idle in transaction connections**: A single uncommitted transaction holding an `xmin` horizon blocks autovacuum from freeing dead tuples across the *entire* database cluster, causing runaway disk growth. Always enforce `idle_in_transaction_session_timeout = '30s'`.
+- **Transaction Isolation Anomaly Matrix & Serialization Retries**:
+  - `READ COMMITTED` (default): Vulnerable to non-repeatable reads, phantom reads, and lost updates in read-modify-write patterns.
+  - `REPEATABLE READ`: Guarantees a consistent snapshot at the start of the transaction. If two concurrent transactions modify the same row, the second fails with SQLSTATE `40001` (`could not serialize access due to concurrent update`).
+  - **Application Retry Loop Invariant**: When running under `REPEATABLE READ` or `SERIALIZABLE`, the application layer MUST wrap database transactions in an idempotent retry loop with jittered backoff to handle transient serialization errors automatically.
+
+
 
 
 
