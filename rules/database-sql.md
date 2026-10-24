@@ -1,5 +1,5 @@
 ---
-description: SQL and database production invariants, zero-downtime migrations, and query safety
+description: SQL and database production invariants, zero-downtime migrations, lock safety, and query performance
 globs: **/*.{sql,prisma},**/migrations/**
 alwaysApply: false
 ---
@@ -9,29 +9,75 @@ alwaysApply: false
 > Add these rules to your project if writing relational database migrations, SQL queries, or ORM data models (PostgreSQL, MySQL, SQLite).
 
 ## 1. Zero-Downtime Migrations (Expand & Contract)
-- **Never Break Running Services**: Database schema changes and application deployments are asynchronous. All migrations must be backwards-compatible with running versions of the app.
+- **Never Break Running Services**:
+  - Database schema changes and application deployments are asynchronous. All migrations must be backwards-compatible with running versions of the app.
 - **Three-Phase Migration Discipline**:
   1. **Expand**: Add new nullable columns or tables; deploy dual-write application logic.
-  2. **Backfill**: Backfill historical rows asynchronously in batches with rate-limiting.
-  3. **Contract**: Switch reads to new columns; remove old code; drop deprecated columns in a subsequent release.
+  2. **Backfill**: Backfill historical rows asynchronously in small batches (e.g., 1,000 rows per batch) with rate-limiting.
+  3. **Contract**: Switch reads to new columns; remove old application code; drop deprecated columns in a subsequent release.
 - **Lock Contention Invariant**:
-  - PostgreSQL: Always use `CREATE INDEX CONCURRENTLY` (outside a transaction block).
-  - Never add non-null columns without defaults on high-traffic tables.
-  - Set a strict `lock_timeout` before executing DDL migrations to avoid blocking user transactions.
+  - PostgreSQL: Always use `CREATE INDEX CONCURRENTLY` (must run outside a transaction block).
+  - ❌ **NEVER add non-null columns without defaults on high-traffic tables** in older database engines that rewrite the entire table.
+  - Set a strict `lock_timeout` before executing DDL migrations to avoid queuing behind long queries and taking down production:
+    ```sql
+    SET lock_timeout = '2s';
+    ALTER TABLE orders ADD COLUMN fulfillment_status varchar(32);
+    ```
 
-## 2. Query Discipline & Indexing
-- ❌ **BAN `SELECT *` IN PRODUCTION**: Explicitly enumerate needed columns to reduce network overhead, prevent memory waste, and avoid breaking when columns are added/removed.
-- **Mandatory Foreign Key Indexing**: Every foreign key column (`user_id`, `org_id`, etc.) MUST have a corresponding index to avoid full table scans during cascade checks and joins.
-- **Pagination Safety**: Never use high-offset `LIMIT 100 OFFSET 100000` on large tables. Use keyset/cursor-based pagination (`WHERE id > :last_seen_id ORDER BY id ASC LIMIT :page_size`).
-- **N+1 Prevention**: In ORM operations (Prisma, TypeORM, SQLAlchemy, GORM, ActiveRecord), always use eager loading / batch fetching (`include`, `select_related`, `preload`). Never execute queries inside loops.
+## 2. Query Discipline & Indexing Hygiene
+- ❌ **BAN `SELECT *` IN PRODUCTION**:
+  - Explicitly enumerate needed columns to reduce network overhead, prevent memory bloat, and avoid breaking when columns are added, renamed, or dropped.
+- **Compound Index Leftmost Prefix Rule**:
+  - In composite indexes `(tenant_id, status, created_at)`:
+    - Place equality filter columns first (`tenant_id = :tid AND status = :st`).
+    - Place range filters and sorting columns last (`created_at >= :ts ORDER BY created_at DESC`).
+  - An index on `(a, b)` does NOT accelerate queries filtering only on `b`.
+- **Partial Indexes for Soft Deletes & Statuses**:
+  - For soft-deleting tables, avoid indexing millions of deleted rows:
+    ```sql
+    CREATE INDEX idx_users_active_email ON users (email) WHERE deleted_at IS NULL;
+    ```
+- **Mandatory Foreign Key Indexing**:
+  - Every foreign key column (`user_id`, `org_id`, etc.) MUST have a corresponding index to avoid table-lock escalations and full table scans during cascade deletes and joins.
+- **Keyset / Cursor Pagination Safety**:
+  - ❌ **NEVER use high-offset `LIMIT 100 OFFSET 100000`** on large tables (forces engine to scan and discard 100,000 rows).
+  - Use keyset pagination:
+    ```sql
+    WHERE id > :last_seen_id ORDER BY id ASC LIMIT :page_size
+    ```
+- **N+1 Prevention**:
+  - In ORM operations (Prisma, TypeORM, SQLAlchemy, GORM, ActiveRecord), always use eager loading / batch fetching (`include`, `select_related`, `preload`). Never execute queries inside loops.
 
-## 3. Transaction Hygiene & Boundary Safety
-- **Keep Transactions Micro-Short**: Hold transactions open only for the minimal number of write operations.
-- ❌ **ZERO NETWORK I/O INSIDE TRANSACTIONS**: Never make external HTTP calls, RPC calls, email triggers, or file uploads while holding an active database transaction.
-- **Idempotent Writes**: Design state-changing mutations with idempotency keys or unique constraints to gracefully handle network retries without duplicate billing or data corruption.
+## 3. Parameterization & SQL Injection Immunity
+- ❌ **STRICT BAN ON STRING CONCATENATION FOR QUERY VALUES**:
+  - Never interpolate variables into SQL strings:
+    ```ts
+    // ❌ Catastrophic SQL Injection:
+    db.query(`SELECT * FROM users WHERE email = '${email}'`);
 
-## 4. Connection Pool & Statement Limits
+    // ✅ Enforce parameterized placeholders:
+    db.query(`SELECT id, email, created_at FROM users WHERE email = $1`, [email]);
+    ```
+- **Dynamic Identifiers (Table / Column Names)**:
+  - If column or table names must be dynamic in reporting queries, strictly validate them against a compile-time whitelist or use identifier quoting functions (`quote_ident` in PostgreSQL). Never allow raw user input into identifiers.
+
+## 4. Transaction Hygiene & Deadlock Prevention
+- **Keep Transactions Micro-Short**:
+  - Hold transactions open only for the absolute minimal number of write operations.
+- ❌ **ZERO NETWORK I/O INSIDE TRANSACTIONS**:
+  - Never make external HTTP calls, RPC calls, email triggers, or file uploads while holding an active database transaction. Network latency will exhaust database connection pools.
+- **Deterministic Lock Acquisition Order**:
+  - To prevent cyclic deadlocks between concurrent workers, always acquire row locks in a consistent order:
+    ```sql
+    -- Sort IDs before batch locking:
+    SELECT id FROM accounts WHERE id IN (10, 42, 99) ORDER BY id ASC FOR UPDATE;
+    ```
+- **Idempotent Mutations**:
+  - Design state-changing mutations with idempotency keys or unique constraints (`ON CONFLICT (idempotency_key) DO NOTHING`) to gracefully handle network retries without duplicate billing or data corruption.
+
+## 5. Connection Pool & Statement Limits
 - Every production database connection MUST configure:
-  - `statement_timeout`: Abort runaway queries before exhausting connection slots.
+  - `statement_timeout`: Abort runaway queries before exhausting connection slots (e.g., `SET statement_timeout = '5s'`).
+  - `idle_in_transaction_session_timeout`: Kill transactions abandoned by crashed application pods or leaked connections (e.g., `SET idle_in_transaction_session_timeout = '10s'`).
   - `max_open_conns` and `max_idle_conns`: Prevent connection spikes from crashing database clusters.
   - `conn_max_lifetime`: Recycle stale connections to handle DNS failovers and load balancer recycles cleanly.

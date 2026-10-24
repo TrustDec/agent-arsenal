@@ -1,37 +1,108 @@
 ---
-description: Golang concurrency safety, context lifecycle propagation, and production invariants
+description: Golang concurrency safety, context lifecycle propagation, memory leak prevention, and production invariants
 globs: **/*.go,**/go.mod
 alwaysApply: false
 ---
 
 # Golang Production Discipline & Concurrency Safety
 
-> Add these rules to your project if developing in Go (Golang) microservices, CLI tools, or distributed backends.
+> Add these rules to your project if developing in Go (Golang) microservices, CLI tools, high-performance network services, or distributed backends.
 
-## 1. Concurrency & Context Lifecycle
-- **Context is King**: `ctx context.Context` MUST always be the first parameter in I/O and long-running functions. **NEVER** store `context.Context` inside a `struct`.
-- **Zero Goroutine Leaks**: Every goroutine spawned MUST have a deterministic termination condition (e.g., listening to `ctx.Done()`, bounded channel send/receive, or managed via `golang.org/x/sync/errgroup`).
-- **Race Condition Immunity**: Always run tests with the race detector enabled: `go test -race ./...`. Any detected data race is a blocking bug.
-- **Mutex Discipline**: Always pair `mu.Lock()` with `defer mu.Unlock()` immediately on the next line unless micro-benchmarked in high-frequency critical sections with documented rationale.
+## 1. Concurrency, Context Lifecycle & Goroutine Hygiene
+- **Context is King**:
+  - `ctx context.Context` MUST always be the first parameter in I/O and long-running functions.
+  - ❌ **NEVER store `context.Context` inside a `struct`**. Pass it down explicitly through call stacks.
+  - When spawning background work derived from a request, deliberately choose between propagating cancellation (`ctx`) or detaching for async completion (`context.WithoutCancel(ctx)` in Go 1.21+).
+- **Zero Goroutine Leaks**:
+  - Every goroutine spawned MUST have a deterministic, provable termination condition (e.g., listening to `ctx.Done()`, bounded channel iteration, or managed via `golang.org/x/sync/errgroup`).
+  - Prefer `errgroup.WithContext(ctx)` for concurrent task fan-out so the first error cancels sibling workers:
+    ```go
+    g, ctx := errgroup.WithContext(ctx)
+    for _, item := range items {
+        item := item // invariant for Go < 1.22
+        g.Go(func() error {
+            return processItem(ctx, item)
+        })
+    }
+    if err := g.Wait(); err != nil {
+        return fmt.Errorf("batch processing failed: %w", err)
+    }
+    ```
+- **Race Condition Immunity**:
+  - Always run tests with the race detector enabled: `go test -race ./...`. Any detected data race is a blocking production bug.
+- **Mutex Discipline & Copy Prevention**:
+  - Always pair `mu.Lock()` with `defer mu.Unlock()` immediately on the next line unless micro-benchmarked in high-frequency critical sections with documented rationale.
+  - ❌ **NEVER copy structs containing `sync.Mutex` or `sync.RWMutex` by value**. Pass them via pointer (`*Server`), or declare them with `go vet` copylocks checking.
+- **Channel Ownership Discipline**:
+  - The sender goroutine owns the channel and is exclusively responsible for closing it.
+  - ❌ **NEVER close a channel from the receiver end** or close a channel multiple times (causes panic).
 
-## 2. Explicit Error Handling & Zero Panic
-- ❌ **NEVER USE `_ = err` or ignore returned errors**: Check every single error return, including `f.Close()`, `w.Write()`, and JSON encoding.
-- **Wrap with Context**: Wrap errors with context using `fmt.Errorf("failed to process order %s: %w", orderID, err)` to preserve the causal chain for `errors.Is` and `errors.As`.
-- **Zero Panic in Production**: `panic()` is strictly forbidden in request/worker lifecycles. Panic is only permissible in `init()` or `main()` when mandatory configuration or static initialization fails fatally.
+## 2. Explicit Error Handling & Sentinel Hygiene
+- ❌ **NEVER USE `_ = err` or ignore returned errors**:
+  - Check every single error return, including `f.Close()`, `w.Write()`, and JSON encoding.
+- **Preserve Causal Chains**:
+  - Wrap errors with context using `%w`: `fmt.Errorf("failed to process order %s: %w", orderID, err)`.
+  - Use `errors.Is(err, target)` instead of direct equality (`err == target`) to support wrapped errors.
+  - Use `errors.As(err, &targetStruct)` instead of type asserting (`err.(*CustomError)`).
+- **Zero Panic in Production**:
+  - `panic()` is strictly forbidden in request/worker lifecycles. Panic is only permissible in `init()` or `main()` when mandatory configuration or static initialization fails fatally.
 
-## 3. Resource Management & HTTP Safety
-- **Drain Before Close**: When consuming HTTP response bodies, ALWAYS drain before closing to ensure TCP connection reuse (keep-alive):
+## 3. Memory & Resource Safety
+- **Slice Sub-slicing Memory Retention Trap**:
+  - Sub-slicing a small portion of a massive array keeps the entire underlying memory pinned:
+    ```go
+    // ❌ Leaks the entire 10MB buffer:
+    smallHeader := hugeBuffer[:32]
+
+    // ✅ Allocate a new slice to let the GC reclaim hugeBuffer:
+    smallHeader := make([]byte, 32)
+    copy(smallHeader, hugeBuffer[:32])
+    ```
+- **Timer & Ticker Leaks in Long-Running Loops**:
+  - Always stop tickers: `ticker := time.NewTicker(interval); defer ticker.Stop()`.
+  - ❌ **AVOID `time.After` inside loops or select statements**: `time.After` allocations are not garbage collected until the timer expires. Use an explicit `time.NewTimer` and stop/drain it when done.
+- **Drain Before Close for HTTP Response Bodies**:
+  - When consuming HTTP response bodies, ALWAYS drain before closing to ensure TCP connection reuse (keep-alive):
+    ```go
+    resp, err := client.Do(req)
+    if err != nil {
+        return err
+    }
+    defer resp.Body.Close()
+    _, _ = io.Copy(io.Discard, resp.Body)
+    ```
+- **Timeouts on All Network I/O**:
+  - ❌ **NEVER use `http.DefaultClient` in production**: It has no timeout by default. Always configure explicit `Timeout`, `IdleConnTimeout`, and transport deadlines.
+- **Nil Slice vs Empty Slice**:
+  - Be deliberate with JSON serialization: `var s []T` serializes to `null`, while `s := []T{}` serializes to `[]`. Use consistent conventions across API boundaries.
+
+## 4. Architecture, Receivers & Interface Restraint
+- **Accept Interfaces, Return Concrete Types**:
+  - Keep interfaces small, caller-defined, and focused (1-2 methods like `io.Reader`, `io.Closer`).
+  - Do not export massive mock-oriented interfaces from provider packages.
+- **Receiver Consistency**:
+  - Do not mix pointer and value receivers on the same type arbitrarily.
+  - Use pointer receivers (`func (s *Service) Method()`) if the method mutates state, contains locks, or if the struct is large. Use value receivers only for small immutable scalar values.
+- **No Generic Garbage Dumps**:
+  - Ban generic `common`, `utils`, and `helper` packages. Organize packages by domain capability (e.g., `auth`, `billing`, `storage`).
+
+## 5. Graceful Shutdown Invariant
+- Distributed services and HTTP servers must cleanly shut down on OS signals:
   ```go
-  resp, err := client.Do(req)
-  if err != nil {
-      return err
-  }
-  defer resp.Body.Close()
-  _, _ = io.Copy(io.Discard, resp.Body)
-  ```
-- **Timeouts on All I/O**: Never use `http.DefaultClient` in production. Always configure explicit `Timeout`, `IdleConnTimeout`, and transport deadlines.
-- **Nil Slice vs Empty Slice**: Be deliberate with JSON serialization. `var s []T` serializes to `null`, while `s := []T{}` serializes to `[]`. Use consistent conventions across API boundaries.
+  ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+  defer stop()
 
-## 4. Architecture & Interface Restraint
-- **Accept Interfaces, Return Concrete Types**: Keep interfaces small and caller-defined (1-2 methods like `io.Reader`). Do not export massive mock-oriented interfaces from provider packages.
-- **No Package Garbage Dumps**: Ban generic `common`, `utils`, and `helper` packages. Organize packages by domain capability.
+  srv := &http.Server{Addr: ":8080", Handler: router}
+  go func() {
+      if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+          log.Fatalf("listen error: %v", err)
+      }
+  }()
+
+  <-ctx.Done()
+  shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+  defer cancel()
+  if err := srv.Shutdown(shutdownCtx); err != nil {
+      log.Printf("server forced to shutdown: %v", err)
+  }
+  ```

@@ -31,12 +31,13 @@
 
 Beyond core general rules, `agent-arsenal` includes plug-and-play rules for modern stacks and environments:
 
+- 🧠 **AI, LLM Apps & RAG Systems (`rules/ai-llm-rag.md`)**: Strict Structured Outputs / JSON Schema validation, semantic chunking boundaries, hybrid search (dense embeddings + lexical BM25 via Reciprocal Rank Fusion), cross-encoder reranking, anti-prompt injection delimiter containment, token window budgeting, full-jitter exponential backoff, and SSE streaming disconnect cleanup.
 - 🛡️ **Application Security & OWASP Defense (`rules/security-appsec.md`)**: Anti-SSRF guards with DNS pre-flight & private IP bans, absolute command injection / shell interpolation elimination, parameterized SQL invariants, path traversal immunity with canonical base checks, constant-time cryptographic comparison (`timingSafeEqual`), CSPRNG token discipline, and ReDoS prevention.
 - 🐳 **Docker & Container Production Invariants (`rules/docker-containers.md`)**: Multi-stage build isolation with minimal attack surfaces (`distroless`/`alpine`), absolute ban on running as root (`USER nonroot`), PID 1 signal forwarding (`tini`/exec form) for zero-downtime graceful shutdown, secret isolation via `--mount=type=secret`, same-layer package cache pruning, and deterministic healthchecks.
 - 🔌 **Model Context Protocol (MCP) Server Engineering (`rules/mcp-server.md`)**: Absolute ban on stdio `stdout` pollution (`console.log` / `print` breaks JSON-RPC byte framing), mandatory descriptive Zod/Pydantic schemas for LLM tool selection, bounded token payload ceilings with pagination/projections, graceful error handling (`isError: true`), and path traversal / shell injection immunity.
 - 🔷 **TypeScript & Runtime Discipline (`rules/typescript.md`)**: Total ban on `any` and unvalidated type assertions (`as T`), mandatory Zod/runtime validation at I/O boundaries, zero floating promises, non-null assertion (`!`) ban, discriminated unions, and safe Node/Bun stream & memory leak prevention.
-- 🐹 **Golang Concurrency & Systems (`rules/golang.md`)**: Context lifecycle propagation, zero goroutine leaks, `go test -race` invariants, explicit error wrapping, and HTTP response body drain requirements.
-- 🗄️ **SQL & Database Production Safety (`rules/database-sql.md`)**: Expand-and-contract zero-downtime migrations, `SELECT *` ban in production endpoints, concurrent indexing, short transactions, and zero network I/O inside DB transactions.
+- 🐹 **Golang Concurrency & Systems (`rules/golang.md`)**: Context lifecycle propagation, zero goroutine leaks with `errgroup`, sub-slice memory leak traps, `go test -race` invariants, explicit error wrapping (`%w`), HTTP response body drain requirements, and graceful OS signal shutdown.
+- 🗄️ **SQL & Database Production Safety (`rules/database-sql.md`)**: Expand-and-contract zero-downtime migrations, `SELECT *` ban in production endpoints, compound index leftmost prefix discipline, partial soft-delete indexing, concurrent indexing, short transactions, and zero network I/O inside DB transactions.
 - 💚 **Vue 3 & Nuxt 3 (`rules/vue-nuxt.md`)**: Enforces `<script setup lang="ts">`, preserves prop reactivity (`toRefs` invariants), bans `reactive()` reassignment, prevents Nuxt SSR hydration mismatches (zero browser globals in setup), and guarantees Pinia `storeToRefs` & side-effect cleanup.
 - 🧡 **Svelte 5 Runes & SvelteKit (`rules/svelte-sveltekit.md`)**: Complete ban on legacy Svelte 3/4 reactive syntax, strict `$state` vs `$state.raw` memory discipline, prohibition of `$effect()` for derived computations, SSR hydration guards, form actions progressive enhancement (`use:enhance`), and universal reactivity safety in `.svelte.ts`.
 - ⚛️ **Next.js 14/15 & React (`rules/react-nextjs.md`)**: Enforces App Router Server/Client boundaries, Next.js 15 async request APIs (`await params`), `server-only` leak protection, Server Actions authorization guards, and hydration mismatch elimination.
@@ -70,6 +71,7 @@ agent-arsenal/
 ├── rules/
 │   ├── CLAUDE.md           # Master rules for Claude Code, Windsurf, Copilot, Cline
 │   ├── .cursorrules        # Optimized rules for Cursor IDE (root fallback)
+│   ├── ai-llm-rag.md       # AI, LLM apps, RAG pipelines & vector search safety
 │   ├── security-appsec.md  # Application security, SSRF defense & OWASP invariants
 │   ├── docker-containers.md# Multi-stage builds, non-root user & container safety
 │   ├── mcp-server.md       # Model Context Protocol (MCP) server & tool discipline

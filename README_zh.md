@@ -31,12 +31,13 @@
 
 除了通用的防幻觉规则外，现已全面补充主流技术栈与现代协议规范：
 
+- 🧠 **AI、LLM 应用与 RAG 检索增强生产级规范 (`rules/ai-llm-rag.md`)**：强制原生 Structured Outputs / JSON Schema 结构化提取与单轮自愈机制、严禁无脑固定字符切割（强制 Markdown/AST 语义边界切分）、混合检索（向量密集检索 + BM25 稀疏词法检索经 RRF 融合）、Cross-Encoder 精准重排、RAG 注入隔离边界（XML 显式防间接提示词注入）、严格 Token 窗口预算、全抖动指数退避抗 429 限流与 SSE 流式连接断开即时中止上游。
 - 🛡️ **应用安全与 OWASP 防御规范 (`rules/security-appsec.md`)**：严打 Agent 随手写出的 SSRF 漏洞（强制 DNS 预解析与内网私有 IP/云元数据 169.254 封禁）、命令拼接与 Shell 注入绝对防御、SQL 参数化与动态列白名单校验、路径遍历根目录规范校验、密码/签名常量时间比较（`timingSafeEqual` 防时序侧信道攻击）、CSPRNG 密码学安全随机数与 ReDoS 正则灾难性回溯免疫。
 - 🐳 **Docker 与容器化生产级规范 (`rules/docker-containers.md`)**：强制多阶段构建（Multi-Stage）收敛攻击面（`distroless`/`alpine`）、生产环境严禁 root 用户运行（`USER nonroot`）、PID 1 信号转发与轻量 Init（`tini`/Exec 格式）杜绝优雅关机超时死进程、BuildKit Secret 挂载防密钥硬编码至镜像层、同层包管理器缓存清理与真实健康检查。
 - 🔌 **Model Context Protocol (MCP) 服务端与工具规范 (`rules/mcp-server.md`)**：全面严禁 stdio 传输下的 `stdout` 杂质输出（`console.log` / `print` 会彻底打崩 JSON-RPC 字节流致客户端断联）、工具入参强制配备详尽 Schema `description` 引导 Agent 决策、严格上限控制与分页防 Context 爆炸、错误统一走 `{ isError: true }` 优雅降级，以及路径遍历白名单与 Shell 注入绝对防御。
 - 🔷 **TypeScript 与 Node.js/Bun 生产级规范 (`rules/typescript.md`)**：全面严禁 `any` 与未经校验的暴力断言（`as T`）、I/O 边界强制使用 Zod/运行时 Schema 校验、根绝浮动 Promise（Floating Promise）、严禁非空断言感叹号（`!`）、强制可辨识联合类型（Discriminated Unions）消除不可能状态、防范 Node/Bun 事件监听器泄露与无上限 Map 内存暴涨。
-- 🐹 **Golang 并发与系统工程 (`rules/golang.md`)**：强制 `context.Context` 规范传递、严防 Goroutine 泄露、测试必带 `go test -race`、HTTP 响应体关闭前 Drain 排水排查、错误严格包装与生产代码零 panic。
-- 🗄️ **SQL 与数据库生产级安全 (`rules/database-sql.md`)**：严守 Expand & Contract 零停机迁移法、生产接口严禁 `SELECT *`、外键与筛选列强制索引、PostgreSQL 并发建索引、超短事务与严禁事务内发起网络 I/O。
+- 🐹 **Golang 并发与系统工程 (`rules/golang.md`)**：强制 `context.Context` 规范传递、`errgroup` 协同工作与严防 Goroutine 泄露、切片子切片内存截留排查、测试必带 `go test -race`、HTTP 响应体关闭前 Drain 排水排查、错误使用 `%w` 与 `errors.Is/As` 保持因果链、生产代码零 panic 与优雅停机。
+- 🗄️ **SQL 与数据库生产级安全 (`rules/database-sql.md`)**：严守 Expand & Contract 零停机迁移法、生产接口严禁 `SELECT *`、复合索引最左前缀原则、软删除部分索引（Partial Index）、PostgreSQL 并发建索引、SQL 参数化防注入、超短事务与严禁事务内发起网络 I/O。
 - 💚 **Vue 3 与 Nuxt 3 响应式与 SSR 严苛守则 (`rules/vue-nuxt.md`)**：强制 `<script setup lang="ts">`、严禁直接解构 Props（丢失响应式）、严禁覆写 `reactive()` 对象引用、消灭 Nuxt SSR 水合不匹配（Setup 严禁访问浏览器全局变量）、Pinia 状态解构必配 `storeToRefs` 与生命周期副作用必须卸载。
 - 🧡 **Svelte 5 Runes 与 SvelteKit 生产级守则 (`rules/svelte-sveltekit.md`)**：全面废弃 Svelte 3/4 旧语法，强制使用 Svelte 5 符文（Runes: `$state`, `$derived`, `$props`），严禁滥用 `$effect()` 造成多轮重渲染/死循环，消灭 SSR 水合不匹配，原生 Form Actions 渐进增强（`use:enhance`）与 `.svelte.ts` 模块级防 SSR 用户间数据泄漏。
 - ⚛️ **Next.js 14/15 与 React 生产架构 (`rules/react-nextjs.md`)**：严格划分 App Router 服务端组件与客户端组件边界、适配 Next.js 15 异步请求 API（`await params`）、强制 `server-only` 防密钥泄露、Server Actions 权限与 Zod 校验，根除 Hydration 水合不匹配。
@@ -70,6 +71,7 @@ agent-arsenal/
 ├── rules/
 │   ├── CLAUDE.md           # Claude Code, Windsurf, Copilot, Cline 主规则
 │   ├── .cursorrules        # Cursor 经典根目录规则
+│   ├── ai-llm-rag.md       # AI, LLM 应用、RAG 检索增强与向量检索规范
 │   ├── security-appsec.md  # 应用安全、SSRF 防御与 OWASP 严苛守则
 │   ├── docker-containers.md# 容器化多阶段构建、无 root 运行与优雅停机规范
 │   ├── mcp-server.md       # Model Context Protocol (MCP) 服务端与工具生产规范
