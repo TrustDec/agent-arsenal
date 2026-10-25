@@ -774,6 +774,42 @@ alwaysApply: false
       </Teleport>
     </template>
     ```
+- **Vue 3.5+ Watcher Controls (`pause()` and `resume()`) for Programmatic Batch Updates**:
+  - ❌ **Cascading Feedback Loops on External Hydration**: When syncing state from external sources (WebSockets, IndexedDB, or server payloads), updating multiple reactive refs triggers active watchers that emit change events or make redundant HTTP calls.
+  - ✅ **Production Invariant**: In Vue 3.5+, use watcher controls to pause triggers during batch mutations and resume cleanly:
+    ```vue
+    <script setup lang="ts">
+    import { ref, watch } from 'vue';
+
+    const formData = ref({ title: '', tags: [] as string[] });
+
+    const { pause, resume } = watch(formData, (val) => {
+      autoSaveToServer(val);
+    }, { deep: true });
+
+    function hydrateFromRemote(remotePayload: typeof formData.value) {
+      pause(); // Temporarily suspend auto-save trigger
+      formData.value = { ...remotePayload };
+      // State is updated without firing unwanted auto-save network requests
+      resume();
+    }
+    </script>
+    ```
+- **Nuxt 3 SSR Host Header Poisoning Defense**:
+  - ❌ **Unvalidated `useRequestURL()` in SSR Rendered Links**: Directly interpolating `useRequestURL().origin` into canonical metadata tags (`<link rel="canonical" :href="url">`) or password reset email templates during SSR. If behind an unvalidated reverse proxy, an attacker can send a spoofed `Host: evil.com` or `X-Forwarded-Host: evil.com` header, poisoning the server-side generated HTML and downstream CDN caches.
+  - ✅ **Production Invariant**: Always validate or derive canonical URLs from explicit runtime configuration:
+    ```typescript
+    // In Nuxt 3 composables or pages:
+    const config = useRuntimeConfig();
+    const allowedBaseUrl = config.public.siteUrl; // e.g. 'https://app.example.com'
+
+    useHead({
+      link: [
+        { rel: 'canonical', href: `${allowedBaseUrl}${useRoute().path}` }
+      ]
+    });
+    ```
+
 
 
 

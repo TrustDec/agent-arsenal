@@ -925,6 +925,55 @@ alwaysApply: false
       });
     };
     ```
+- **SvelteKit `data-sveltekit-preload-data="hover"` vs `"tap"` Invariant**:
+  - ❌ **Network Flooding on Data Tables & Long Feeds**: Placing `data-sveltekit-preload-data="hover"` on high-density list items, search result feeds, or data tables. Casual pointer movement over dozens of rows triggers concurrent `load` function executions, exhausting browser connection limits and overloading backend servers.
+  - ✅ **Production Invariant**: Scope `"hover"` exclusively to high-intent primary navigation (e.g. main navbar, primary CTA buttons). For dense lists and tables, use `"tap"` (which initiates preloading on `touchstart` / `mousedown` with zero accidental hover network thrashing):
+    ```svelte
+    <!-- High-intent navigation: hover is safe -->
+    <nav data-sveltekit-preload-data="hover">
+      <a href="/dashboard">Dashboard</a>
+    </nav>
+
+    <!-- Dense list / data tables: enforce tap preloading -->
+    <ul data-sveltekit-preload-data="tap">
+      {#each items as item (item.id)}
+        <li><a href="/items/{item.id}">{item.name}</a></li>
+      {/each}
+    </ul>
+    ```
+- **Svelte 5 Recursive Snippet Safeguards & Depth Guard Invariant**:
+  - ❌ **Call Stack Overflow on Cyclic or Deep Data**: Invoking a recursive Svelte 5 snippet without a termination depth guard. If user data contains unexpected circular references (nested comments, category trees), the browser throws `Maximum call stack size exceeded` and freezes the page.
+  - ✅ **Production Invariant**: Pass an explicit depth counter to recursive snippets and enforce a hard rendering ceiling:
+    ```svelte
+    <script lang="ts">
+      interface CategoryNode {
+        id: string;
+        name: string;
+        children?: CategoryNode[];
+      }
+
+      let { tree }: { tree: CategoryNode[] } = $props();
+      const MAX_DEPTH = 8;
+    </script>
+
+    {#snippet renderTree(nodes: CategoryNode[], depth: number)}
+      {#if depth < MAX_DEPTH}
+        <ul class="pl-4 border-l border-zinc-200">
+          {#each nodes as node (node.id)}
+            <li>
+              <span>{node.name}</span>
+              {#if node.children && node.children.length > 0}
+                {@render renderTree(node.children, depth + 1)}
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    {/snippet}
+
+    {@render renderTree(tree, 0)}
+    ```
+
 
 
 

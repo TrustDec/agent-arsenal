@@ -1088,6 +1088,46 @@ alwaysApply: false
         "AV_LOG_FORCE_NOCOLOR=1",
     )
     ```
+- **Go 1.24+ `os.Root` Filesystem Sandboxing & Symlink Path Traversal Immunity**:
+  - ❌ **The `filepath.Clean` & Symlink Escape Vulnerability**: Attempting to sanitize user-provided file paths with `filepath.Clean(filepath.Join(baseDir, userInput))` or string prefix checks (`strings.HasPrefix(target, baseDir)`). An attacker can supply a symlink created inside the directory pointing to `/etc/passwd` or `/root/.ssh`, bypassing lexical path checks entirely (TOCTOU directory traversal).
+  - ✅ **Production Invariant**: In Go 1.24+, use `os.OpenRoot(baseDir)` to confine all directory operations to an isolated OS-level filesystem sandbox:
+    ```go
+    // Go 1.24+ Bulletproof directory containment
+    root, err := os.OpenRoot(uploadDir)
+    if err != nil {
+        return fmt.Errorf("failed to open root sandbox: %w", err)
+    }
+    defer root.Close()
+
+    // Guaranteed to fail if untrustedPath resolves outside uploadDir (via symlinks or ..):
+    f, err := root.Open(untrustedPath)
+    if err != nil {
+        return fmt.Errorf("access denied or invalid path: %w", err)
+    }
+    defer f.Close()
+    ```
+- **Context Cancellation Cause Propagation (`context.WithCancelCause` & `context.Cause`)**:
+  - ❌ **Loss of Domain Failure Reason**: Calling `cancel()` on a standard `context.WithCancel(parent)` context when an error occurs in a goroutine. Downstream consumers or middleware receive generic `context.Canceled`, making it impossible to determine whether the operation was cancelled due to a rate limit, a client disconnect, or a timeout.
+  - ✅ **Production Invariant**: Use `context.WithCancelCause` to associate the exact domain error with the cancellation, and inspect it via `context.Cause(ctx)`:
+    ```go
+    // Go 1.20+: Propagate exact root-cause domain errors across goroutine lifecycles
+    ctx, cancel := context.WithCancelCause(parentCtx)
+
+    go func() {
+        if err := workerPool.Process(); err != nil {
+            // Cancel context and attach the concrete root cause:
+            cancel(fmt.Errorf("worker failed due to database exhaustion: %w", err))
+            return
+        }
+        cancel(nil) // Clean completion
+    }()
+
+    <-ctx.Done()
+    if err := context.Cause(ctx); err != nil && !errors.Is(err, context.Canceled) {
+        slog.Error("pipeline terminated abnormally", "cause", err)
+    }
+    ```
+
 
 
 

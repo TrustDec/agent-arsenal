@@ -657,6 +657,33 @@ alwaysApply: false
     FROM orders 
     WHERE (metadata['payment']['amount_cents'])::text::bigint >= 5000;
     ```
+- **PostgreSQL 15+ `UNIQUE NULLS NOT DISTINCT` vs Partial Unique Indexes**:
+  - ❌ **The Infinite Duplicate NULL Hole**: Standard SQL-92 treats `NULL != NULL`. A unique constraint on `(tenant_id, slug, parent_id)` allows unlimited duplicate rows where `parent_id IS NULL`, causing silent business rule violations for root items. Historically, developers patched this with fragile dual partial indexes (`WHERE parent_id IS NOT NULL` and `WHERE parent_id IS NULL`).
+  - ✅ **Production Invariant**: In PostgreSQL 15+, declare `NULLS NOT DISTINCT` directly in the unique constraint:
+    ```sql
+    -- PostgreSQL 15+: Treats NULLs as equal for uniqueness enforcement
+    CREATE TABLE categories (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL,
+        slug VARCHAR(64) NOT NULL,
+        parent_id UUID,
+        CONSTRAINT uq_tenant_slug_parent UNIQUE NULLS NOT DISTINCT (tenant_id, slug, parent_id)
+    );
+    ```
+- **`EXPLAIN (ANALYZE, BUFFERS, SETTINGS)` Shared Buffer Hit Ratio Diagnosis**:
+  - ❌ **Misleading Wall-Clock Timings in `EXPLAIN ANALYZE`**: Relying solely on raw execution times in development. A query that executes in 2ms on warm OS page cache during local testing will collapse in production under real disk I/O when buffer pages are evicted.
+  - ✅ **Production Invariant**: Always inspect `BUFFERS` when optimizing SQL queries. Calculate the Shared Buffer Hit Ratio:
+    $$\text{Hit Ratio} = \frac{\text{shared hit}}{\text{shared hit} + \text{shared read}} \times 100\%$$
+    ```sql
+    EXPLAIN (ANALYZE, BUFFERS, SETTINGS, TIMING)
+    SELECT id, status, total_cents 
+    FROM orders 
+    WHERE tenant_id = 'c8b2...' AND status = 'pending';
+    
+    -- Invariant: Target >99% Hit Ratio on OLTP paths. If 'shared read' is high,
+    -- add covering index columns (INCLUDE) or refine composite index ordering.
+    ```
+
 
 
 
