@@ -968,6 +968,20 @@ alwaysApply: false
     CREATE INDEX CONCURRENTLY idx_orders_user_id ON orders(user_id);
     CREATE INDEX CONCURRENTLY idx_order_items_order_id ON order_items(order_id);
     ```
+- **PostgreSQL 16+ `pg_stat_io` Storage Diagnostics & Buffer Contention**:
+  - ❌ **The Opaque I/O Bottleneck Guesswork**: Assuming high query latency is CPU-bound or guessing table scan bottlenecks without inspecting physical storage metrics. Historically, database administrators had to infer whether slow queries were waiting on client backends, autovacuum I/O thrashing, or background writer dirty page flushes.
+  - ✅ **Production Invariant**: In PostgreSQL 16+, use `pg_stat_io` to identify exact I/O bottlenecks segmented by backend type (`client backend`, `autovacuum`, `background writer`), target object type (`relation`, `temp relation`), and I/O context (`normal`, `vacuum`, `bulkread`, `bulkwrite`):
+    ```sql
+    -- Diagnostic query: Identify backend disk reads vs buffer cache hits
+    SELECT backend_type, io_object, io_context, reads, writes, extends, hits, evictions, reuses
+    FROM pg_stat_io
+    WHERE reads > 0 OR writes > 0
+    ORDER BY reads DESC;
+    ```
+    If `evictions` spike in `client backend` under `normal` context, increase `shared_buffers` to eliminate disk read thrashing.
+- **B-Tree Index Deduplication & High-Cardinality Sizing (PostgreSQL 13+)**:
+  - ❌ **Disabling B-Tree Deduplication on Low-Uniqueness Columns**: Leaving default un-deduplicated B-tree structures on columns with recurring duplicates (e.g., status flags, category codes, foreign keys). This inflates index sizes on NVMe by 300–400% and triggers unnecessary page splits.
+  - ✅ **Production Invariant**: Ensure B-Tree deduplication is enabled (`deduplicate_items = on`, default since PG13) on non-unique indexes. This coalesces duplicate posting lists into compact B-tree leaf pages, dramatically boosting shared buffer hit ratios and reducing index scan latency.
 
 
 

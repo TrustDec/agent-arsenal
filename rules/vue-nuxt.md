@@ -1249,6 +1249,36 @@ alwaysApply: false
       { watch: [userId], dedupe: 'defer' }
     );
     ```
+- **Nuxt 3 Server Components (`.server.vue`) & Zero-JS Islands**:
+  - ❌ **The Client Hydration Bloat on Static Content**: Rendering heavy static markdown blocks, syntax-highlighted code containers (e.g. Shiki), or complex legal terms as standard universal client components. The browser downloads megabytes of Vue component bytecode and executes wasteful hydration passes on DOM nodes that never change.
+  - ✅ **Production Invariant**: Suffix static or read-only components with `.server.vue` (e.g., `MarkdownRenderer.server.vue`). Nuxt renders them exclusively on the server and ships raw HTML to the client with **zero** JavaScript bundle overhead. Wrap client interactive controls inside client slots:
+    ```vue
+    <!-- components/AuditLogViewer.server.vue -->
+    <template>
+      <div class="audit-log-container font-mono text-xs">
+        <div v-for="log in logs" :key="log.id" class="py-1 border-b border-zinc-800">
+          <span class="text-zinc-500">{{ log.timestamp }}</span> - {{ log.message }}
+        </div>
+      </div>
+    </template>
+    ```
+- **Vue 3.5+ `onWatcherCleanup` for Eliminating Async Race Conditions**:
+  - ❌ **The Out-of-Order Stale Response Race**: Triggering async fetch requests inside `watch(query, async (newQuery) => ...)` without cancelling prior requests. If query #1 takes 500ms and query #2 takes 100ms, query #1 resolves last and silently overwrites query #2 with stale data.
+  - ✅ **Production Invariant**: In Vue 3.5+, invoke `onWatcherCleanup()` inside the watcher body. It runs automatically when the watcher re-executes or the component unmounts, cleanly aborting pending requests:
+    ```ts
+    import { watch, onWatcherCleanup } from 'vue';
+
+    watch(searchQuery, async (query) => {
+      const controller = new AbortController();
+      onWatcherCleanup(() => controller.abort());
+
+      const results = await $fetch('/api/search', {
+        query: { q: query },
+        signal: controller.signal,
+      });
+      searchResults.value = results;
+    });
+    ```
 
 
 

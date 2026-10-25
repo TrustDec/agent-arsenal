@@ -349,6 +349,35 @@ alwaysApply: false
   - For long-running operations (e.g. repo indexing, large downloads, or multi-step migrations), accept an optional `_meta.progressToken` from the client request.
   - Emit intermediate `notifications/progress` updates with `progress` and `total` counters so the client UI displays accurate interactive progress indicators rather than hanging silently.
 
+## 17. MCP Roots Protocol (`roots/list`) & Dynamic Path Sandboxing
+- **Querying and Enforcing Client Workspace Boundaries**:
+  - When operating in tools that access the local filesystem (`read_file`, `search_files`, `execute_script`), never assume arbitrary filesystem access.
+  - ❌ **The Path Traversal Outside Allowed Workspaces Trap**: Allowing tool operations to traverse arbitrarily across `~/.ssh`, `/etc/passwd`, or other projects when the user intended to scope the MCP server to a single project folder.
+  - ✅ **Production Invariant**: In MCP servers with filesystem access, implement the `roots/list` client capability query upon initialization. Canonicalize requested paths (`path.resolve` followed by `fs.realpathSync`) and verify that target paths fall strictly within one of the registered client roots:
+    ```ts
+    import path from 'node:path';
+    import fs from 'node:fs';
+
+    export async function validatePathWithinRoots(targetPath: string, server: Server): Promise<string> {
+      const rootsResult = await server.request({ method: 'roots/list' }, ListRootsResultSchema);
+      const allowedRoots = rootsResult.roots.map((r) => fs.realpathSync(new URL(r.uri).pathname));
+
+      const canonicalTarget = fs.realpathSync(path.resolve(targetPath));
+      const isAllowed = allowedRoots.some((root) => canonicalTarget.startsWith(root));
+
+      if (!isAllowed) {
+        throw new Error(`Access denied: path "${targetPath}" is outside client workspace roots.`);
+      }
+      return canonicalTarget;
+    }
+    ```
+
+## 18. Schema Context Token Economy & Minimalist Tool Declarations
+- **Preventing Schema Bloat in Multi-Server Host Environments**:
+  - When an agent host (Claude Desktop, Cursor, Pi) connects to multiple MCP servers, the entire JSON Schema of every declared tool is injected into the prompt prefix on **every turn**.
+  - ❌ **The 10k-Token Schema Bloat Disaster**: Declaring massive nested objects with hundreds of optional properties, verbose comments, or duplicated enum strings. 20 verbose tools can easily consume 8,000+ tokens of prompt context, exhausting cache boundaries and reducing LLM reasoning depth.
+  - ✅ **Production Invariant**: Keep tool parameter schemas lean and flat. Restrict tool declarations to essential parameters, provide concise 1-sentence descriptions, and avoid deep nesting. For complex configurations, accept a path to a configuration file rather than inlining 50-field JSON objects.
+
 
 
 

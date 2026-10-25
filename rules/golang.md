@@ -1529,6 +1529,29 @@ alwaysApply: false
         })
     }
     ```
+- **Go 1.24+ `runtime.AddCleanup` over `runtime.SetFinalizer` Object Resurrection Defense**:
+  - ❌ **The Object Resurrection Memory Leak Trap**: Using legacy `runtime.SetFinalizer(obj, finalizer)` to release CGo memory, shared memory mappings, or OS file handles. `runtime.SetFinalizer` passes the object pointer back into the finalizer closure, resurrecting the object onto the heap, creating uncollectible reference cycles, and deferring reclamation indefinitely.
+  - ✅ **Production Invariant**: In Go 1.24+, use `runtime.AddCleanup(ptr, cleanupFunc, arg)`. The cleanup function receives an isolated detached value (`arg`), never the target object pointer itself, making object resurrection mathematically impossible and allowing seamless garbage collection of circular data structures:
+    ```go
+    type SafeMmap struct {
+        data []byte
+    }
+
+    func NewSafeMmap(descriptor int, length int) *SafeMmap {
+        data := mmapSyscall(descriptor, length)
+        handle := &SafeMmap{data: data}
+
+        // Passes detached pointer value to cleanup; handle cannot be resurrected
+        runtime.AddCleanup(handle, func(addr uintptr) {
+            munmapSyscall(addr, length)
+        }, uintptr(unsafe.Pointer(&data[0])))
+
+        return handle
+    }
+    ```
+- **Go 1.24+ Generic Type Aliases for Zero-Downtime Package Migration**:
+  - ❌ **The Monolithic Package Refactoring Breaking Change**: Moving generic structures or interfaces from an internal package to a public API (e.g. `internal/cache.Store[K, V]` to `cache.Store[K, V]`). Prior to Go 1.24, type aliases did not support type parameters (`type Store[K, V] = internal.Store[K, V]` was forbidden), forcing breaking API changes or duplicate boilerplate wrapper types.
+  - ✅ **Production Invariant**: In Go 1.24+, utilize generic type aliases (`type Cache[K comparable, V any] = internal.Cache[K, V]`) to seamlessly refactor package hierarchies and decouple interfaces without breaking downstream consumer type signatures.
 
 
 

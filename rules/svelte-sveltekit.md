@@ -1486,6 +1486,46 @@ alwaysApply: false
 - **SvelteKit Universal `fetch` vs Naked Global `fetch`**:
   - ❌ **The Naked Global `fetch` Cookie & Hydration Hazard**: Calling global `fetch()` inside a `load` function instead of using the provided `{ fetch }` parameter in `PageLoad` / `LayoutLoad`. Naked `fetch` fails to inherit incoming request cookies/auth headers during SSR and causes double-fetching on the client instead of inlining data into the hydration payload.
   - ✅ **Production Invariant**: Always use the injected event `load({ fetch })` parameter across all SvelteKit load functions.
+- **SvelteKit `handleServerError` Sanitization & Diagnostic Error IDs**:
+  - ❌ **Leaking Database Errors & Internal Paths in Production**: When an unhandled exception occurs in a form action or `+page.server.ts` load, naive error handling bubbles raw PostgreSQL errors, file paths, or table schemas to the client UI.
+  - ✅ **Production Invariant**: Implement `handleServerError` in `src/hooks.server.ts`. Capture the raw error in server-side logs with full stack traces, assign a monotonic UUIDv7 `errorId`, and return an opaque, sanitized payload to the client:
+    ```ts
+    // src/hooks.server.ts
+    import type { HandleServerError } from '@sveltejs/kit';
+
+    export const handleServerError: HandleServerError = ({ error, event }) => {
+      const errorId = crypto.randomUUID();
+
+      // Log full diagnostic trace internally
+      console.error(`[Server Error ${errorId}] on ${event.url.pathname}:`, error);
+
+      // Return sanitized object safe for public consumption
+      return {
+        message: 'An unexpected internal error occurred. Please quote the reference ID.',
+        errorId,
+      };
+    };
+    ```
+- **Svelte 5 `$derived.by` for Complex Multi-Statement Memoization**:
+  - ❌ **The `$effect` State Sync Anti-Pattern**: Updating a secondary `$state` variable inside an `$effect()` whenever a dependency changes. This introduces an extra render cycle, causes UI frame tearing, and can induce infinite re-render loops.
+  - ✅ **Production Invariant**: Use `$derived.by(() => { ... })` for multi-step derivations, complex matrix filters, or grouped collections. `$derived.by` is pure, lazy, synchronously memoized, and tracked cleanly by Svelte's push-pull reactivity graph:
+    ```svelte
+    <script lang="ts">
+      let items = $state<Array<{ id: string; category: string; price: number }>>([]);
+      let selectedCategory = $state('all');
+
+      // Pure memoized computation; zero intermediate state variables or effects
+      const filteredTotal = $derived.by(() => {
+        let sum = 0;
+        for (const item of items) {
+          if (selectedCategory === 'all' || item.category === selectedCategory) {
+            sum += item.price;
+          }
+        }
+        return sum;
+      });
+    </script>
+    ```
 
 
 
