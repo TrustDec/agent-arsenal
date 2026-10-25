@@ -1171,6 +1171,42 @@ alwaysApply: false
         bufferPool.Put(buf)
     }
     ```
+- **`net/http.Server` ReadHeaderTimeout & Slowloris Attack Defense**:
+  - ❌ **The Zero-Timeout Server Exhaustion Vulnerability**: Declaring `&http.Server{Addr: ":8080", Handler: mux}` without specifying `ReadHeaderTimeout`. The zero value means *no timeout*, allowing malicious or sluggish clients to open TCP connections and send headers byte-by-byte (the Slowloris exploit). Each stalled connection holds an active goroutine and kernel socket descriptor, completely starving server resources with minimal attacker bandwidth.
+  - ✅ **Production Invariant**: Always configure explicit connection phase timeouts on every production HTTP server, specifically enforcing `ReadHeaderTimeout`:
+    ```go
+    srv := &http.Server{
+        Addr:              ":8080",
+        Handler:           mux,
+        ReadHeaderTimeout: 3 * time.Second,  // Hard ceiling for slowloris header trickles
+        ReadTimeout:       10 * time.Second, // Max duration reading entire request including body
+        WriteTimeout:      15 * time.Second, // Max duration writing response
+        IdleTimeout:       120 * time.Second,// Keep-alive idle connection timeout
+        MaxHeaderBytes:    1 << 20,          // 1 MB header size ceiling
+    }
+    ```
+- **Typesafe Unexported Context Key Discipline**:
+  - ❌ **The String Key Context Collision Bug**: Injecting values into `context.Context` using raw strings or built-in primitive types (`ctx = context.WithValue(ctx, "user_id", id)`). In multi-package applications or third-party middleware, identical string keys collide and silently overwrite each other's state, leading to catastrophic authorization and auditing bugs.
+  - ✅ **Production Invariant**: Always declare an unexported, zero-size private struct type for context keys within the owning package, providing strictly typed getter and setter helper functions:
+    ```go
+    package auth
+
+    type contextKey struct{}
+
+    var userContextKey = contextKey{}
+
+    // WithUser returns a new Context bearing the authenticated User entity.
+    func WithUser(ctx context.Context, u *User) context.Context {
+        return context.WithValue(ctx, userContextKey, u)
+    }
+
+    // FromContext extracts the User entity from Context, returning false if absent.
+    func FromContext(ctx context.Context) (*User, bool) {
+        u, ok := ctx.Value(userContextKey).(*User)
+        return u, ok && u != nil
+    }
+    ```
+
 
 
 

@@ -856,6 +856,40 @@ alwaysApply: false
       () => $fetch(`/api/tenants/${tenantId.value}/users/${userId.value}`)
     );
     ```
+- **Nuxt 3 `useHead` / Unhead Raw HTML XSS Sanitization & Injection Defense**:
+  - ❌ **The Head Title / Meta Tag XSS Vulnerability**: Interpolating unsanitized user-generated strings directly into `useHead` or SSR meta tags: `useHead({ title: userProvidedTitle })`. If an attacker inputs `</title><script>evil()</script>`, the raw closing tag breaks out of the SSR-generated `<title>` node and executes arbitrary JavaScript in the victim's browser context.
+  - ✅ **Production Invariant**: Always sanitize or escape user-provided strings before binding to `useHead`, or leverage Unhead's built-in title templates with strict string escaping:
+    ```typescript
+    // In Nuxt 3 / Vue component:
+    const route = useRoute();
+    const rawPostTitle = ref(post.value?.title ?? '');
+
+    // Unhead automatically escapes strings passed into titleTemplate, but manually escape inner raw HTML:
+    useHead({
+      title: computed(() => rawPostTitle.value.replace(/[<>]/g, '')),
+      titleTemplate: '%s · Acme Enterprise',
+      meta: [
+        {
+          name: 'description',
+          content: computed(() => post.value?.summary?.slice(0, 160) ?? ''),
+        },
+      ],
+    });
+    ```
+- **Vue 3.5 `toRef` Getter Syntax for Lightweight Readonly Projections**:
+  - ❌ **The Over-Engineered `computed()` Heap Bloat**: Creating multiple `computed(() => props.item.name)` watchers for lightweight, simple property reads. Each `computed` allocates an internal reactive effect, dependency tracker set, and dirty check state machine.
+  - ✅ **Production Invariant**: In Vue 3.5+, use getter-based `toRef(() => expr)` for zero-overhead readonly reactive references without instantiating heavy `computed` effect instances:
+    ```typescript
+    <script setup lang="ts">
+    import { toRef } from 'vue';
+
+    const props = defineProps<{ user: { firstName: string; lastName: string } }>();
+
+    // Lightweight getter-ref: tracks reactivity dynamically without computed cache overhead:
+    const fullName = toRef(() => `${props.user.firstName} ${props.user.lastName}`);
+    </script>
+    ```
+
 
 
 

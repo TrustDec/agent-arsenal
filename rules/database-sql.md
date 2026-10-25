@@ -720,6 +720,38 @@ alwaysApply: false
     JOIN high_value_cohort c ON c.user_id = u.id
     WHERE u.country_code = 'US';
     ```
+- **PostgreSQL Subtransactions (`SAVEPOINT`) & `pg_subtrans` SLRU Thrashing Trap**:
+  - ❌ **The Excessive Savepoint Performance Collapse**: Using nested transactions or ORMs with automatic savepoint rollback wrappers inside high-throughput loops or batch workers. In PostgreSQL, subtransactions are tracked in the shared memory `pg_subtrans` ring buffer. When a single top-level transaction exceeds 64 subtransactions, PostgreSQL can no longer cache subtransaction membership in the proc array; every subsequent visibility check incurs disk lookups and severe lock contention on `SubtransSLRU`, causing CPU usage to spike to 100% and stalling the entire database.
+  - ✅ **Production Invariant**: Strictly prohibit `SAVEPOINT` inside high-frequency loops. For batch worker processing, commit top-level transactions in bounded chunks ($N = 1,000$) or catch and handle errors at the application boundary rather than relying on nested SQL savepoints.
+- **PostgreSQL `TRUNCATE TABLE` AccessExclusiveLock Queue Starvation Trap**:
+  - ❌ **The Cluster-Freezing Table Truncate**: Executing `TRUNCATE TABLE logs;` on an active production system. `TRUNCATE` requires an `ACCESS EXCLUSIVE` lock on the target table AND all tables referencing it with foreign keys. If long-running read queries are in flight, `TRUNCATE` queues up behind them, and subsequent incoming `SELECT` queries queue behind `TRUNCATE`, locking up all application traffic within seconds.
+  - ✅ **Production Invariant**: Always guard `TRUNCATE` with a strict `lock_timeout`, or prefer chunked `DELETE` in batched loops yielding I/O:
+    ```sql
+    -- Method A: Guarded truncate with immediate fallback
+    BEGIN;
+    SET LOCAL lock_timeout = '2s';
+    TRUNCATE TABLE audit_logs;
+    COMMIT;
+
+    -- Method B: Safe chunked deletion loop for high-traffic tables
+    DO $$
+    DECLARE
+        rows_deleted INT := 1;
+    BEGIN
+        WHILE rows_deleted > 0 LOOP
+            DELETE FROM audit_logs
+            WHERE id IN (
+                SELECT id FROM audit_logs
+                WHERE created_at < NOW() - INTERVAL '90 days'
+                LIMIT 5000
+            );
+            GET DIAGNOSTICS rows_deleted = ROW_COUNT;
+            COMMIT; -- Release row locks and allow concurrent queries to breathe
+            PERFORM pg_sleep(0.05); -- 50ms cooldown prevents replication lag
+        END LOOP;
+    END $$;
+    ```
+
 
 
 

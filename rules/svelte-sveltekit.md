@@ -1019,6 +1019,55 @@ alwaysApply: false
       </button>
     </form>
     ```
+- **SvelteKit `handleServerError` Error Sanitization & Secret Leak Defense**:
+  - ❌ **The Internal Database / Secret Error Leak Trap**: Allowing unhandled server exceptions (such as database connection strings, raw SQL queries, or internal stack traces) to bubble up directly to the client. By default, uncaught exceptions can leak internal network topologies, table schemas, or authorization credentials.
+  - ✅ **Production Invariant**: Implement `handleServerError` in `src/hooks.server.ts` to log errors securely to server telemetry and return an opaque reference ID to the client:
+    ```typescript
+    // src/hooks.server.ts
+    import type { HandleServerError } from '@sveltejs/kit';
+    import crypto from 'node:crypto';
+
+    export const handleServerError: HandleServerError = ({ error, event }) => {
+      const errorId = crypto.randomUUID();
+
+      // Log full diagnostic context to server-side telemetry / APM:
+      console.error(`[Unhandled Server Error: ${errorId}]`, {
+        url: event.url.pathname,
+        method: event.request.method,
+        error: error instanceof Error ? error.stack : error,
+      });
+
+      // Return strictly sanitized error payload to the browser client:
+      return {
+        message: 'An unexpected internal error occurred. Please contact support.',
+        errorId,
+      };
+    };
+    ```
+- **Svelte 5 `$host()` Custom Element Shadow DOM Access Invariant**:
+  - ❌ **The Fragile Global DOM Query Trap in Web Components**: Authoring Svelte 5 custom elements (`<svelte:options customElement="x-player" />`) and attempting to locate the host DOM element via `document.querySelector('x-player')`. In multi-instance or nested shadow DOM trees, this returns the wrong component instance and breaks encapsulation.
+  - ✅ **Production Invariant**: In Svelte 5, use the `$host()` rune to retrieve a direct, typesafe reference to the custom element's containing host element:
+    ```svelte
+    <svelte:options customElement={{ tag: 'audio-player', shadow: 'open' }} />
+
+    <script lang="ts">
+      const host = $host<HTMLElement>();
+
+      function dispatchCustomStatus(status: string) {
+        // Dispatch native CustomEvent directly from the host element:
+        host.dispatchEvent(new CustomEvent('playbackchange', {
+          detail: { status },
+          bubbles: true,
+          composed: true, // Escape shadow DOM boundary
+        }));
+      }
+    </script>
+
+    <div class="player-controls">
+      <button onclick={() => dispatchCustomStatus('playing')}>Play</button>
+    </div>
+    ```
+
 
 
 
