@@ -783,5 +783,44 @@ alwaysApply: false
       </button>
     </form>
     ```
+- **SvelteKit `sequence` Helper for Modular Server Middleware Hooks (`hooks.server.ts`)**:
+  - ❌ **The Monolithic Hook Anti-Pattern**: Combining authentication, tenant extraction, CSRF validation, and telemetry inside a single massive `handle` function in `src/hooks.server.ts` creates tight coupling and makes unit testing impossible.
+  - ✅ **Production Invariant**: Compose modular handlers using the official `sequence` helper:
+    ```ts
+    // src/hooks.server.ts
+    import { sequence } from '@sveltejs/kit/hooks';
+    import type { Handle } from '@sveltejs/kit';
+
+    const auth: Handle = async ({ event, resolve }) => {
+      event.locals.user = await authenticateRequest(event);
+      return resolve(event);
+    };
+
+    const telemetry: Handle = async ({ event, resolve }) => {
+      const start = performance.now();
+      const response = await resolve(event);
+      const duration = performance.now() - start;
+      response.headers.set('Server-Timing', `total;dur=${duration.toFixed(2)}`);
+      return response;
+    };
+
+    export const handle: Handle = sequence(auth, telemetry);
+    ```
+- **Svelte 5 Deep Reactive Proxy Mutation vs Unnecessary Object Spreading**:
+  - ❌ **The Legacy Svelte 4 Spread Boilerplate**: In Svelte 5, using `state = { ...state, key: val }` or `array = [...array, newItem]` on `$state` objects triggers unnecessary object reallocations and breaks fine-grained signals.
+  - ✅ **Production Invariant**: Svelte 5 `$state` creates deep reactive proxies. Mutate object properties and array elements directly in place:
+    ```svelte
+    <script lang="ts">
+      let user = $state({ profile: { name: 'Alice', visits: 0 } });
+      let items = $state<string[]>([]);
+
+      function recordVisit(item: string) {
+        // Direct fine-grained mutation in Svelte 5:
+        user.profile.visits++;
+        items.push(item);
+      }
+    </script>
+    ```
+
 
 

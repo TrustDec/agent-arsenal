@@ -897,5 +897,77 @@ alwaysApply: false
         return executeCall(ctx, payload)
     }
     ```
+- **Go 1.24 Weak Pointers (`weak.Pointer`) & In-Memory Canonicalization Caches**:
+  - ❌ **The Strong Reference In-Memory Cache Leak**: Building in-memory identity caches or memoization tables using standard `map[string]*HeavyObject` prevents the Go garbage collector from ever freeing cached objects, inevitably resulting in slow, fatal memory leaks in long-running services.
+  - ✅ **Production Invariant**: Use Go 1.24+ `weak.Pointer[T]` for memory caches and canonicalization where keys should automatically be collected when no active references remain:
+    ```go
+    // Go 1.24+ weak reference cache
+    package cache
+
+    import (
+        "sync"
+        "weak"
+    )
+
+    type CanonicalCache[K comparable, V any] struct {
+        mu    sync.RWMutex
+        store map[K]weak.Pointer[V]
+    }
+
+    func (c *CanonicalCache[K, V]) GetOrSet(key K, factory func() *V) *V {
+        c.mu.RLock()
+        if wp, ok := c.store[key]; ok {
+            if val := wp.Value(); val != nil {
+                c.mu.RUnlock()
+                return val
+            }
+        }
+        c.mu.RUnlock()
+
+        c.mu.Lock()
+        defer c.mu.Unlock()
+
+        // Double-check after acquiring write lock
+        if wp, ok := c.store[key]; ok {
+            if val := wp.Value(); val != nil {
+                return val
+            }
+        }
+
+        newVal := factory()
+        c.store[key] = weak.Make(newVal)
+        return newVal
+    }
+    ```
+- **`sync.Map` Antipattern vs Sharded Concurrent Mutex Maps**:
+  - ❌ **The `sync.Map` Mutation Degeneration**: Using `sync.Map` for write-heavy key spaces or high-frequency update/delete cycles causes continuous cache-line thrashing, promotes dirty maps back to read-only maps with heap allocations, and degrades performance significantly below standard mutexes.
+  - ✅ **Production Invariant**: Reserve `sync.Map` strictly for cache-like workloads where keys are written once and read millions of times, or disjoint key sets across goroutines. For high-frequency concurrent read/write workloads, use a sharded/striped mutex map:
+    ```go
+    const ShardCount = 32
+
+    type ShardedMap[V any] struct {
+        shards [ShardCount]struct {
+            sync.RWMutex
+            items map[string]V
+        }
+    }
+
+    func (m *ShardedMap[V]) getShard(key string) *struct {
+        sync.RWMutex
+        items map[string]V
+    } {
+        h := fnv32(key)
+        return &m.shards[h%ShardCount]
+    }
+
+    func fnv32(key string) uint32 {
+        var hash uint32 = 2166136261
+        for i := 0; i < len(key); i++ {
+            hash = (hash ^ uint32(key[i])) * 16777619
+        }
+        return hash
+    }
+    ```
+
 
 

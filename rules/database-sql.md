@@ -587,4 +587,30 @@ alwaysApply: false
     ANALYZE addresses;
     ```
 
+---
+
+## 19. Zero-Downtime Column Renaming, `pg_stat_statements` & Transaction Wraparound Safety
+- **Zero-Downtime Column Renaming via Updatable Views / Dual-Write**:
+  - ❌ **The Immediate Breaking Rename**: Executing `ALTER TABLE users RENAME COLUMN phone TO mobile_phone;` acquires an `ACCESS EXCLUSIVE` lock and instantly crashes all running microservices that are currently executing queries referencing `phone`.
+  - ✅ **Production Invariant**: Use the Expand-Migrate-Contract pattern:
+    1. **Expand**: Add `mobile_phone` as a nullable column and create a bi-directional trigger to synchronize `phone <-> mobile_phone`.
+    2. **Backfill**: Batch-update existing rows in non-blocking batches (`WHERE mobile_phone IS NULL LIMIT 5000`).
+    3. **Migrate**: Deploy code pointing to `mobile_phone`.
+    4. **Contract**: Drop the sync trigger and old `phone` column safely during off-peak hours.
+- **`pg_stat_statements` & Buffer Hit Ratio Diagnostics**:
+  - ❌ **The Blind Index Creation Habit**: Guessing slow queries without profiling PostgreSQL's internal shared buffer usage.
+  - ✅ **Production Invariant**: Identify top I/O consumers via `pg_stat_statements`:
+    ```sql
+    SELECT 
+      queryid,
+      substring(query, 1, 50) AS query_preview,
+      calls,
+      round(mean_exec_time::numeric, 2) AS avg_ms,
+      round((100.0 * shared_blks_hit / nullif(shared_blks_hit + shared_blks_read, 0))::numeric, 2) AS hit_percent
+    FROM pg_stat_statements
+    ORDER BY total_exec_time DESC
+    LIMIT 10;
+    ```
+
+
 

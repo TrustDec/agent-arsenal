@@ -636,5 +636,57 @@ alwaysApply: false
     });
     </script>
     ```
+- **Nuxt 3 Nitro Server Route Error Sanitization (`createError`)**:
+  - ❌ **The Unfiltered Database Error Leak**: Catching an error in a Nitro server route (`server/api/...`) and rethrowing it directly leaks database connection strings, table schemas, and SQL syntax details to the client browser in production.
+  - ✅ **Production Invariant**: Sanitize and throw via `createError` with safe client-facing messages:
+    ```ts
+    // server/api/projects/[id].get.ts
+    export default defineEventHandler(async (event) => {
+      const id = getRouterParam(event, 'id');
+      try {
+        const project = await db.query.projects.findFirst({
+          where: eq(projects.id, id),
+        });
+        if (!project) {
+          throw createError({
+            statusCode: 404,
+            statusMessage: 'Project not found',
+          });
+        }
+        return project;
+      } catch (err: any) {
+        if (err.statusCode) throw err;
+        console.error('[Database Error]', err); // Server-side log with full details
+        throw createError({
+          statusCode: 500,
+          statusMessage: 'Internal server error', // Sanitized message for client
+        });
+      }
+    });
+    ```
+- **SSR Hydration-Safe Deterministic Timestamps**:
+  - ❌ **The `new Date()` Hydration Mismatch**: Evaluating `new Date().toLocaleDateString()` directly in Vue component templates produces different strings on the Node.js server (UTC) and the client browser (local timezone), triggering Vue warning `[Vue warn]: Hydration text content mismatch`.
+  - ✅ **Production Invariant**: Use ISO string formatting from the server and defer localized formatting to client-mounted components or `<ClientOnly>`:
+    ```vue
+    <script setup lang="ts">
+    import { ref, onMounted } from 'vue';
+
+    const props = defineProps<{ timestamp: string }>();
+    const formattedDate = ref(props.timestamp); // Safe fallback matching SSR
+
+    onMounted(() => {
+      // Localize only after hydration completes safely:
+      formattedDate.value = new Intl.DateTimeFormat(navigator.language, {
+        dateStyle: 'medium',
+        timeStyle: 'short',
+      }).format(new Date(props.timestamp));
+    });
+    </script>
+
+    <template>
+      <time :datetime="props.timestamp">{{ formattedDate }}</time>
+    </template>
+    ```
+
 
 
