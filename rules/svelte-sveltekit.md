@@ -1463,6 +1463,29 @@ alwaysApply: false
       };
     </script>
     ```
+- **Svelte 5 `$effect.pre` for Synchronous Layout & Scroll Restoration**:
+  - ❌ **The Screen Flickering & FOUC in `$effect`**: Measuring DOM heights or restoring scroll positions inside standard `$effect()`. In Svelte 5, `$effect` runs *after* the browser has already painted the DOM, causing noticeable layout shifts, jitter, and screen flickering.
+  - ✅ **Production Invariant**: Use `$effect.pre()` to run layout calculations and scroll stabilization *before* the DOM updates are painted to the screen:
+    ```svelte
+    <script lang="ts">
+      let messages = $state<string[]>([]);
+      let container: HTMLElement;
+
+      $effect.pre(() => {
+        // Read current scroll height before DOM mutation
+        if (container) {
+          const isAtBottom = container.scrollHeight - container.scrollTop === container.clientHeight;
+          // Synchronous post-update scroll restoration before screen paint
+          tick().then(() => {
+            if (isAtBottom) container.scrollTop = container.scrollHeight;
+          });
+        }
+      });
+    </script>
+    ```
+- **SvelteKit Universal `fetch` vs Naked Global `fetch`**:
+  - ❌ **The Naked Global `fetch` Cookie & Hydration Hazard**: Calling global `fetch()` inside a `load` function instead of using the provided `{ fetch }` parameter in `PageLoad` / `LayoutLoad`. Naked `fetch` fails to inherit incoming request cookies/auth headers during SSR and causes double-fetching on the client instead of inlining data into the hydration payload.
+  - ✅ **Production Invariant**: Always use the injected event `load({ fetch })` parameter across all SvelteKit load functions.
 
 
 

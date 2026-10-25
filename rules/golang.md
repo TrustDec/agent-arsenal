@@ -1504,6 +1504,31 @@ alwaysApply: false
 - **Context Teardown Hygiene with `context.AfterFunc`**:
   - ❌ **The Orphan Goroutine Teardown Watcher**: Spawning a dedicated goroutine `go func() { <-ctx.Done(); cleanup() }()` to monitor cancellation. This leaks a full stack frame (2KB–8KB) per connection/request, incurs scheduler context switching overhead, and delays cleanup.
   - ✅ **Production Invariant**: Use `stop := context.AfterFunc(ctx, cleanupFunc)` introduced in Go 1.21+. It executes `cleanupFunc` asynchronously in its own goroutine when the context expires or is cancelled, and returns a cancellation handle (`stop()`) to deregister the callback immediately when work finishes normally.
+- **Go 1.24+ Swiss Tables Map Architecture & Predictable Iteration**:
+  - ❌ **Relying on Pseudo-Ordering in Map Iteration**: Go 1.24 incorporates a Swiss Tables map redesign using SSE2/AVX2 control bytes for 30% faster lookups. However, Go randomized map iteration seed remains active. Relying on map iteration order when building deterministic signatures, JSON payloads, or cryptographic digests causes non-deterministic output and broken cache hits.
+  - ✅ **Production Invariant**: Always sort map keys explicitly (`slices.Sort(keys)`) before computing cryptographic hashes (SHA-256) or sending payloads across network boundaries.
+- **Go 1.24+ `testing/synctest` for Hermetic Virtualized Concurrency Testing**:
+  - ❌ **Arbitrary Wall-Clock Sleeps in Concurrency Tests**: Using `time.Sleep()` or flaky channel timers to test timeout and deadline logic across goroutines. Under CI load, wall-clock sleeps cause intermittent test failures and balloon execution runtimes.
+  - ✅ **Production Invariant**: In Go 1.24+, use `testing/synctest` (`synctest.Run(func() { ... })`) to execute concurrent code bubbles under a virtualized system clock. `synctest.Wait()` blocks until all goroutines in the bubble are idle, advancing virtual time deterministically and running simulated multi-minute timeouts in milliseconds without flakiness:
+    ```go
+    func TestWorkerTimeoutHermetic(t *testing.T) {
+        synctest.Run(func() {
+            ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+            defer cancel()
+
+            worker := NewWorker()
+            done := make(chan error, 1)
+            go func() {
+                done <- worker.Process(ctx)
+            }()
+
+            // Advances virtualized clock immediately without real-world sleep
+            synctest.Wait()
+            err := <-done
+            require.ErrorIs(t, err, context.DeadlineExceeded)
+        })
+    }
+    ```
 
 
 

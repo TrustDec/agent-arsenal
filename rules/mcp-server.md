@@ -329,6 +329,26 @@ alwaysApply: false
     }));
     ```
 
+## 16. Client Cancellation Notifications (`notifications/cancelled`) & Progress Telemetry
+- **Propagating Client Abort Signals to In-Flight Operations**:
+  - When a user stops generation in Claude Desktop/Cursor or an orchestrator encounters a step timeout, the client sends a `notifications/cancelled` notification with the target `requestId`.
+  - ❌ **The Orphan Background Execution Trap**: If the MCP server ignores `notifications/cancelled`, expensive shell commands, LLM sampling calls, or database mutations continue executing in the background, wasting compute, leaking file handles, and corrupting state.
+  - ✅ **Production Invariant**: Map incoming JSON-RPC `requestId`s to active `AbortController` instances. Upon receiving `notifications/cancelled`, immediately invoke `controller.abort()` to terminate child processes (`child.kill('SIGTERM')`), cancel HTTP fetches, and release database transactions:
+    ```ts
+    const activeRequests = new Map<string | number, AbortController>();
+
+    server.setNotificationHandler(CancelledNotificationSchema, (notification) => {
+      const controller = activeRequests.get(notification.params.requestId);
+      if (controller) {
+        controller.abort(notification.params.reason || 'Operation cancelled by MCP client');
+        activeRequests.delete(notification.params.requestId);
+      }
+    });
+    ```
+- **Progress Token Telemetry (`notifications/progress`)**:
+  - For long-running operations (e.g. repo indexing, large downloads, or multi-step migrations), accept an optional `_meta.progressToken` from the client request.
+  - Emit intermediate `notifications/progress` updates with `progress` and `total` counters so the client UI displays accurate interactive progress indicators rather than hanging silently.
+
 
 
 

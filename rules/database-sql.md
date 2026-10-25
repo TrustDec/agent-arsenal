@@ -957,6 +957,17 @@ alwaysApply: false
 - **Partition Pruning Invariants & Dynamic Query Anti-Patterns**:
   - ❌ **The Runtime Pruning De-Optimization**: Partitioning large event tables (e.g., `audit_logs` by month) but querying using non-immutable functions or un-indexed expressions (e.g. `WHERE DATE_TRUNC('month', created_at) = '2026-03-01'::timestamptz`). PostgreSQL cannot prune partition branches at planning time, forcing sequential scans across all hundreds of sub-partitions.
   - ✅ **Production Invariant**: Always provide direct, sargable range boundaries on the exact partitioning key (`WHERE created_at >= '2026-03-01' AND created_at < '2026-04-01'`). Verify partition pruning in `EXPLAIN` output: look for `Partitions pruned: N` and ensure only the targeted partition table is scanned.
+- **PostgreSQL Transaction ID (TXID) Wraparound Prevention & Freeze Map Tuning**:
+  - ❌ **The 2-Billion Transaction Catastrophic Read-Only Shutdown**: High-throughput write workloads and agent event stores generate billions of transaction IDs. If autovacuum cannot keep up with freezing old tuples, PostgreSQL reaches `autovacuum_freeze_max_age` (default 200M) and ultimately shuts down into single-user emergency read-only mode at 2.1 billion transactions to prevent silent data corruption.
+  - ✅ **Production Invariant**: Proactively monitor TXID age (`SELECT max(age(datfrozenxid)) FROM pg_database;`). On modern NVMe storage, raise `autovacuum_vacuum_cost_limit = 2000` (up from default 200) and lower `autovacuum_vacuum_cost_delay = 2ms` so autovacuum freezes old tuples at 10x throughput without starving client connections.
+- **Foreign Key Index Invariants & Cascade Lock Serialization**:
+  - ❌ **The Missing Foreign Key Index Cascade Lock**: PostgreSQL creates unique indexes for `PRIMARY KEY` and `UNIQUE` constraints, but **NEVER** automatically indexes referencing foreign key columns (`REFERENCES users(id)`). Deleting or updating a parent record forces a table scan or row-level share locks on the child table, serializing concurrent writes and triggering massive production deadlock spikes.
+  - ✅ **Production Invariant**: Always create explicit B-tree indexes on foreign key columns referencing parent tables:
+    ```sql
+    -- Mandatory child foreign key index preventing table lock serialization
+    CREATE INDEX CONCURRENTLY idx_orders_user_id ON orders(user_id);
+    CREATE INDEX CONCURRENTLY idx_order_items_order_id ON order_items(order_id);
+    ```
 
 
 
