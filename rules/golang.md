@@ -1462,6 +1462,33 @@ alwaysApply: false
 - **Go 1.24+ Swiss Tables Map Architecture & Allocation Pacing**:
   - ❌ **The Unsized Swiss Table Rehash Penalty**: In Go 1.24, Go's runtime replaces legacy 8-slot bucket hash maps with Swiss Tables (flat group SIMD control-byte probing). While lookup performance is significantly faster and memory overhead per element is reduced, growing a map dynamically from zero capacity still incurs multi-phase allocation, control byte rehashing, and table expansion overhead.
   - ✅ **Production Invariant**: Always pre-size maps when item count is known or bounded (`make(map[K]V, count)`). In Go 1.24+, this pre-allocates contiguous control-byte groups and value slots in a single contiguous memory block, achieving optimal SIMD instruction cache locality and eliminating rehashing pauses.
+- **Go 1.24+ Weak Pointers (`weak.Pointer`) & Zero-Leak In-Memory Caches**:
+  - ❌ **The Strong Pointer Cache Retain Trap**: Maintaining canonicalization caches, symbol intern tables, or session memoizers using strong references (`map[string]*LargeObject`). Even if all caller goroutines have discarded the object, the cache map retains a root pointer, completely blinding the GC and causing gradual memory exhaustion.
+  - ✅ **Production Invariant**: In Go 1.24+, use standard library `weak.Make(ptr)` to store weak references (`weak.Pointer[T]`). A weak pointer allows the garbage collector to reclaim the object when no strong references remain, returning `nil` when accessed via `wp.Value()`:
+    ```go
+    import "weak"
+
+    type CanonicalCache[K comparable, V any] struct {
+        mu    sync.RWMux
+        store map[K]weak.Pointer[V]
+    }
+
+    func (c *CanonicalCache[K, V]) Get(key K) *V {
+        c.mu.RLock()
+        wp, exists := c.store[key]
+        c.mu.RUnlock()
+
+        if !exists {
+            return nil
+        }
+        // Returns nil if GC reclaimed the target object
+        return wp.Value()
+    }
+    ```
+- **Go 1.24+ Finalizer Modernization with `runtime.AddCleanup`**:
+  - ❌ **The Fragile Legacy `runtime.SetFinalizer` Object Resurrection**: Legacy finalizers (`runtime.SetFinalizer(x, fn)`) fail completely on circular reference structures, delay collection of `x` and its dependencies by at least one full additional GC cycle, and can accidentally resurrect the dead object.
+  - ✅ **Production Invariant**: In Go 1.24+, replace all `runtime.SetFinalizer` calls with `runtime.AddCleanup(ptr, cleanupFunc, arg)`. The cleanup function receives an isolated value `arg` (such as an OS file descriptor or socket handle) rather than the parent object, completely eliminating cyclic reference memory leaks and resurrection bugs.
+
 
 
 

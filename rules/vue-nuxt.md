@@ -1147,6 +1147,49 @@ alwaysApply: false
       return freshData;
     });
     ```
+- **Vue 3.5+ Native Reactive Props Destructuring & Default Values**:
+  - ❌ **The Lost Reactivity Trap of Legacy `defineProps`**: In Vue 3.0–3.4, destructuring `defineProps()` (`const { title } = defineProps<Props>()`) stripped reactivity, forcing developers to use boilerplate `toRefs()` or `withDefaults(...)`.
+  - ✅ **Production Invariant**: In Vue 3.5+, props destructuring is compiled into reactive getters. Use native JavaScript default parameters directly; the Vue compiler preserves full reactivity across `computed`, `watch`, and templates:
+    ```vue
+    <script setup lang="ts">
+    import { computed } from 'vue';
+
+    // Vue 3.5+ fully reactive destructuring with native defaults
+    const { count = 0, label = 'Counter' } = defineProps<{
+      count?: number;
+      label?: string;
+    }>();
+
+    const doubled = computed(() => count * 2);
+    </script>
+
+    <template>
+      <div>{{ label }}: {{ count }} (Doubled: {{ doubled }})</div>
+    </template>
+    ```
+- **Nuxt 3 Route Middleware Invariants & Universal Auth Guards**:
+  - ❌ **The SSR Window Crash & Infinite Redirect Loop**: Accessing browser-only globals (`window.localStorage`) inside `defineNuxtRouteMiddleware` causes SSR 500 server crashes. Failing to check `to.path === '/login'` causes infinite client redirect loops.
+  - ✅ **Production Invariant**: Always use `useCookie()` for universal token access across SSR and client transitions. Always guard redirection against the target destination to eliminate redirect loops:
+    ```ts
+    // middleware/auth.ts
+    export default defineNuxtRouteMiddleware((to) => {
+      const token = useCookie('auth_token');
+
+      // Unauthenticated users trying to access protected routes
+      if (!token.value && to.path !== '/login') {
+        return navigateTo({
+          path: '/login',
+          query: { redirect: to.fullPath },
+        });
+      }
+
+      // Authenticated users trying to visit login page
+      if (token.value && to.path === '/login') {
+        return navigateTo('/dashboard');
+      }
+    });
+    ```
+
 
 
 

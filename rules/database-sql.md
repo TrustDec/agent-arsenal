@@ -917,6 +917,32 @@ alwaysApply: false
 - **PostgreSQL `GENERATED ALWAYS AS (expr) STORED` vs Expression Indexes**:
   - ❌ **The STORED Generated Column WAL & Tuple Bloat**: Using `STORED` generated columns for frequently updated JSON extractions or string formatting (`full_name TEXT GENERATED ALWAYS AS (first_name || ' ' || last_name) STORED`). STORED columns physically write duplicate bytes to disk on every row, reducing row density per 8KB page, increasing I/O cache misses, and doubling WAL generation during write spikes.
   - ✅ **Production Invariant**: For read-heavy query filtering or sorting on derived attributes, prefer Expression Indexes (`CREATE INDEX idx_users_full_name ON users ((first_name || ' ' || last_name));`) or virtual generated views. Only use `STORED` generated columns when the column must be directly referenced by foreign key constraints or exported via replication tools.
+- **PostgreSQL Concurrent Work Queues via `FOR UPDATE SKIP LOCKED`**:
+  - ❌ **The `FOR UPDATE` Lock Convoy & Head-of-Line Blocking Trap**: Building background task queues with `SELECT id FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE;`. When multiple worker processes poll the queue concurrently, every worker waits behind the first worker's transaction lock. If worker 1 takes 2 seconds to process its job, all other workers are frozen in a lock convoy, collapsing concurrency from $N$ workers to strictly 1 serialized worker.
+  - ✅ **Production Invariant**: Always use `FOR UPDATE SKIP LOCKED`. PostgreSQL skips rows locked by concurrent transactions, allowing $N$ workers to claim $N$ distinct jobs simultaneously with zero lock contention:
+    ```sql
+    -- Atomic, non-blocking job claim across concurrent workers
+    WITH claimed_job AS (
+      SELECT id
+      FROM background_jobs
+      WHERE status = 'pending'
+        AND scheduled_at <= CLOCK_TIMESTAMP()
+      ORDER BY priority DESC, scheduled_at ASC
+      LIMIT 1
+      FOR UPDATE SKIP LOCKED
+    )
+    UPDATE background_jobs j
+    SET status = 'processing',
+        locked_at = CLOCK_TIMESTAMP(),
+        worker_id = $1
+    FROM claimed_job
+    WHERE j.id = claimed_job.id
+    RETURNING j.*;
+    ```
+- **PostgreSQL TOAST Storage Discipline & Hot-Row Updates**:
+  - ❌ **The In-Page TOAST Thrashing & WAL Bloat**: Storing large payloads (e.g. 10KB+ JSONB execution traces or prompt histories) directly in primary entity rows with frequent status updates. Updating unrelated columns (e.g. `UPDATE agent_tasks SET status = 'active'`) still writes new row versions to the heap. If large JSONB attributes are modified repeatedly, uncompressed updates trigger massive WAL amplification and exhaust autovacuum workers.
+  - ✅ **Production Invariant**: Segregate volatile status columns from large semi-static payloads into a 1:1 auxiliary table (e.g., `agent_tasks` vs `agent_task_payloads`). For pre-compressed data (gzipped bytes or images), alter column storage to `EXTERNAL` (`ALTER TABLE agent_task_payloads ALTER COLUMN raw_blob SET STORAGE EXTERNAL;`) to skip redundant and costly lz4/pglz compression CPU cycles.
+
 
 
 

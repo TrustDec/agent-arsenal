@@ -1373,6 +1373,54 @@ alwaysApply: false
       };
     };
     ```
+- **Svelte 5 `$bindable()` Two-Way State Invariants**:
+  - ❌ **The Implicit Mutation Bug**: Mutating incoming `$props()` directly or expecting child changes to reflect in parents without contracts. In Svelte 5, props are strictly read-only and unidirectional by default.
+  - ✅ **Production Invariant**: When a child component must support two-way synchronization with parent state (e.g., custom checkboxes, range sliders, or dialog states), declare the prop explicitly with `$bindable()`:
+    ```svelte
+    <!-- Switch.svelte -->
+    <script lang="ts">
+      let { checked = $bindable(false), label = 'Toggle' }: {
+        checked?: boolean;
+        label?: string;
+      } = $props();
+    </script>
+
+    <button
+      role="switch"
+      aria-checked={checked}
+      onclick={() => checked = !checked}
+    >
+      {label}: {checked ? 'ON' : 'OFF'}
+    </button>
+    ```
+- **SvelteKit Progressive Enhancement via `use:enhance` & Optimistic Rollbacks**:
+  - ❌ **The Full-Page Browser Flash on Mutation**: Submitting forms natively without progressive enhancement causes jarring browser reloads, drops active client state, and resets viewport scroll positions.
+  - ✅ **Production Invariant**: Always attach `use:enhance` to SvelteKit mutation forms. Apply optimistic state updates immediately in the callback, and roll back cleanly if the server action returns an error:
+    ```svelte
+    <script lang="ts">
+      import { enhance } from '$app/forms';
+
+      let items = $state<string[]>(['Item 1']);
+
+      function optimisticSubmit() {
+        const newItem = `Item ${items.length + 1}`;
+        const previous = [...items];
+        items.push(newItem); // Optimistic UI update
+
+        return async ({ result, update }) => {
+          if (result.type === 'failure' || result.type === 'error') {
+            items = previous; // Rollback on failure
+          }
+          await update();
+        };
+      }
+    </script>
+
+    <form method="POST" action="?/add" use:enhance={optimisticSubmit}>
+      <button type="submit">Add Item</button>
+    </form>
+    ```
+
 
 
 

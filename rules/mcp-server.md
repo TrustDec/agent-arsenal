@@ -278,6 +278,35 @@ alwaysApply: false
     };
     ```
 
+## 14. Roots Protocol, Filesystem Sandboxing & Concurrency Throttling
+- **MCP Roots Protocol (`roots/list`) & Workspace Boundary Enforcement**:
+  - Filesystem-manipulating MCP servers must query the client for permitted root directories via `roots/list` and listen for `notifications/roots/list_changed`:
+    ```ts
+    // Query client workspace roots to establish path boundaries
+    const { roots } = await server.request(
+      { method: 'roots/list' },
+      ListRootsResultSchema
+    );
+
+    function assertPathInWorkspace(targetPath: string, allowedRoots: string[]) {
+      const resolved = path.resolve(targetPath);
+      const isAllowed = allowedRoots.some(root => {
+        const rootPath = fileURLToPath(root.uri);
+        return resolved.startsWith(rootPath) && !resolved.includes('..');
+      });
+      if (!isAllowed) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `Access denied: path ${targetPath} is outside permitted workspace roots.`
+        );
+      }
+    }
+    ```
+- **Parallel Tool Call Concurrency Throttling**:
+  - Frontier LLMs frequently emit 5–15 simultaneous tool calls in a single response turn. Spawning unthrottled child processes or database connections simultaneously causes `EMFILE` (too many open files) or connection pool exhaustion.
+  - Bound concurrent tool executions with an internal semaphore queue (e.g. max 4 concurrent tool runs, queueing remaining calls with execution timeouts).
+
+
 
 
 
