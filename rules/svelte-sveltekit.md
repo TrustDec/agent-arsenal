@@ -1155,6 +1155,53 @@ alwaysApply: false
       <span>{name}</span> - <span>{role}</span>
     </button>
     ```
+- **Svelte 5 `$derived.by` for Complex Multi-Statement Computations**:
+  - ❌ **The IIFE Derivation Anti-Pattern**: Attempting to execute multi-step branching logic or loops inside `$derived((() => { ... })())`. This introduces unnecessary closure overhead, clutters code, and deviates from Svelte 5 idiomatic reactive primitives.
+  - ✅ **Production Invariant**: Use Svelte 5 `$derived.by(() => { ... })` for any derived computation requiring branching logic, temporary variables, or array transformations:
+    ```svelte
+    <script lang="ts">
+      let { products, searchQuery, minRating } = $props<{
+        products: Array<{ id: string; title: string; rating: number; inStock: boolean }>;
+        searchQuery: string;
+        minRating: number;
+      }>();
+
+      // Idiomatic Svelte 5 multi-statement computation:
+      const matchedProducts = $derived.by(() => {
+        const query = searchQuery.trim().toLowerCase();
+        return products.filter(p => {
+          if (!p.inStock) return false;
+          if (p.rating < minRating) return false;
+          return query === '' || p.title.toLowerCase().includes(query);
+        });
+      });
+    </script>
+    ```
+- **SvelteKit Fine-Grained `depends()` & Targeted `invalidate()` vs Wholesale `invalidateAll()`**:
+  - ❌ **The `invalidateAll()` Over-Fetching Cascade**: Invoking `invalidateAll()` upon every single user mutation. This forces SvelteKit to re-run every `load` function on the page hierarchy, triggering unnecessary database queries and destroying client cache performance.
+  - ✅ **Production Invariant**: Register targeted custom URI dependencies using `depends('app:orders')` in `load` functions, and invalidate only that specific tag upon mutation:
+    ```ts
+    // src/routes/dashboard/+page.ts
+    export const load = async ({ fetch, depends }) => {
+      // Register custom dependency tag:
+      depends('app:dashboard-metrics');
+
+      const res = await fetch('/api/v1/metrics');
+      return { metrics: await res.json() };
+    };
+    ```
+    ```svelte
+    <!-- src/routes/dashboard/+page.svelte -->
+    <script lang="ts">
+      import { invalidate } from '$app/navigation';
+
+      async function refreshMetrics() {
+        // Only re-runs load functions tagged with 'app:dashboard-metrics'
+        await invalidate('app:dashboard-metrics');
+      }
+    </script>
+    ```
+
 
 
 

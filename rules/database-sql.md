@@ -807,6 +807,37 @@ alwaysApply: false
     CREATE INDEX CONCURRENTLY idx_order_items_order_id ON order_items (order_id);
     CREATE INDEX CONCURRENTLY idx_order_items_product_id ON order_items (product_id);
     ```
+- **PostgreSQL TOAST Table Bloat & In-Line JSONB Thrashing**:
+  - ❌ **The Unfiltered TOAST Scan & Write Amplification**: Storing multi-megabyte `JSONB` or large `TEXT` documents directly in high-velocity transaction tables (e.g., `events`, `orders`, `audit_logs`). In PostgreSQL, attributes exceeding ~2KB are compressed and pushed into out-of-line TOAST tables. Even though a query only updates `status = 'PROCESSED'`, PostgreSQL's MVCC creates a new tuple and duplicates TOAST references; and if the JSONB itself is updated, full TOAST chunks are rewritten, multiplying disk I/O by 10x and causing massive VACUUM degradation.
+  - ✅ **Production Invariant**: Vertically partition large semi-structured payloads into dedicated auxiliary storage tables, keeping the high-velocity operational table lean, fast, and cache-friendly:
+    ```sql
+    -- High-throughput operational table: Fits entirely in buffer cache
+    CREATE TABLE webhook_events (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL,
+        event_type VARCHAR(64) NOT NULL,
+        status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+        retry_count INT NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+    );
+
+    -- Isolated heavyweight payload table: Read only upon final processing
+    CREATE TABLE webhook_payloads (
+        event_id UUID PRIMARY KEY REFERENCES webhook_events(id) ON DELETE CASCADE,
+        headers JSONB NOT NULL,
+        raw_body TEXT NOT NULL,
+        decompressed_size INT GENERATED ALWAYS AS (octet_length(raw_body)) STORED
+    );
+    ```
+- **Session-Level `idle_in_transaction_session_timeout` to Prevent Connection Pool Exhaustion**:
+  - ❌ **The Dormant Transaction Lock Freeze**: An application handler starts a database transaction (`BEGIN`), then executes a slow external network call (e.g. Stripe payment, OpenAI LLM completion, or S3 upload) while holding row locks. If the HTTP call hangs or takes 30 seconds, PostgreSQL transaction IDs stay open, active locks block other transactions, autovacuum is blocked from cleaning dead tuples, and the connection pool saturates.
+  - ✅ **Production Invariant**: Enforce strict session and database timeouts, and NEVER execute external I/O or network requests inside database transactions:
+    ```sql
+    -- Enforce at database or user level:
+    ALTER DATABASE production_db SET idle_in_transaction_session_timeout = '5000ms';
+    ALTER DATABASE production_db SET statement_timeout = '15000ms';
+    ```
+
 
 
 

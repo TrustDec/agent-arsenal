@@ -981,6 +981,47 @@ alwaysApply: false
     });
     </script>
     ```
+- **`shallowRef` & `markRaw` for Non-UI Instances & High-Frequency Datasets**:
+  - ❌ **The Deep Proxy Overhead Trap**: Wrapping large arrays (e.g. 10,000 table rows) or complex third-party class instances (e.g. Monaco Editor, ECharts, Three.js scenes, Leaflet maps) with standard `ref()` or `reactive()`. Vue recursively walks and converts every nested property into a reactive Proxy, triggering catastrophic CPU stalls, GC churn, and unexpected mutation bugs inside third-party internal prototypes.
+  - ✅ **Production Invariant**: Use `shallowRef()` for collections that are updated wholesale, and wrap third-party class instances with `markRaw()`:
+    ```vue
+    <script setup lang="ts">
+    import { shallowRef, markRaw, onMounted, onBeforeUnmount } from 'vue';
+    import * as echarts from 'echarts';
+
+    // shallowRef: Only mutations to .value trigger re-renders; avoids deep Proxy traversal
+    const timeSeriesData = shallowRef<Array<{ time: number; value: number }>>([]);
+
+    // markRaw: Explicitly prevents Vue from ever wrapping the chart instance in a Proxy
+    let chartInstance: echarts.ECharts | null = null;
+
+    onMounted(() => {
+      const container = document.getElementById('chart-container');
+      if (container) {
+        chartInstance = markRaw(echarts.init(container));
+      }
+    });
+
+    onBeforeUnmount(() => {
+      chartInstance?.dispose();
+    });
+    </script>
+    ```
+- **Nuxt 3 Route Middleware Navigation Guards & Hydration Mismatch Safety**:
+  - ❌ **The Direct Browser Window / Storage Access Anti-Pattern**: Accessing `window.localStorage` or `document.cookie` directly inside universal route middleware without SSR guards. During SSR execution on the server, `window` is `undefined`, crashing the rendering engine with `ReferenceError: window is not defined`.
+  - ✅ **Production Invariant**: Use `useCookie()` or `import.meta.client` guards in Nuxt 3 route middleware:
+    ```ts
+    // middleware/auth.global.ts
+    export default defineNuxtRouteMiddleware((to, from) => {
+      // useCookie is universal: seamlessly works across server SSR and client hydration
+      const sessionToken = useCookie('session_token');
+
+      if (!sessionToken.value && to.path.startsWith('/admin')) {
+        return navigateTo('/login', { redirectCode: 302 });
+      }
+    });
+    ```
+
 
 
 

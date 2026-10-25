@@ -100,3 +100,63 @@ alwaysApply: false
     ```
 - **Secret Hygiene**:
   - Mask credentials, authorization headers, and API keys before logging or returning payloads to the agent.
+
+## 6. HTTP / Server-Sent Events (SSE) Transport & Session Lifecycle
+- **Dual Endpoint Architecture**:
+  - For remote / multi-client MCP servers, use standard HTTP with SSE:
+    - `GET /sse`: Establishes the downstream event stream from server to client.
+    - `POST /message?sessionId=<uuid>`: Ingests upstream JSON-RPC client messages.
+- **Session Resumption & Isolated State**:
+  - Generate a secure cryptographically random `sessionId` (UUIDv4) upon establishing the `/sse` connection.
+  - Store transport message buffers per session; never cross-contaminate state across distinct client sessions.
+- **SSE Keep-Alive Pings**:
+  - Send periodic comment pings (`: ping\n\n`) every 15-30 seconds to prevent intermediate reverse proxies (NGINX, Cloudflare, ALB) from terminating idle SSE connections.
+- **Strict CORS & Origin Validation**:
+  - Remote MCP SSE endpoints must validate incoming `Origin` and `Host` headers to prevent Cross-Site WebSocket/SSE Hijacking and SSRF.
+
+## 7. Capability Exchange & Bi-directional Sampling
+- **Dynamic Capability Negotiation**:
+  - During `initialize`, declare exact server capabilities:
+    ```json
+    {
+      "capabilities": {
+        "tools": { "listChanged": true },
+        "resources": { "subscribe": true, "listChanged": true },
+        "prompts": { "listChanged": true },
+        "logging": {}
+      }
+    }
+    ```
+- **Server-to-Client Sampling (`sampling/createMessage`)**:
+  - MCP allows servers to request nested LLM inference from the client agent host (Claude Desktop, Cursor, Pi).
+  - Use sampling sparingly for intelligent tool-level tasks (e.g. summarizing a 500-line diff before returning to orchestrator).
+  - Always enforce `maxTokens`, `temperature: 0.0`, and provide clear system instructions in sampling requests.
+
+## 8. Progress Tokens & Task Cancellation Invariants
+- **Progress Reporting (`notifications/progress`)**:
+  - For long-running operations (e.g. database migration, test suite run, heavy build), accept `_meta: { progressToken: string | number }` in tool arguments.
+  - Emit periodic `notifications/progress` notifications with `progress` and `total` values so the client harness can render accurate UI progress bars:
+    ```json
+    {
+      "jsonrpc": "2.0",
+      "method": "notifications/progress",
+      "params": {
+        "progressToken": "token-123",
+        "progress": 45,
+        "total": 100
+      }
+    }
+    ```
+- **Cancellation Token Handling (`notifications/cancelled`)**:
+  - MCP clients dispatch `notifications/cancelled` when the user aborts an action.
+  - Pass an `AbortSignal` through all asynchronous tool handlers; immediately abort background subprocesses and network fetch calls when `notifications/cancelled` is received.
+
+## 9. Standard JSON-RPC 2.0 Error Codes
+- Return standard JSON-RPC 2.0 protocol error codes for protocol-level failures:
+  - `-32700`: Parse error (invalid JSON received by the server).
+  - `-32600`: Invalid Request (payload is not a valid JSON-RPC 2.0 object).
+  - `-32601`: Method not found (tool, resource, or prompt method does not exist).
+  - `-32602`: Invalid params (Zod/schema validation failure on tool arguments).
+  - `-32603`: Internal error (unhandled internal server crash).
+- Application-level business errors (e.g. "record not found", "insufficient balance") MUST be returned inside `{ isError: true, content: [...] }` as a successful JSON-RPC response, NOT as protocol-level `-32603` errors.
+

@@ -1288,6 +1288,69 @@ alwaysApply: false
         }(ctx)
     }
     ```
+- **Bounded Worker Pools vs Unbounded Goroutine Spawning**:
+  - ❌ **The Unbounded Goroutine Memory Explosion**: Spawning an unthrottled goroutine for every incoming HTTP request or message queue event (`go handle(msg)`). Under high traffic spikes (e.g., 50,000 req/sec), Go allocates tens of thousands of goroutine stacks, exhausts OS file descriptors and socket buffers, and degrades CPU cache locality with excessive scheduling overhead.
+  - ✅ **Production Invariant**: Bound concurrency using a fixed worker pool with a buffered channel or an explicit weighted semaphore (`golang.org/x/sync/semaphore`):
+    ```go
+    type JobPool struct {
+        tasks chan func(ctx context.Context)
+        wg    sync.WaitGroup
+    }
+
+    func NewJobPool(workers int, queueCapacity int) *JobPool {
+        p := &JobPool{
+            tasks: make(chan func(context.Context), queueCapacity),
+        }
+        p.wg.Add(workers)
+        for i := 0; i < workers; i++ {
+            go func() {
+                defer p.wg.Done()
+                for task := range p.tasks {
+                    task(context.Background())
+                }
+            }()
+        }
+        return p
+    }
+
+    func (p *JobPool) Submit(ctx context.Context, task func(ctx context.Context)) bool {
+        select {
+        case p.tasks <- task:
+            return true
+        case <-ctx.Done():
+            return false // Task dropped due to caller context cancellation/timeout
+        default:
+            return false // Backpressure: queue saturated
+        }
+    }
+    ```
+- **`sync.Pool` Pointer Re-Zeroing & Memory Leak Prevention**:
+  - ❌ **The Dangling Pointer Heap Retention Bug**: Returning structs containing pointers, maps, or sub-slices back to `sync.Pool` without clearing the referenced pointers (`buf.Data = buf.Data[:0]`). The Go garbage collector treats pointers remaining in pooled objects as active roots, preventing large previously allocated objects from being garbage collected across GC cycles.
+  - ✅ **Production Invariant**: Always zero out pointers, maps, and sub-slices before returning structs to `sync.Pool`:
+    ```go
+    type EventBuffer struct {
+        Payload  []byte
+        Headers  map[string]string // Pointer-bearing type!
+        Metadata *EventMeta        // Pointer-bearing type!
+    }
+
+    var eventBufferPool = sync.Pool{
+        New: func() any {
+            return &EventBuffer{
+                Payload: make([]byte, 0, 4096),
+                Headers: make(map[string]string),
+            }
+        },
+    }
+
+    func PutEventBuffer(buf *EventBuffer) {
+        buf.Payload = buf.Payload[:0]
+        clear(buf.Headers) // Go 1.21+ built-in clear() to delete all keys
+        buf.Metadata = nil // Nil out pointer to allow GC of underlying object
+        eventBufferPool.Put(buf)
+    }
+    ```
+
 
 
 
