@@ -1127,6 +1127,51 @@ alwaysApply: false
         slog.Error("pipeline terminated abnormally", "cause", err)
     }
     ```
+- **`http.Transport.MaxIdleConnsPerHost` Default Socket Exhaustion Trap**:
+  - ❌ **The Default `MaxIdleConnsPerHost = 2` Pitfall**: In Go's `http.DefaultTransport`, `MaxIdleConnsPerHost` defaults to `2`. Under microservice concurrency (e.g. 500 parallel requests to an auth service or payment gateway), only 2 idle connections are kept in the pool; the remaining 498 connections are forcefully closed immediately upon completion. This triggers severe TCP socket churn, kernel `TIME_WAIT` socket exhaustion, ephemeral port depletion, and repeated TLS handshake latency overhead.
+  - ✅ **Production Invariant**: Always construct a tuned custom `http.Transport` sizing `MaxIdleConnsPerHost` proportionally to your expected concurrency:
+    ```go
+    // Production tuned HTTP transport for high-throughput inter-service communication
+    var resilientClient = &http.Client{
+        Timeout: 10 * time.Second,
+        Transport: &http.Transport{
+            Proxy: http.ProxyFromEnvironment,
+            DialContext: (&net.Dialer{
+                Timeout:   5 * time.Second,
+                KeepAlive: 30 * time.Second,
+            }).DialContext,
+            ForceAttemptHTTP2:     true,
+            MaxIdleConns:          500,
+            MaxIdleConnsPerHost:   100, // Explicitly match peak inter-service concurrency (default is 2!)
+            MaxConnsPerHost:       200, // Prevent unbounded socket creation under backpressure
+            IdleConnTimeout:       90 * time.Second,
+            TLSHandshakeTimeout:   5 * time.Second,
+            ExpectContinueTimeout: 1 * time.Second,
+        },
+    }
+    ```
+- **`sync.Pool` Bounded Capacity Ceiling & Memory Retention Defense**:
+  - ❌ **The Unbounded Buffer Bloat Trap**: Returning byte slices or buffers directly to `sync.Pool` after an anomalous 50MB payload causes the buffer to stay retained in the pool indefinitely across minor GCs, unnecessarily pinning multi-megabyte chunks of heap memory.
+  - ✅ **Production Invariant**: Enforce a maximum capacity threshold before returning buffers to `sync.Pool`. If a buffer exceeds the safe ceiling, discard it to allow normal GC reclamation:
+    ```go
+    const maxPooledBufferSize = 64 * 1024 // 64 KB ceiling
+
+    var bufferPool = sync.Pool{
+        New: func() any {
+            return bytes.NewBuffer(make([]byte, 0, 4096))
+        },
+    }
+
+    func PutBuffer(buf *bytes.Buffer) {
+        // Discard buffers that grew abnormally large to protect heap working set:
+        if buf.Cap() > maxPooledBufferSize {
+            return
+        }
+        buf.Reset()
+        bufferPool.Put(buf)
+    }
+    ```
+
 
 
 

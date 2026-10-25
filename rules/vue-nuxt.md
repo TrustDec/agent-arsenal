@@ -809,6 +809,54 @@ alwaysApply: false
       ]
     });
     ```
+- **Vue 3.5+ `onWatcherCleanup` for Race-Free Async Fetching & AbortController**:
+  - ❌ **The Asynchronous Stale Overwrite Race**: When watching search inputs or filter selections, subsequent fast requests may return earlier than an earlier slow request. Without aborting in-flight requests, the earlier slow response resolves last, overwriting the UI with outdated results.
+  - ✅ **Production Invariant**: In Vue 3.5+, use the first-class `onWatcherCleanup` helper to cleanly register an abort callback whenever the watcher re-evaluates:
+    ```vue
+    <script setup lang="ts">
+    import { ref, watch, onWatcherCleanup } from 'vue';
+
+    const searchQuery = ref('');
+    const results = ref<SearchResult[]>([]);
+
+    watch(searchQuery, async (newQuery) => {
+      if (!newQuery.trim()) {
+        results.value = [];
+        return;
+      }
+
+      const controller = new AbortController();
+      // Automatically triggered when searchQuery changes again or component unmounts:
+      onWatcherCleanup(() => controller.abort());
+
+      try {
+        const data = await $fetch<SearchResult[]>('/api/search', {
+          query: { q: newQuery },
+          signal: controller.signal,
+        });
+        results.value = data;
+      } catch (err: any) {
+        if (err.name !== 'AbortError') {
+          console.error('Search failed:', err);
+        }
+      }
+    });
+    </script>
+    ```
+- **Nuxt 3 `useAsyncData` Scoped Cache Key Invariant in Multi-Tenant Apps**:
+  - ❌ **The Cross-User Static Key Collision**: Using a static key like `useAsyncData('user-profile', ...)` across an SSR application. Because Nuxt's hydration cache indexes payloads by this key, requests sharing the same server cache can leak one user's or tenant's private profile data to another user during hydration.
+  - ✅ **Production Invariant**: Parameterize every `useAsyncData` key with explicit tenant and entity IDs:
+    ```typescript
+    // In Nuxt 3 page or component:
+    const { tenantId, userId } = useAuth();
+    
+    // Explicitly scope cache keys to guarantee complete tenant and user isolation:
+    const { data: profile } = await useAsyncData(
+      `tenant:${tenantId.value}:user:${userId.value}:profile`,
+      () => $fetch(`/api/tenants/${tenantId.value}/users/${userId.value}`)
+    );
+    ```
+
 
 
 

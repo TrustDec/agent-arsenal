@@ -683,6 +683,44 @@ alwaysApply: false
     -- Invariant: Target >99% Hit Ratio on OLTP paths. If 'shared read' is high,
     -- add covering index columns (INCLUDE) or refine composite index ordering.
     ```
+- **PostgreSQL Heap-Only Tuples (`HOT`) Updates & `fillfactor` Optimization**:
+  - ❌ **The Index Write Amplification & Table Bloat Trap**: When updating a row in PostgreSQL, standard MVCC writes a new tuple and creates a new pointer in *every single index* on that table, even if none of the indexed columns were modified. On high-frequency update tables (e.g. user sessions, heartbeat statuses, account counters), this triggers severe index bloat and disk I/O thrashing.
+  - ✅ **Production Invariant**: When an update modifies only non-indexed columns and free space exists on the same 8KB disk page, PostgreSQL performs a **Heap-Only Tuple (`HOT`) update**—chaining the new version on the same page without touching any index pointers. For write-heavy update tables, configure `fillfactor` to reserve page headroom:
+    ```sql
+    -- Reserve 15-20% free space per page for HOT updates:
+    ALTER TABLE user_sessions SET (fillfactor = 85);
+    
+    -- Rebuild the table once to apply page headroom:
+    VACUUM FULL user_sessions; -- Or pg_repack for zero-downtime online repack
+    
+    -- Verify HOT update ratio in production:
+    SELECT 
+        relname, 
+        n_tup_upd, 
+        n_tup_hot_upd,
+        ROUND((n_tup_hot_upd::numeric / NULLIF(n_tup_upd, 0)) * 100, 2) AS hot_update_ratio_pct
+    FROM pg_stat_user_tables
+    WHERE relname = 'user_sessions';
+    -- Invariant: Target >90% HOT update ratio on update-heavy OLTP tables.
+    ```
+- **PostgreSQL CTE (`WITH`) Optimization Fence: `AS MATERIALIZED` vs `AS NOT MATERIALIZED`**:
+  - ❌ **The Accidental Multiple CTE Execution & Planner Trap**: In PostgreSQL 12+, CTEs are automatically inlined (`AS NOT MATERIALIZED`) by default. While this allows predicate pushdown, referencing a complex non-trivial CTE multiple times causes PostgreSQL to execute the expensive subquery multiple times! Conversely, forcing CTE materialization on large datasets prevents PostgreSQL from pushing outer `WHERE` filters down into the CTE.
+  - ✅ **Production Invariant**: Explicitly declare `AS MATERIALIZED` when an expensive calculation is referenced across multiple joins and must be computed exactly once, and use `AS NOT MATERIALIZED` when outer filter pushdown is required:
+    ```sql
+    -- Enforce single execution of heavy aggregation shared by multiple branches:
+    WITH high_value_cohort AS MATERIALIZED (
+        SELECT user_id, SUM(amount_cents) as total_spend
+        FROM orders
+        WHERE created_at >= NOW() - INTERVAL '30 days'
+        GROUP BY user_id
+        HAVING SUM(amount_cents) > 100000
+    )
+    SELECT u.id, u.email, c.total_spend
+    FROM users u
+    JOIN high_value_cohort c ON c.user_id = u.id
+    WHERE u.country_code = 'US';
+    ```
+
 
 
 

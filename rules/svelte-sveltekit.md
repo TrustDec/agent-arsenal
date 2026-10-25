@@ -973,6 +973,53 @@ alwaysApply: false
 
     {@render renderTree(tree, 0)}
     ```
+- **SvelteKit `load` Function `await parent()` Waterfall Defense**:
+  - ❌ **The Cascading Serialization Waterfall**: Calling `const parentData = await parent()` at the top of a child `+page.server.ts` or `+layout.server.ts` `load` function before starting independent fetch operations. This forces the browser/server to wait for the root layout and all ancestor layouts to resolve before even initiating the page-specific queries, multiplying Time to First Byte (TTFB) by the number of layout tiers.
+  - ✅ **Production Invariant**: Initiate independent child fetch promises *in parallel* before awaiting `parent()`, or omit `await parent()` entirely if the child only needs route parameters:
+    ```typescript
+    // +page.server.ts - Parallel execution pattern
+    export const load: PageServerLoad = async ({ params, fetch, parent }) => {
+      // 1. Initiate independent page fetch immediately (do not block on parent):
+      const pageDataPromise = fetch(`/api/projects/${params.id}`).then(r => r.json());
+
+      // 2. Only await parent() if parent layout data (e.g. session user) is strictly required:
+      const { user } = await parent();
+
+      // 3. Await page-specific promise in parallel:
+      const project = await pageDataPromise;
+
+      return { user, project };
+    };
+    ```
+- **SvelteKit `use:enhance` Atomic Submitter UI Lockout**:
+  - ❌ **Concurrent Form Double-Submit Vulnerability**: Submitting a form with `use:enhance` without disabling the submit button or handling `isSubmitting` state. Users double-clicking a "Pay Now" or "Delete Account" button trigger two concurrent HTTP POST requests before the client state updates.
+  - ✅ **Production Invariant**: Manage pending state within the `use:enhance` callback to disable submit controls atomically:
+    ```svelte
+    <script lang="ts">
+      import { enhance } from '$app/forms';
+      import type { SubmitFunction } from './$types';
+
+      let isSubmitting = $state(false);
+
+      const handleEnhance: SubmitFunction = () => {
+        isSubmitting = true;
+        return async ({ update }) => {
+          try {
+            await update();
+          } finally {
+            isSubmitting = false;
+          }
+        };
+      };
+    </script>
+
+    <form method="POST" action="?/checkout" use:enhance={handleEnhance}>
+      <button type="submit" disabled={isSubmitting} class="disabled:opacity-50 disabled:cursor-not-allowed">
+        {isSubmitting ? 'Processing...' : 'Complete Purchase'}
+      </button>
+    </form>
+    ```
+
 
 
 
