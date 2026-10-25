@@ -687,6 +687,41 @@ alwaysApply: false
       <time :datetime="props.timestamp">{{ formattedDate }}</time>
     </template>
     ```
+- **Vue 3.5+ `watch` Depth Limiting (`deep: number`) vs Unbounded Traversal**:
+  - ❌ **The `deep: true` CPU Freeze**: Passing `{ deep: true }` to watch a complex reactive tree (e.g. data tables, ASTs, canvas state) forces Vue's reactivity engine to recursively walk every nested object and array key on every mutation, burning CPU cycles and dropping frames.
+  - ✅ **Production Invariant**: In Vue 3.5+, limit traversal depth with a numeric parameter `{ deep: 1 }`, or prefer watching specific getters instead of whole trees:
+    ```ts
+    // Vue 3.5+ bounded depth traversal (only checks immediate child mutations):
+    watch(
+      () => complexState.value,
+      (newVal) => handleMutation(newVal),
+      { deep: 1 }
+    );
+
+    // Or target exact properties directly:
+    watch(
+      () => complexState.value.activeTabId,
+      (newId) => loadTabData(newId)
+    );
+    ```
+- **Nuxt 3 `useFetch` vs `$fetch` Inside Event Handlers**:
+  - ❌ **The Composable Inside Callback Anti-Pattern**: Calling `await useFetch('/api/submit', { method: 'POST' })` inside a button `@click` or form submission handler triggers `[nuxt] A composable that requires access to the Nuxt instance was called outside of a plugin, Nuxt hook, or Nuxt composable.` and leaves dangling reactive watchers in memory.
+  - ✅ **Production Invariant**: Reserve `useFetch` / `useAsyncData` strictly for declarative data fetching at the top level of `<script setup>`. Use `$fetch` for imperative event actions:
+    ```vue
+    <script setup lang="ts">
+    // Declarative page data fetching at setup time:
+    const { data: profile } = await useFetch('/api/profile');
+
+    // Imperative mutation inside user event handler:
+    async function onSave() {
+      await $fetch('/api/profile', {
+        method: 'PUT',
+        body: { bio: profile.value?.bio },
+      });
+    }
+    </script>
+    ```
+
 
 
 

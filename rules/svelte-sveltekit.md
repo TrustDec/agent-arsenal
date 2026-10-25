@@ -821,6 +821,51 @@ alwaysApply: false
       }
     </script>
     ```
+- **Svelte 5 `$derived.by()` for Multi-Branch Computations vs Abusive IIFEs**:
+  - ❌ **The Single-Line Ternary / IIFE Anti-Pattern**: Trying to squeeze complex derivations with loops, intermediate variables, or branching into `$derived(a ? b : c ? d : e)` or wrapping an IIFE `$derived((() => { ... })())`.
+  - ✅ **Production Invariant**: Use Svelte 5 native `$derived.by` for multi-statement computed logic:
+    ```svelte
+    <script lang="ts">
+      let orders = $state<Order[]>([]);
+      let filterStatus = $state('shipped');
+
+      // Clean, expressive multi-statement signal derivation:
+      let totalFilteredRevenue = $derived.by(() => {
+        let sum = 0;
+        for (const order of orders) {
+          if (order.status === filterStatus) {
+            sum += order.totalCents;
+          }
+        }
+        return sum / 100;
+      });
+    </script>
+    ```
+- **SvelteKit `depends()` Custom Keys & Granular `invalidate()` Hygiene**:
+  - ❌ **Brittle URL Invalidation**: Coupling load cache invalidation to hardcoded API URL strings (`invalidate('/api/projects')`), which silently breaks when backend routes or query params change.
+  - ✅ **Production Invariant**: Register semantic dependency keys using `depends()` inside `load` functions and trigger targeted invalidation using `invalidate('app:projects')`:
+    ```ts
+    // src/routes/dashboard/+page.ts
+    export const load = async ({ fetch, depends }) => {
+      // Register custom semantic dependency:
+      depends('data:notifications');
+      const res = await fetch('/api/v2/user/notifications');
+      return { notifications: await res.json() };
+    };
+    ```
+    ```svelte
+    <!-- src/routes/dashboard/+page.svelte -->
+    <script lang="ts">
+      import { invalidate } from '$app/navigation';
+
+      async function markAllRead() {
+        await fetch('/api/v2/notifications/read-all', { method: 'POST' });
+        // Granular cache refresh matching custom key:
+        await invalidate('data:notifications');
+      }
+    </script>
+    ```
+
 
 
 

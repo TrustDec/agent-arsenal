@@ -611,6 +611,29 @@ alwaysApply: false
     ORDER BY total_exec_time DESC
     LIMIT 10;
     ```
+- **Partial Uniqueness Constraints on Soft-Deleted Tables**:
+  - ❌ **The Plain `UNIQUE` Soft-Delete Bug**: Creating a standard table constraint `UNIQUE (tenant_id, email)` when soft deletes (`deleted_at TIMESTAMP NULL`) are present permanently prevents an offboarded user or deleted record from ever re-registering with the same email address.
+  - ✅ **Production Invariant**: Always implement uniqueness on soft-deleted tables using a partial unique index filtered strictly to active records:
+    ```sql
+    -- Allows unlimited soft-deleted historical rows while guaranteeing single active uniqueness:
+    CREATE UNIQUE INDEX CONCURRENTLY idx_users_tenant_email_active 
+    ON users (tenant_id, lower(email)) 
+    WHERE deleted_at IS NULL;
+    ```
+- **Optimistic Concurrency Control (OCC) with Monotonic Version Tokens**:
+  - ❌ **The Blind Overwrite / Lost Update Catastrophe**: Executing a read-modify-write cycle (`SELECT` then in-memory calculation then `UPDATE products SET stock = :new_stock WHERE id = :id`) allows concurrent HTTP requests to interleave, silently overwriting each other's state changes and creating ghost inventory or double-spends.
+  - ✅ **Production Invariant**: Enforce OCC using an atomic version token condition. If another transaction committed first, the update affects 0 rows, triggering an application-level retry loop:
+    ```sql
+    UPDATE inventory 
+    SET 
+      stock = stock - :quantity,
+      version = version + 1,
+      updated_at = NOW()
+    WHERE id = :item_id 
+      AND version = :expected_version 
+      AND stock >= :quantity;
+    ```
+
 
 
 

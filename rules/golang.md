@@ -968,6 +968,65 @@ alwaysApply: false
         return hash
     }
     ```
+- **`sync.WaitGroup` `Add(1)` Placement Invariant & Pointer Semantics**:
+  - ❌ **The Child Goroutine `Add()` Race Condition**: Calling `wg.Add(1)` inside the spawned goroutine (`go func() { wg.Add(1); ... }()`) creates a critical race condition. The parent thread executing `wg.Wait()` can immediately complete and exit before the Go runtime scheduler even dispatches the spawned goroutine, causing missed execution and premature process teardown.
+  - ❌ **Passing `WaitGroup` by Value**: Passing `wg sync.WaitGroup` as a function parameter copies the internal 64-bit state atomic word. The worker operates on a disconnected copy, leaving the original `Wait()` blocked forever in a deadlock.
+  - ✅ **Production Invariant**: Always increment `wg.Add(1)` in the parent spawning goroutine *before* calling `go func()`, and always pass `*sync.WaitGroup` via pointer (or capture in a closure):
+    ```go
+    // Go: Safe WaitGroup synchronization
+    func ProcessItems(ctx context.Context, items []string) {
+        var wg sync.WaitGroup
+
+        for _, item := range items {
+            // Add MUST be executed in the parent goroutine before spawning:
+            wg.Add(1)
+            go func(val string) {
+                defer wg.Done()
+                process(ctx, val)
+            }(item)
+        }
+
+        wg.Wait()
+    }
+    ```
+- **`io.Reader` Short-Read Invariant & `io.ReadFull` in Network Streams**:
+  - ❌ **The `Read(buf)` Buffer Fullness Assumption**: In TCP sockets, TLS streams, and pipes, `r.Read(buf)` is permitted by the `io.Reader` contract to return any number of bytes $1 \le n \le \text{len}(buf)$ with `err == nil` when only partial data has arrived over the wire. Assuming `Read(buf)` fills the buffer leads to silent truncation, corrupted framed protocols, and intermittent network bugs.
+  - ✅ **Production Invariant**: When an exact number of bytes is required (e.g. wire headers, fixed-length frames), always use `io.ReadFull`:
+    ```go
+    // Go: Safe wire protocol framing read
+    func ReadMessage(r io.Reader) ([]byte, error) {
+        var header [4]byte
+        // Guaranteed to read all 4 bytes or return an explicit ErrUnexpectedEOF:
+        if _, err := io.ReadFull(r, header[:]); err != nil {
+            return nil, fmt.Errorf("read header: %w", err)
+        }
+
+        msgLen := binary.BigEndian.Uint32(header[:])
+        if msgLen > MaxAllowedPayload {
+            return nil, fmt.Errorf("payload exceeds limit: %d", msgLen)
+        }
+
+        payload := make([]byte, msgLen)
+        if _, err := io.ReadFull(r, payload); err != nil {
+            return nil, fmt.Errorf("read full payload: %w", err)
+        }
+        return payload, nil
+    }
+    ```
+- **Go 1.22+ `cmp.Or` for Deterministic Zero-Value Fallback Chains**:
+  - ❌ **Cluttered Fallback Logic**: Writing repetitive multi-branch `if host == "" { host = envHost }; if host == "" { host = "localhost" }` boilerplate across configuration loaders and service constructors.
+  - ✅ **Production Invariant**: Use standard library `cmp.Or` to select the first non-zero value deterministically:
+    ```go
+    import "cmp"
+
+    func ResolveConfig(cfg *Config) ResolvedConfig {
+        return ResolvedConfig{
+            Host: cmp.Or(cfg.Host, os.Getenv("SERVICE_HOST"), "127.0.0.1"),
+            Port: cmp.Or(cfg.Port, os.Getenv("SERVICE_PORT"), "8080"),
+        }
+    }
+    ```
+
 
 
 
