@@ -1488,6 +1488,22 @@ alwaysApply: false
 - **Go 1.24+ Finalizer Modernization with `runtime.AddCleanup`**:
   - ❌ **The Fragile Legacy `runtime.SetFinalizer` Object Resurrection**: Legacy finalizers (`runtime.SetFinalizer(x, fn)`) fail completely on circular reference structures, delay collection of `x` and its dependencies by at least one full additional GC cycle, and can accidentally resurrect the dead object.
   - ✅ **Production Invariant**: In Go 1.24+, replace all `runtime.SetFinalizer` calls with `runtime.AddCleanup(ptr, cleanupFunc, arg)`. The cleanup function receives an isolated value `arg` (such as an OS file descriptor or socket handle) rather than the parent object, completely eliminating cyclic reference memory leaks and resurrection bugs.
+- **Go 1.24+ Modern Benchmark Loops with `b.Loop()`**:
+  - ❌ **The Legacy `for i := 0; i < b.N; i++` Skew & Compiler Dead-Code Stripping**: The traditional benchmark loop requires explicit calls to `b.ResetTimer()` after setup and is vulnerable to compiler optimizations stripping out pure operations when outputs are unused. Furthermore, running warm-up iterations manually often distorts benchmark metrics.
+  - ✅ **Production Invariant**: In Go 1.24+, use `for b.Loop()` instead of `for i := 0; i < b.N; i++`. `b.Loop()` automatically manages timer resetting across iterations, ensures compiler side-effects are preserved, and provides consistent per-op timing without manual reset calls:
+    ```go
+    func BenchmarkTokenVerification(b *testing.B) {
+        verifier := setupCryptoVerifier() // Expensive setup before the loop
+
+        // Go 1.24+: Automatically resets timer and manages iterations
+        for b.Loop() {
+            _ = verifier.VerifyToken(sampleToken)
+        }
+    }
+    ```
+- **Context Teardown Hygiene with `context.AfterFunc`**:
+  - ❌ **The Orphan Goroutine Teardown Watcher**: Spawning a dedicated goroutine `go func() { <-ctx.Done(); cleanup() }()` to monitor cancellation. This leaks a full stack frame (2KB–8KB) per connection/request, incurs scheduler context switching overhead, and delays cleanup.
+  - ✅ **Production Invariant**: Use `stop := context.AfterFunc(ctx, cleanupFunc)` introduced in Go 1.21+. It executes `cleanupFunc` asynchronously in its own goroutine when the context expires or is cancelled, and returns a cancellation handle (`stop()`) to deregister the callback immediately when work finishes normally.
 
 
 

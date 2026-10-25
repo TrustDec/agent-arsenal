@@ -1420,6 +1420,49 @@ alwaysApply: false
       <button type="submit">Add Item</button>
     </form>
     ```
+- **Svelte 5 Snippets (`{#snippet ...}`) vs Legacy `<slot>`**:
+  - ❌ **The Legacy `<slot>` & Let-Directive Clutter**: Using Svelte 4 `<slot>` and `let:item` attributes for parameterized component composition. Slots cannot be passed as first-class props, cannot be instantiated conditionally outside the template body, and introduce scope confusion.
+  - ✅ **Production Invariant**: In Svelte 5, replace all slots with native snippets (`{#snippet ...}`) and `@render`. Snippets are first-class values that can be passed as component props, typed via `Snippet<[T]>`, and rendered anywhere:
+    ```svelte
+    <script lang="ts">
+      import type { Snippet } from 'svelte';
+
+      let { items, header, row }: {
+        items: string[];
+        header?: Snippet;
+        row: Snippet<[string, number]>;
+      } = $props();
+    </script>
+
+    {#if header}
+      {@render header()}
+    {/if}
+
+    <ul>
+      {#each items as item, index}
+        <li>{@render row(item, index)}</li>
+      {/each}
+    </ul>
+    ```
+- **SvelteKit Snapshot API for BFCache State Persistence**:
+  - ❌ **The Back-Forward Navigation Form Loss**: Users filling out multi-step agent inputs or complex filters lose all form state when navigating away and clicking the browser's "Back" button.
+  - ✅ **Production Invariant**: Use SvelteKit's `snapshot` object export to persist ephemeral form state into `sessionStorage` automatically:
+    ```svelte
+    <script lang="ts">
+      import type { Snapshot } from './$types';
+
+      let filterQuery = $state('');
+      let selectedTab = $state('all');
+
+      export const snapshot: Snapshot<{ query: string; tab: string }> = {
+        capture: () => ({ query: filterQuery, tab: selectedTab }),
+        restore: (value) => {
+          filterQuery = value.query;
+          selectedTab = value.tab;
+        }
+      };
+    </script>
+    ```
 
 
 

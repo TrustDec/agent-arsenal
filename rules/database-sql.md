@@ -942,6 +942,21 @@ alwaysApply: false
 - **PostgreSQL TOAST Storage Discipline & Hot-Row Updates**:
   - ❌ **The In-Page TOAST Thrashing & WAL Bloat**: Storing large payloads (e.g. 10KB+ JSONB execution traces or prompt histories) directly in primary entity rows with frequent status updates. Updating unrelated columns (e.g. `UPDATE agent_tasks SET status = 'active'`) still writes new row versions to the heap. If large JSONB attributes are modified repeatedly, uncompressed updates trigger massive WAL amplification and exhaust autovacuum workers.
   - ✅ **Production Invariant**: Segregate volatile status columns from large semi-static payloads into a 1:1 auxiliary table (e.g., `agent_tasks` vs `agent_task_payloads`). For pre-compressed data (gzipped bytes or images), alter column storage to `EXTERNAL` (`ALTER TABLE agent_task_payloads ALTER COLUMN raw_blob SET STORAGE EXTERNAL;`) to skip redundant and costly lz4/pglz compression CPU cycles.
+- **PostgreSQL `LISTEN` / `NOTIFY` Payload Limits & Outbox Decoupling**:
+  - ❌ **The 8,000-Byte Notification Crash**: Attempting to broadcast large JSON payloads directly through `pg_notify('channel', large_json)`. PostgreSQL enforces a strict hard ceiling of 8,000 bytes on notify payloads; exceeding this causes an immediate `54000: payload string too long` database error and aborts the enclosing transaction.
+  - ✅ **Production Invariant**: Broadcast only a lightweight reference envelope containing the table name, event type, and primary key UUID:
+    ```sql
+    -- Send lightweight event envelope (<128 bytes)
+    PERFORM pg_notify('agent_events', json_build_object(
+      'table', 'agent_runs',
+      'action', 'COMPLETED',
+      'id', NEW.id
+    )::text);
+    ```
+    Subscribers receive the notification and fetch the full entity state via primary key lookup.
+- **Partition Pruning Invariants & Dynamic Query Anti-Patterns**:
+  - ❌ **The Runtime Pruning De-Optimization**: Partitioning large event tables (e.g., `audit_logs` by month) but querying using non-immutable functions or un-indexed expressions (e.g. `WHERE DATE_TRUNC('month', created_at) = '2026-03-01'::timestamptz`). PostgreSQL cannot prune partition branches at planning time, forcing sequential scans across all hundreds of sub-partitions.
+  - ✅ **Production Invariant**: Always provide direct, sargable range boundaries on the exact partitioning key (`WHERE created_at >= '2026-03-01' AND created_at < '2026-04-01'`). Verify partition pruning in `EXPLAIN` output: look for `Partitions pruned: N` and ensure only the targeted partition table is scanned.
 
 
 

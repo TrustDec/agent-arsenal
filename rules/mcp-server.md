@@ -306,6 +306,29 @@ alwaysApply: false
   - Frontier LLMs frequently emit 5–15 simultaneous tool calls in a single response turn. Spawning unthrottled child processes or database connections simultaneously causes `EMFILE` (too many open files) or connection pool exhaustion.
   - Bound concurrent tool executions with an internal semaphore queue (e.g. max 4 concurrent tool runs, queueing remaining calls with execution timeouts).
 
+## 15. MCP Sampling (`sampling/createMessage`) & Dynamic Resource Templates
+- **Reverse LLM Sampling Protocol Boundaries**:
+  - MCP allows servers to request LLM completions from the host client via `sampling/createMessage`. This enables servers to delegate fuzzy extraction or summarization back to the user's primary LLM harness without embedding private API keys in the MCP server.
+  - **Invariants for Reverse Sampling**:
+    - Always check host capabilities: Ensure `clientCapabilities.sampling` is enabled before calling `server.createMessage()`.
+    - Set explicit `maxTokens` and reasonable `temperature` (default 0.1–0.2 for deterministic extraction).
+    - Guard against infinite recursion: Never call tools inside a sampling request that invoke the same MCP server recursively.
+- **Dynamic Resource Templates (`resources/templates/list`)**:
+  - When exposing parameterized data (e.g., database tables, Git commits, or log streams), avoid registering thousands of static resources.
+  - Expose parameterized URI templates (RFC 6570) via `resources/templates/list`:
+    ```ts
+    server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
+      resourceTemplates: [
+        {
+          uriTemplate: 'db://{table}/rows/{id}',
+          name: 'Database Row by ID',
+          mimeType: 'application/json',
+          description: 'Fetches a single row from the specified database table by primary key ID',
+        },
+      ],
+    }));
+    ```
+
 
 
 

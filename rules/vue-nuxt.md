@@ -1189,6 +1189,39 @@ alwaysApply: false
       }
     });
     ```
+- **Vue 3.5+ Type-Safe Template Refs with `useTemplateRef`**:
+  - ❌ **The Fragile String Matching Ref Anti-Pattern**: Using generic `const input = ref<HTMLInputElement | null>(null)` with `ref="input"` in template. Renaming either the variable or the template string causes silent ref breakage and runtime `undefined` access errors.
+  - ✅ **Production Invariant**: In Vue 3.5+, use `useTemplateRef<T>('refName')`. It provides explicit, type-safe coupling between template ref attributes and script bindings without requiring matching variable identifier names:
+    ```vue
+    <script setup lang="ts">
+    import { useTemplateRef, onMounted } from 'vue';
+
+    // Vue 3.5+ explicit template ref binding
+    const searchInput = useTemplateRef<HTMLInputElement>('search-box');
+
+    onMounted(() => {
+      searchInput.value?.focus();
+    });
+    </script>
+
+    <template>
+      <input ref="search-box" type="search" placeholder="Query symbols..." />
+    </template>
+    ```
+- **Nuxt Server Routes Streaming for Large Context Payloads**:
+  - ❌ **The In-Memory Buffer Overflow on Large JSON**: Buffering massive LLM outputs or dataset exports into a single in-memory JavaScript object before returning from `defineEventHandler`. This spikes Node.js heap memory and causes high TTFT (time-to-first-token) latency.
+  - ✅ **Production Invariant**: Use `sendStream(event, readableStream)` or Web ReadableStreams in Nitro server routes to pipe chunks directly to the client without buffering:
+    ```ts
+    // server/api/stream.ts
+    export default defineEventHandler(async (event) => {
+      setHeader(event, 'Content-Type', 'text/event-stream');
+      setHeader(event, 'Cache-Control', 'no-cache');
+      setHeader(event, 'Connection', 'keep-alive');
+
+      const stream = getUpstreamLLMStream();
+      return sendStream(event, stream);
+    });
+    ```
 
 
 
