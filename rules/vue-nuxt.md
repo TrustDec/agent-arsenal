@@ -1021,6 +1021,46 @@ alwaysApply: false
       }
     });
     ```
+- **SSR Server Memory Leak Prevention in Universal Setup**:
+  - ❌ **The Node.js Server Leak Disaster**: Registering intervals, event listeners, or reactive subscriptions (`setInterval`, `window.addEventListener`, global event bus) directly inside `<script setup>` outside lifecycle hooks. During SSR, the server executes `setup()` for *every single incoming HTTP request*, but server-side rendering **never executes `onBeforeUnmount()` or `onUnmounted()`**! The intervals and listeners remain bound in Node.js heap memory forever, causing catastrophic server OOM crashes under production traffic.
+  - ✅ **Production Invariant**: All browser-only side effects, timers, and unmount cleanup MUST reside strictly inside `onMounted()`:
+    ```vue
+    <script setup lang="ts">
+    import { onMounted, onBeforeUnmount } from 'vue';
+
+    // ❌ FORBIDDEN in setup() body:
+    // setInterval(pollStatus, 5000); // Leaks on Node.js server!
+
+    // ✅ Production Discipline: Confined to browser lifecycle
+    let timerId: ReturnType<typeof setInterval> | null = null;
+
+    onMounted(() => {
+      timerId = setInterval(pollStatus, 5000);
+    });
+
+    onBeforeUnmount(() => {
+      if (timerId) clearInterval(timerId);
+    });
+    </script>
+    ```
+- **`v-memo` Subtree Re-rendering Optimization for High-Density Tables**:
+  - ❌ **The Virtual DOM Re-diffing Bottleneck**: Rendering large interactive lists (e.g. 500 table rows) where only 1 row changes state (e.g. selected or status toggled). Vue re-evaluates VNodes and diffs the entire 500-item subtree on every tick.
+  - ✅ **Production Invariant**: Use `v-memo="[row.id, row.selected, row.updatedAt]"` to skip VNode creation and diffing entirely unless the memoized dependencies have changed:
+    ```vue
+    <template>
+      <div
+        v-for="item in heavyList"
+        :key="item.id"
+        v-memo="[item.id, item.status, item.isSelected]"
+        class="table-row"
+      >
+        <span class="font-mono">{{ item.id }}</span>
+        <span :class="item.status">{{ item.status }}</span>
+        <button @click="toggleSelect(item.id)">{{ item.isSelected ? 'Selected' : 'Select' }}</button>
+      </div>
+    </template>
+    ```
+
 
 
 

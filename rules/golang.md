@@ -1350,6 +1350,48 @@ alwaysApply: false
         eventBufferPool.Put(buf)
     }
     ```
+- **Container Cgroup Memory Soft Ceiling via `GOMEMLIMIT` & `GOGC` Tuning**:
+  - ❌ **The Unaware Container OOM Killer Termination**: The Go runtime defaults to running GC every time heap memory doubles (`GOGC=100`). In a Kubernetes pod or container sandbox with a 1 GB memory limit, if the heap is at 600 MB and allocations spike, Go will not trigger GC until 1200 MB, causing the Linux cgroups v2 OOM killer to immediately terminate the process with `Exit Code 137` (SIGKILL).
+  - ✅ **Production Invariant**: In containerized environments, always set `GOMEMLIMIT` to 80%–90% of the container hard memory limit (e.g. `GOMEMLIMIT=850MiB` for a 1GiB container). The Go 1.19+ runtime will aggressively pace garbage collection as memory approaches this soft ceiling, avoiding OOM kills under temporary allocation spikes:
+    ```bash
+    # Kubernetes Pod / Container Execution Environment:
+    export GOMEMLIMIT="850MiB" # Leaves 150MiB headroom for OS/CGo/binary overhead
+    export GOGC="100"          # Or tune to 200 with GOMEMLIMIT to reduce GC CPU overhead
+    ```
+- **Deterministic Lock Ordering to Prevent Multi-Resource Deadlocks**:
+  - ❌ **The Inverted Acquisition Deadlock**: Goroutine A locks `Account 1` then requests `Account 2`, while Goroutine B locks `Account 2` then requests `Account 1`. Under high concurrency, both goroutines block each other forever, freezing database or in-memory transaction processors.
+  - ✅ **Production Invariant**: Always sort multiple resources into a deterministic canonical order (e.g., lexicographical by ID or memory address) before acquiring mutexes:
+    ```go
+    // Go: Deterministic multi-mutex acquisition
+    func TransferBalance(accA, accB *Account, amount int64) error {
+        if accA.ID == accB.ID {
+            return errors.New("cannot transfer to identical account")
+        }
+
+        // Lock in strict ascending order of ID to eliminate ABBA deadlocks:
+        first, second := accA, accB
+        if first.ID > second.ID {
+            first, second = accB, accA
+        }
+
+        first.mu.Lock()
+        defer first.mu.Unlock()
+
+        second.mu.Lock()
+        defer second.mu.Unlock()
+
+        if accA.Balance < amount {
+            return errors.New("insufficient balance")
+        }
+        accA.Balance -= amount
+        accB.Balance += amount
+        return nil
+    }
+    ```
+- **`sync.Mutex` Copylock & Pointer Receiver Invariant**:
+  - ❌ **The Mutex Pass-by-Value State Desynchronization**: Defining methods on structs that contain `sync.Mutex` or `sync.RWMutex` with value receivers (`func (c Counter) Value() int`). Passing the struct by value creates a shallow copy of the mutex's internal atomic state. The caller's lock is completely disassociated from the copy's lock, leading to race conditions and data corruption.
+  - ✅ **Production Invariant**: Always define pointer receivers (`func (c *Counter) ...`) on any struct containing synchronization primitives, and enforce `go vet` in CI to fail on `copylocks` violations.
+
 
 
 

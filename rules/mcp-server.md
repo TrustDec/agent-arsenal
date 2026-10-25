@@ -160,3 +160,37 @@ alwaysApply: false
   - `-32603`: Internal error (unhandled internal server crash).
 - Application-level business errors (e.g. "record not found", "insufficient balance") MUST be returned inside `{ isError: true, content: [...] }` as a successful JSON-RPC response, NOT as protocol-level `-32603` errors.
 
+## 10. Workspace Trust & Client Root Boundaries (`roots/list`)
+- **Querying Client Roots**:
+  - MCP servers with filesystem or repository access must not assume arbitrary disk access.
+  - Request active workspace root URIs from the client via `roots/list`:
+    ```json
+    {
+      "jsonrpc": "2.0",
+      "method": "roots/list"
+    }
+    ```
+- **Confining Operations to Declared Roots**:
+  - Always canonicalize paths (`filepath.EvalSymlinks`) and reject any tool execution targeting paths outside the declared client roots.
+- **Dynamic Root Changes (`notifications/roots/list_changed`)**:
+  - Listen for client root updates when user opens/closes folders or workspaces in Claude Desktop, Cursor, or Pi.
+
+## 11. Resource Templates & Cursor-Based Pagination
+- **Parameterized Resource Templates (`resources/templates/list`)**:
+  - Use RFC 6570 URI templates for dynamic parameterized resources rather than attempting to enumerate infinite static resources:
+    ```json
+    {
+      "resourceTemplates": [
+        {
+          "uriTemplate": "postgres://tables/{tableName}/schema",
+          "name": "Database Table Schema",
+          "mimeType": "application/json",
+          "description": "Returns the DDL and column schema for a given PostgreSQL table."
+        }
+      ]
+    }
+    ```
+- **Cursor-Based List Pagination**:
+  - When exposing large catalogs of tools or resources (> 50 items), support `cursor` parameter in requests and return `nextCursor` in responses to avoid multi-megabyte JSON-RPC frame overloads.
+
+

@@ -837,6 +837,36 @@ alwaysApply: false
     ALTER DATABASE production_db SET idle_in_transaction_session_timeout = '5000ms';
     ALTER DATABASE production_db SET statement_timeout = '15000ms';
     ```
+- **BRIN vs B-Tree Index Selection for Massive Append-Only Time-Series Tables**:
+  - ❌ **The Multi-Gigabyte B-Tree Index RAM Bloat**: Creating standard B-Tree indexes on monotonically increasing timestamps (`created_at`) across tables with hundreds of millions of append-only audit, event, or telemetry logs. A B-Tree index on a 200M row table can consume 8GB–15GB of RAM, evicting active database buffer cache and degrading write throughput with constant tree rebalancing.
+  - ✅ **Production Invariant**: Use Block Range Indexes (BRIN) for append-only tables where physical disk order naturally correlates with column values. A BRIN index only stores minimum and maximum values for physical disk page ranges (e.g. 128 pages), shrinking index footprint from 10 GB down to 5 MB (a 99.9% reduction) while preserving fast range-scan performance:
+    ```sql
+    -- Massive append-only logs table:
+    CREATE TABLE audit_logs (
+        id UUID DEFAULT gen_random_uuid(),
+        tenant_id UUID NOT NULL,
+        event_name VARCHAR(128) NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+    );
+
+    -- 99% smaller index footprint with near-zero write maintenance overhead:
+    CREATE INDEX CONCURRENTLY idx_audit_logs_created_at_brin
+    ON audit_logs USING BRIN (created_at)
+    WITH (pages_per_range = 128);
+    ```
+- **PgBouncer Transaction Pooling Mode Prepared Statement Traps & Server Reset**:
+  - ❌ **The "Prepared Statement Already Exists" Collision**: Using server-side named prepared statements (`PREPARE stmt AS ...`) with connection poolers (PgBouncer, AWS RDS Proxy) running in `transaction` pooling mode. Because physical backend connections are reallocated to different client sessions across transactions, named statements from Client A persist into Client B's session, triggering `ERROR: prepared statement "..." already exists` or `does not exist`.
+  - ✅ **Production Invariant**: When deploying with PgBouncer transaction mode, configure database drivers to use client-side parameter interpolation, protocol-level unnamed prepared statements, or configure `server_reset_query = DISCARD ALL` in PgBouncer to wipe session state between transactions:
+    ```ini
+    # pgbouncer.ini
+    pool_mode = transaction
+    server_reset_query = DISCARD ALL
+    max_prepared_statements = 0
+    ```
+- **Transaction ID (XID) Wraparound Catastrophe & Autovacuum Aggressiveness**:
+  - ❌ **The Emergency Read-Only Lockout Disaster**: PostgreSQL uses 32-bit transaction IDs, wrapping around after 2 billion transactions. If long-running transactions, orphaned replication slots, or disabled autovacuum prevent the vacuum worker from freezing old tuples, PostgreSQL reaches `autovacuum_freeze_max_age` and forces the entire database cluster into read-only emergency mode (`FATAL: database is not accepting commands to avoid wraparound data loss`).
+  - ✅ **Production Invariant**: Monitor `SELECT max(age(datfrozenxid)) FROM pg_database;` in Prometheus alerting (trigger critical alarm at > 1.2 billion), drop abandoned replication slots, and configure aggressive autovacuum freeze worker settings so freeze passes complete continuously in the background without causing transaction starvation.
+
 
 
 

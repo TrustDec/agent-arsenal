@@ -1201,6 +1201,63 @@ alwaysApply: false
       }
     </script>
     ```
+- **Svelte 5 Runes: `untrack()` for Reading Signals Without Dependency Subscription**:
+  - ❌ **The Accidental Effect Re-run Loop**: Reading a secondary signal (e.g. logging page URL, analytics token, or modal state) inside `$effect(() => { ... })` causes the effect to re-run whenever that secondary signal mutates, triggering infinite loops or duplicate API mutations.
+  - ✅ **Production Invariant**: Use `untrack(() => signal)` when you only want to read a state's current value inside an effect without establishing a reactive subscription:
+    ```svelte
+    <script lang="ts">
+      import { untrack } from 'svelte';
+
+      let { activeUserId, analyticsEnabled } = $props<{
+        activeUserId: string;
+        analyticsEnabled: boolean;
+      }>();
+
+      $effect(() => {
+        // We want this effect to trigger ONLY when activeUserId changes:
+        const userId = activeUserId;
+
+        // Read analyticsEnabled without subscribing to its mutations:
+        const enabled = untrack(() => analyticsEnabled);
+        if (enabled) {
+          sendTelemetry('user_view', { userId });
+        }
+      });
+    </script>
+    ```
+- **SvelteKit Server Data Streaming with Non-Blocking Deferred Promises**:
+  - ❌ **The Slowest-Query Waterfall Stall**: A page `load` function executing `await Promise.all([fastHeaderQuery, slowAnalyticsQuery])` delays the entire HTML response until the slowest query (e.g. 3 seconds) completes, destroying TTFT (Time To First Byte) and First Contentful Paint.
+  - ✅ **Production Invariant**: Return the slow promise directly (unawaited) from the `load` function and stream it to the client using Svelte's `{#await}` block:
+    ```ts
+    // src/routes/dashboard/+page.server.ts
+    export const load = async () => {
+      return {
+        // Instant response:
+        user: await fetchFastUserData(),
+        // Streamed deferred response (does not block initial page render):
+        slowMetrics: fetchHeavyAnalyticsData(),
+      };
+    };
+    ```
+    ```svelte
+    <!-- src/routes/dashboard/+page.svelte -->
+    <script lang="ts">
+      let { data } = $props();
+    </script>
+
+    <!-- Renders immediately without waiting for slowMetrics -->
+    <h1>Welcome, {data.user.name}</h1>
+
+    <!-- Streamed asynchronously when server resolves the promise -->
+    {#await data.slowMetrics}
+      <div class="skeleton-loader">Loading analytics...</div>
+    {:then metrics}
+      <AnalyticsChart data={metrics} />
+    {:catch error}
+      <p class="text-error">Failed to load analytics: {error.message}</p>
+    {/await}
+    ```
+
 
 
 
