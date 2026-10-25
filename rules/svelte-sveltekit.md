@@ -1319,6 +1319,61 @@ alwaysApply: false
       </button>
     </form>
     ```
+- **Svelte 5 Snippets Composition & Total Deprecation of `<slot />`**:
+  - ❌ **The Legacy `<slot>` and `let:item` Scoped Slot Anti-Pattern**: In Svelte 5, legacy `<slot />` elements and scoped slot syntax (`<div slot="item" let:item>`) are deprecated. They introduced non-standard scoping rules, lacked type safety, and could not be passed as first-class props or composed conditionally.
+  - ✅ **Production Invariant**: In Svelte 5, use the `{#snippet}` block and `{@render ...}` tags. Type snippet props using `import type { Snippet } from 'svelte'`, passing typed arguments directly to custom renderers:
+    ```svelte
+    <!-- DataTable.svelte -->
+    <script lang="ts" generics="T">
+      import type { Snippet } from 'svelte';
+
+      interface Props {
+        items: T[];
+        row: Snippet<[item: T, index: number]>;
+        empty?: Snippet;
+      }
+
+      let { items, row, empty }: Props = $props();
+    </script>
+
+    {#if items.length === 0}
+      {#if empty}
+        {@render empty()}
+      {:else}
+        <p class="text-muted">No items found.</p>
+      {/if}
+    {:else}
+      <ul>
+        {#each items as item, index (index)}
+          <li>{@render row(item, index)}</li>
+        {/each}
+      </ul>
+    {/if}
+    ```
+- **SvelteKit Server Load Parallelization & Deferred Streaming**:
+  - ❌ **The Sequential `await` Load Waterfall Trap**: Writing sequential `await` calls in `+page.server.ts` (`const user = await getUser(); const products = await getProducts(); const stats = await getStats();`). The total server response time equals the sum of all database queries ($t = t_1 + t_2 + t_3$), directly inflating TTFB and causing poor Largest Contentful Paint (LCP).
+  - ✅ **Production Invariant**: Execute independent database queries concurrently using `Promise.all()`, and stream non-critical slow promises without awaiting them, letting SvelteKit stream HTML immediately while the client renders loading skeletons via `{#await}`:
+    ```ts
+    // src/routes/dashboard/+page.server.ts
+    import type { PageServerLoad } from './$types';
+
+    export const load: PageServerLoad = async ({ locals }) => {
+      // 1. Critical data needed for immediate SSR layout (fetched in parallel)
+      const [user, preferences] = await Promise.all([
+        locals.db.user.findUnique({ where: { id: locals.userId } }),
+        locals.db.preferences.findFirst({ where: { userId: locals.userId } })
+      ]);
+
+      // 2. Return slow / non-critical queries as unawaited promises for streaming
+      return {
+        user,
+        preferences,
+        // SvelteKit streams HTML immediately; client resolves promise with {#await}
+        streamedAnalytics: locals.db.analytics.calculateMonthlyRollups(locals.userId),
+      };
+    };
+    ```
+
 
 
 

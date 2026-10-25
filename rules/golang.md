@@ -1436,6 +1436,33 @@ alwaysApply: false
         return buf, nil
     }
     ```
+- **Go 1.24+ Deterministic Concurrency Testing with `testing/synctest` Bubbles**:
+  - ❌ **The Flaky `time.Sleep` Concurrency Test Anti-Pattern**: Testing async pipelines, channel handoffs, timeouts, or worker pools using arbitrary `time.Sleep(50 * time.Millisecond)`. On overloaded CI runners, 50ms is too short (causing random test failures), while increasing timeouts makes the test suite take minutes to run.
+  - ✅ **Production Invariant**: In Go 1.24+, wrap concurrent test logic in `synctest.Run(func())`. Goroutines inside the synctest "bubble" operate in an isolated virtual time space. When all goroutines within the bubble are durably blocked on channel sends, receives, or timers, time instantly jumps to unblock the earliest pending timer without real-world latency:
+    ```go
+    // Go 1.24+ instant, non-flaky concurrent timer test
+    func TestWorkerPoolTimeout(t *testing.T) {
+        synctest.Run(func() {
+            done := make(chan bool)
+            go func() {
+                // Sleep for 10 virtual minutes inside bubble
+                time.Sleep(10 * time.Minute)
+                done <- true
+            }()
+
+            select {
+            case <-done:
+                // Test completes instantaneously in virtual time!
+            case <-time.After(11 * time.Minute):
+                t.Fatal("worker did not complete in virtual time")
+            }
+        })
+    }
+    ```
+- **Go 1.24+ Swiss Tables Map Architecture & Allocation Pacing**:
+  - ❌ **The Unsized Swiss Table Rehash Penalty**: In Go 1.24, Go's runtime replaces legacy 8-slot bucket hash maps with Swiss Tables (flat group SIMD control-byte probing). While lookup performance is significantly faster and memory overhead per element is reduced, growing a map dynamically from zero capacity still incurs multi-phase allocation, control byte rehashing, and table expansion overhead.
+  - ✅ **Production Invariant**: Always pre-size maps when item count is known or bounded (`make(map[K]V, count)`). In Go 1.24+, this pre-allocates contiguous control-byte groups and value slots in a single contiguous memory block, achieving optimal SIMD instruction cache locality and eliminating rehashing pauses.
+
 
 
 

@@ -223,5 +223,61 @@ alwaysApply: false
   - Never store tool cache, client tokens, or workspace paths in module-level global variables in SSE MCP servers.
   - All ephemeral state must be strictly keyed by `sessionId` with an automatic eviction TTL (e.g. 30 minutes of inactivity) to prevent cross-client state leaks and memory leaks.
 
+## 13. Progress Notifications, Tab Completion & Multi-Modal Content Payloads
+- **Progress Notifications (`notifications/progress`) for Long-Running Tools**:
+  - Tools that execute multi-step operations (large git clones, test suites, container builds) must accept an optional `_meta: { progressToken: string | number }` and emit standard MCP progress notifications to keep the client UI responsive:
+    ```ts
+    // Emitting progress notifications via MCP server transport
+    if (params._meta?.progressToken) {
+      await server.notification({
+        method: 'notifications/progress',
+        params: {
+          progressToken: params._meta.progressToken,
+          progress: currentStep,
+          total: totalSteps,
+        },
+      });
+    }
+    ```
+- **Contextual Argument Autocompletion (`completion/complete`)**:
+  - When exposing tools with dynamic resource identifiers (e.g. database table names, git branches, kubernetes namespaces), implement the `completion/complete` handler so interactive agent TUIs and chat inputs can offer instant tab completion:
+    ```ts
+    server.setRequestHandler(CompleteRequestSchema, async (request) => {
+      const { ref, argument } = request.params;
+      if (ref.type === 'ref/prompt' || ref.name === 'execute_query') {
+        if (argument.name === 'tableName') {
+          return {
+            completion: {
+              values: ['users', 'orders', 'transactions', 'audit_logs'].filter((t) =>
+                t.startsWith(argument.value)
+              ),
+              hasMore: false,
+            },
+          };
+        }
+      }
+      return { completion: { values: [] } };
+    });
+    ```
+- **Multi-Modal Content Response Discipline**:
+  - Never return raw binary buffers or binary strings directly on stdout.
+  - When returning visual graphs, screenshots, or generated charts from MCP tools, format them explicitly as typed image content blocks:
+    ```ts
+    return {
+      content: [
+        {
+          type: 'text',
+          text: 'Captured layout screenshot of component render:',
+        },
+        {
+          type: 'image',
+          data: base64PngBuffer,
+          mimeType: 'image/png',
+        },
+      ],
+    };
+    ```
+
+
 
 

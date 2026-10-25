@@ -1099,6 +1099,55 @@ alwaysApply: false
       });
     }
     ```
+- **Vue 3.5+ `useTemplateRef` & Typed Component Instance Invariants**:
+  - ❌ **The Brittle Variable-Name Matching of Legacy `ref(null)`**: In Vue 3.0–3.4, template refs relied on the variable name in `<script setup>` matching the string attribute in template (`<MyModal ref="modalRef" />` with `const modalRef = ref(null)`). Renaming variables during refactoring or minification broke the association silently, leaving `modalRef.value` as `null` with zero compiler warnings.
+  - ✅ **Production Invariant**: In Vue 3.5+, use `useTemplateRef<T>('refName')`. It explicitly decouples the JavaScript variable name from the template identifier, provides clean autocomplete, and enforces strict component instance typing:
+    ```vue
+    <script setup lang="ts">
+    import { useTemplateRef, onMounted } from 'vue';
+    import type UserModal from '~/components/UserModal.vue';
+
+    // Strongly-typed component instance ref
+    const userModal = useTemplateRef<InstanceType<typeof UserModal>>('userModalRef');
+
+    function openModal() {
+      // Safe, fully typed method invocation
+      userModal.value?.open({ userId: 'usr_123' });
+    }
+    </script>
+
+    <template>
+      <button @click="openModal">Edit Profile</button>
+      <UserModal ref="userModalRef" />
+    </template>
+    ```
+- **Nuxt 3 Nitro Server Storage via Unstorage & Multi-Environment Drivers**:
+  - ❌ **The Ephemeral In-Memory State & Edge Filesystem Crash**: Storing cached API responses, rate limits, or user session tokens in module-level `Map` instances or local `fs.writeFile` in Nuxt Nitro server routes (`/server/api/*`). On serverless or edge deployments (Vercel, Cloudflare Workers, AWS Lambda), each execution isolate is ephemeral and has read-only filesystems, resulting in lost state or crashes.
+  - ✅ **Production Invariant**: Always use Nitro's unified `useStorage()` abstraction configured with environment-appropriate Unstorage drivers (Redis or Cloudflare KV in production, memory/fs in local development):
+    ```ts
+    // nuxt.config.ts
+    export default defineNuxtConfig({
+      nitro: {
+        storage: {
+          cache: process.env.NODE_ENV === 'production'
+            ? { driver: 'redis', url: process.env.REDIS_URL, ttl: 3600 }
+            : { driver: 'fs', base: '.cache/nitro' }
+        }
+      }
+    });
+
+    // server/api/catalog.get.ts
+    export default defineEventHandler(async (event) => {
+      const storage = useStorage('cache');
+      const cachedData = await storage.getItem('catalog:featured');
+      if (cachedData) return cachedData;
+
+      const freshData = await fetchFromDatabase();
+      await storage.setItem('catalog:featured', freshData);
+      return freshData;
+    });
+    ```
+
 
 
 

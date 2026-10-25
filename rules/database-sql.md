@@ -890,6 +890,34 @@ alwaysApply: false
     FROM entity_hierarchy
     WHERE NOT is_cycle;
     ```
+- **Zero-Downtime Partition Attachment via Pre-Validated Check Constraints**:
+  - ❌ **The `ACCESS EXCLUSIVE` Lock Contention Freeze**: Running `ALTER TABLE parent ATTACH PARTITION child FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');` directly on a live high-throughput table. PostgreSQL must scan every single row of `child` to verify that values fall strictly within the partition bounds. During this full table scan, PostgreSQL holds an `ACCESS EXCLUSIVE` lock on `parent`, queueing behind slow queries and instantly deadlocking all incoming reads and writes.
+  - ✅ **Production Invariant**: Always create an exact matching `CHECK` constraint on `child` with `NOT VALID`, validate it separately (`VALIDATE CONSTRAINT` acquires only a weak `SHARE UPDATE EXCLUSIVE` lock that allows concurrent reads and writes), and then attach the partition. PostgreSQL detects the validated constraint and skips the full scan, attaching in under 5 milliseconds:
+    ```sql
+    -- Step 1: Add non-blocking check constraint
+    ALTER TABLE orders_2026_03
+      ADD CONSTRAINT check_partition_bounds
+      CHECK (created_at >= '2026-03-01' AND created_at < '2026-04-01')
+      NOT VALID;
+
+    -- Step 2: Validate constraint concurrently (no write blocking)
+    ALTER TABLE orders_2026_03
+      VALIDATE CONSTRAINT check_partition_bounds;
+
+    -- Step 3: Attach partition instantly (skips table scan, <5ms metadata lock)
+    SET lock_timeout = '2s';
+    ALTER TABLE orders
+      ATTACH PARTITION orders_2026_03
+      FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+
+    -- Step 4: Drop redundant check constraint (partition bounds supersede it)
+    ALTER TABLE orders_2026_03
+      DROP CONSTRAINT check_partition_bounds;
+    ```
+- **PostgreSQL `GENERATED ALWAYS AS (expr) STORED` vs Expression Indexes**:
+  - ❌ **The STORED Generated Column WAL & Tuple Bloat**: Using `STORED` generated columns for frequently updated JSON extractions or string formatting (`full_name TEXT GENERATED ALWAYS AS (first_name || ' ' || last_name) STORED`). STORED columns physically write duplicate bytes to disk on every row, reducing row density per 8KB page, increasing I/O cache misses, and doubling WAL generation during write spikes.
+  - ✅ **Production Invariant**: For read-heavy query filtering or sorting on derived attributes, prefer Expression Indexes (`CREATE INDEX idx_users_full_name ON users ((first_name || ' ' || last_name));`) or virtual generated views. Only use `STORED` generated columns when the column must be directly referenced by foreign key constraints or exported via replication tools.
+
 
 
 
