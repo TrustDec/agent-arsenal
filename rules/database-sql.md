@@ -777,6 +777,36 @@ alwaysApply: false
         LIMIT 3
     ) p;
     ```
+- **Partial (Filtered) Indexes for Active Queues & Soft-Deletions**:
+  - ❌ **The Bloated Index Thrash**: Creating a standard B-tree index on `(status, created_at)` in a high-throughput queue or events table where 99% of rows are `status = 'COMPLETED'`. The index grows to tens of gigabytes, wastes buffer pool RAM, and slows every update with unnecessary index maintenance.
+  - ✅ **Production Invariant**: Build partial indexes filtering exclusively for active/unprocessed states or non-deleted rows. The resulting index is often 98% smaller, fits entirely in L3/RAM cache, and accelerates queries (`SELECT ... FOR UPDATE SKIP LOCKED`) by orders of magnitude:
+    ```sql
+    -- High-performance queue worker index: Only indexes actionable rows
+    CREATE INDEX CONCURRENTLY idx_orders_active_queue
+    ON orders (priority DESC, created_at ASC)
+    WHERE status IN ('PENDING', 'PROCESSING');
+
+    -- High-performance soft-delete unique constraint:
+    CREATE UNIQUE INDEX CONCURRENTLY idx_users_active_email
+    ON users (email)
+    WHERE deleted_at IS NULL;
+    ```
+- **Mandatory Foreign Key Supporting Indexes to Prevent Table-Level Lockout Deadlocks**:
+  - ❌ **The Cascading ShareRowExclusiveLock Disaster**: Creating a foreign key constraint without creating an index on the referencing column in the child table. When a row is deleted or primary key updated in the parent table, PostgreSQL is forced to perform a sequential scan on the child table, acquiring a restrictive `ShareRowExclusiveLock`. Under concurrency, this blocks all inserts and updates to the child table, causing cascading connection pool exhaustion and deadlocks.
+  - ✅ **Production Invariant**: Every foreign key MUST have an explicit index on the foreign key column in the child table:
+    ```sql
+    -- Always index the referencing column!
+    CREATE TABLE order_items (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+        product_id UUID NOT NULL REFERENCES products(id),
+        quantity INT NOT NULL CHECK (quantity > 0)
+    );
+
+    -- Mandatory supporting indexes:
+    CREATE INDEX CONCURRENTLY idx_order_items_order_id ON order_items (order_id);
+    CREATE INDEX CONCURRENTLY idx_order_items_product_id ON order_items (product_id);
+    ```
 
 
 

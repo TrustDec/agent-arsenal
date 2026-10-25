@@ -944,6 +944,43 @@ alwaysApply: false
       return { geoCountry: readonly(geoCountry) };
     }
     ```
+- **Vue 3.5 `useTemplateRef` for Decoupled Static Ref Typing**:
+  - ❌ **The Fragile Identifier Renaming Fragility**: Declaring DOM refs with `const inputRef = ref<HTMLInputElement | null>(null)` where the variable name must match the `<input ref="inputRef">` template attribute. Refactoring or renaming the TypeScript variable silently breaks the DOM connection with zero compiler errors.
+  - ✅ **Production Invariant**: In Vue 3.5+, use `useTemplateRef<T>('refName')`. It cleanly separates the local variable identifier from the template ref attribute string, enforces strict DOM typing, and guarantees safe ref resolution across component lifecycles:
+    ```vue
+    <script setup lang="ts">
+    import { useTemplateRef, onMounted } from 'vue';
+
+    // Type-safe template ref decoupled from local variable name:
+    const searchInputElement = useTemplateRef<HTMLInputElement>('searchInput');
+
+    onMounted(() => {
+      searchInputElement.value?.focus();
+    });
+    </script>
+
+    <template>
+      <input
+        ref="searchInput"
+        type="search"
+        placeholder="Type to search..."
+        class="rounded-lg border px-3 py-2"
+      />
+    </template>
+    ```
+- **Nuxt 3 `callOnce()` vs In-Component Flags for Idempotent Setup Execution**:
+  - ❌ **The Double Execution Hydration Trap**: Executing global one-time initialization (e.g. analytics setup, token verification, or feature-flag loading) in a top-level `<script setup>` or `onMounted()` using a component-scoped boolean flag. During SSR and subsequent client hydration, or during client-side page transitions, the setup logic runs twice or executes repeatedly on page re-entry.
+  - ✅ **Production Invariant**: Wrap universal one-time operations in Nuxt 3.9+ `callOnce('key', async () => { ... })`. It executes strictly once across both SSR and client hydration, serializing execution status into `useNuxtApp().payload`:
+    ```vue
+    <script setup lang="ts">
+    // Runs on the server during SSR, and skips completely on client hydration.
+    // On pure client navigation, it runs strictly once per user session.
+    await callOnce('init-app-telemetry', async () => {
+      const telemetry = useTelemetry();
+      await telemetry.registerAppSession();
+    });
+    </script>
+    ```
 
 
 

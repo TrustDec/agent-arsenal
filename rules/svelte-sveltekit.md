@@ -1107,6 +1107,54 @@ alwaysApply: false
       Reports
     </a>
     ```
+- **Svelte 5 `untrack()` inside `$effect` to Eliminate Reactive Over-Subscription Loops**:
+  - ❌ **The Auxiliary Dependency Cascade Trap**: Reading secondary configuration or telemetry state inside an `$effect` intended to track a primary entity. When the secondary state changes, the effect re-runs unexpectedly, causing unintended side effects, duplicated API calls, or infinite reactive loops.
+  - ✅ **Production Invariant**: In Svelte 5, isolate auxiliary state reads with `untrack(() => ...)` so the effect establishes dependencies strictly on intended reactive signals:
+    ```svelte
+    <script lang="ts">
+      import { untrack } from 'svelte';
+
+      let activeTab = $state('overview');
+      let userAnalyticsId = $state('usr_987');
+
+      $effect(() => {
+        // Primary dependency: This effect will ONLY re-run when activeTab changes
+        const tab = activeTab;
+
+        // untrack ensures changes to userAnalyticsId do NOT re-trigger this effect
+        const userId = untrack(() => userAnalyticsId);
+
+        navigator.sendBeacon('/api/telemetry', JSON.stringify({ tab, userId }));
+      });
+    </script>
+    ```
+- **Svelte 5 `$host()` for Web Components & Custom Elements Integration**:
+  - ❌ **The Fragile Shadow DOM Element Query**: Accessing the host custom element via `document.querySelector` or manual component binding when compiling Svelte components to web components (`customElement: true`). It fails in nested shadow trees, breaks encapsulation, and leaks memory.
+  - ✅ **Production Invariant**: In Svelte 5 custom elements, use the `$host()` rune to retrieve a direct reference to the outer custom element instance, allowing idiomatic DOM event dispatching and attribute reflection:
+    ```svelte
+    <svelte:options customElement="user-profile-badge" />
+
+    <script lang="ts">
+      let { name, role } = $props<{ name: string; role: string }>();
+
+      // Safe direct access to the hosting Web Component DOM element:
+      const hostElement = $host<HTMLElement>();
+
+      function handleBadgeClick() {
+        hostElement.dispatchEvent(
+          new CustomEvent('badge-click', {
+            bubbles: true,
+            composed: true, // Pierces Shadow DOM boundary into main document
+            detail: { name, role }
+          })
+        );
+      }
+    </script>
+
+    <button onclick={handleBadgeClick} class="badge-button">
+      <span>{name}</span> - <span>{role}</span>
+    </button>
+    ```
 
 
 

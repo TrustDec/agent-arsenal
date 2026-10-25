@@ -1246,6 +1246,48 @@ alwaysApply: false
         return err
     }
     ```
+- **Go 1.20+ Zero-Copy Conversions: `unsafe.String` / `unsafe.Slice` vs Deprecated `reflect.SliceHeader`**:
+  - ❌ **The Memory Corruption Reflection Anti-Pattern**: Casting between `[]byte` and `string` by mutating deprecated `reflect.SliceHeader` or `reflect.StringHeader`. In modern Go (1.20+), modifying Header structs violates internal runtime pointer tracking invariants; the GC can relocate memory between pointer reads, triggering silent memory corruption or panic under GC stress.
+  - ✅ **Production Invariant**: Always use compiler-intrinsic `unsafe.String`, `unsafe.StringData`, `unsafe.Slice`, and `unsafe.SliceData`. They are fully compiler-checked and guaranteed safe by the Go runtime:
+    ```go
+    import "unsafe"
+
+    // Zero-copy byte slice to string without heap allocation
+    func ByteSliceToString(b []byte) string {
+        if len(b) == 0 {
+            return ""
+        }
+        return unsafe.String(unsafe.SliceData(b), len(b))
+    }
+
+    // Zero-copy string to byte slice (read-only view; never mutate bytes)
+    func StringToReadOnlyBytes(s string) []byte {
+        if len(s) == 0 {
+            return nil
+        }
+        return unsafe.Slice(unsafe.StringData(s), len(s))
+    }
+    ```
+- **Go 1.21+ `context.WithoutCancel` for Detached Background Audit & Teardown Spans**:
+  - ❌ **The Telemetry Loss or Immediate Failure Dilemma**: When an incoming HTTP request is canceled or times out, passing the parent `r.Context()` to background audit logging or database cleanup causes them to immediately fail with `context canceled`. Conversely, using `context.Background()` completely severs OpenTelemetry trace IDs, correlation baggage, and authenticated user credentials.
+  - ✅ **Production Invariant**: Use Go 1.21+ `context.WithoutCancel(parentCtx)`. It detaches the cancellation signal while preserving all context values, trace spans, and request metadata:
+    ```go
+    func HandleOrder(w http.ResponseWriter, r *http.Request) {
+        ctx := r.Context()
+        // ... process order ...
+
+        // Detached background audit logger: survives client abort but retains trace ID and user context
+        go func(auditCtx context.Context) {
+            // Apply independent 5-second deadline for the background operation
+            cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(auditCtx), 5*time.Second)
+            defer cancel()
+
+            if err := auditService.RecordAuditLog(cleanupCtx, "order.processed"); err != nil {
+                slog.ErrorContext(cleanupCtx, "Failed to persist audit log", "error", err)
+            }
+        }(ctx)
+    }
+    ```
 
 
 
