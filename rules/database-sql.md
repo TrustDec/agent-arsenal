@@ -866,6 +866,31 @@ alwaysApply: false
 - **Transaction ID (XID) Wraparound Catastrophe & Autovacuum Aggressiveness**:
   - ❌ **The Emergency Read-Only Lockout Disaster**: PostgreSQL uses 32-bit transaction IDs, wrapping around after 2 billion transactions. If long-running transactions, orphaned replication slots, or disabled autovacuum prevent the vacuum worker from freezing old tuples, PostgreSQL reaches `autovacuum_freeze_max_age` and forces the entire database cluster into read-only emergency mode (`FATAL: database is not accepting commands to avoid wraparound data loss`).
   - ✅ **Production Invariant**: Monitor `SELECT max(age(datfrozenxid)) FROM pg_database;` in Prometheus alerting (trigger critical alarm at > 1.2 billion), drop abandoned replication slots, and configure aggressive autovacuum freeze worker settings so freeze passes complete continuously in the background without causing transaction starvation.
+- **Recursive CTEs (`WITH RECURSIVE`) & Infinite Graph Cycle Protection**:
+  - ❌ **The Infinite Loop Memory & CPU Exhaustion**: Querying hierarchical graphs (knowledge graphs, organization charts, file directory trees, task dependency DAGs) using naive `WITH RECURSIVE` queries without cycle detection. If any circular reference or bidirectional edge exists (Entity A -> Entity B -> Entity A), the query worker enters an infinite loop, allocating gigabytes of memory until killed by OOM or connection timeout.
+  - ✅ **Production Invariant**: Always enforce a hard depth ceiling (`depth <= 10`) and track visited nodes using an array (`path`) or PostgreSQL 14+ native `CYCLE ... SET is_cycle USING path` clause to short-circuit recursion immediately upon detecting cycles:
+    ```sql
+    -- PostgreSQL 14+ idiomatic graph traversal with cycle guard:
+    WITH RECURSIVE entity_hierarchy AS (
+        -- Anchor member:
+        SELECT id, parent_id, name, 1 AS depth
+        FROM knowledge_nodes
+        WHERE id = :root_entity_id
+
+        UNION ALL
+
+        -- Recursive member:
+        SELECT kn.id, kn.parent_id, kn.name, eh.depth + 1
+        FROM knowledge_nodes kn
+        JOIN entity_hierarchy eh ON kn.parent_id = eh.id
+        WHERE eh.depth < 10 -- Mandatory hard depth ceiling
+    )
+    CYCLE id SET is_cycle USING path -- Halts recursion instantly on cycle detection
+    SELECT id, parent_id, name, depth, path
+    FROM entity_hierarchy
+    WHERE NOT is_cycle;
+    ```
+
 
 
 

@@ -1060,6 +1060,46 @@ alwaysApply: false
       </div>
     </template>
     ```
+- **Nuxt 3 Hybrid Rendering & `routeRules` Caching Discipline**:
+  - ❌ **The Uncached Dynamic SSR Server Meltdown**: Leaving high-traffic marketing, documentation, or public catalog routes as default uncached dynamic SSR. Every client visit or bot crawl triggers full server-side Vue component compilation and downstream database fetches, creating high TTFB and CPU saturation under load.
+  - ✅ **Production Invariant**: Define explicit hybrid rendering policies via `routeRules` in `nuxt.config.ts`. Apply `swr` (Stale-While-Revalidate) or `isr` (Incremental Static Regeneration) for public content, and designate authenticated user admin routes as `ssr: false`:
+    ```ts
+    // nuxt.config.ts
+    export default defineNuxtConfig({
+      routeRules: {
+        // Public marketing pages: regenerate static HTML in background every hour
+        '/': { isr: 3600 },
+        '/blog/**': { swr: 3600, headers: { 'cache-control': 's-maxage=3600, stale-while-revalidate=86400' } },
+        // Public API endpoints: edge cached with stale-while-revalidate
+        '/api/catalog/**': { cache: { maxAge: 60, swr: true } },
+        // Authenticated client portal: bypass SSR entirely, render client-side SPA
+        '/dashboard/**': { ssr: false },
+      }
+    });
+    ```
+- **Pinia `$onAction` & `$subscribe` Lifecycle Detachment Defense**:
+  - ❌ **The Detached Store Subscription Memory Leak**: Invoking `store.$subscribe(...)` or `store.$onAction(...)` inside a composable or component without scoping. If subscriptions are detached from the component's active effect scope, they persist in the global Pinia root store indefinitely after the component unmounts, firing duplicate mutation callbacks on every subsequent action.
+  - ✅ **Production Invariant**: Explicitly bind subscriptions to the component lifecycle, or capture the unsubscribe callback and register it inside `onScopeDispose()`:
+    ```ts
+    import { onScopeDispose } from 'vue';
+    import { useCartStore } from '~/stores/cart';
+
+    export function useCartTelemetry() {
+      const cart = useCartStore();
+
+      // Pass detached: false (default inside setup) to bind to current effect scope:
+      const unsubscribe = cart.$onAction(({ name, args, after, onError }) => {
+        after(() => {
+          sendTelemetry('cart_action', { action: name });
+        });
+      }, false);
+
+      onScopeDispose(() => {
+        unsubscribe();
+      });
+    }
+    ```
+
 
 
 

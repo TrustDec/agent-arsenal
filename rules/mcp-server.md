@@ -193,4 +193,35 @@ alwaysApply: false
 - **Cursor-Based List Pagination**:
   - When exposing large catalogs of tools or resources (> 50 items), support `cursor` parameter in requests and return `nextCursor` in responses to avoid multi-megabyte JSON-RPC frame overloads.
 
+## 12. Dynamic Tool Federation & Multi-Server MCP Gateways
+- **Tool Name Collision Defense via Namespacing**:
+  - In architectures where an MCP gateway aggregates tools from multiple downstream MCP servers (e.g., PostgreSQL MCP + GitHub MCP + Kubernetes MCP), tool names frequently collide (`get_status`, `list_items`).
+  - Always enforce deterministic prefix namespacing at the gateway level:
+    ```ts
+    // Prefix federated tool names with server namespace
+    const federatedTools = upstreamTools.map(tool => ({
+      ...tool,
+      name: `${serverNamespace}_${tool.name}`, // e.g. 'postgres_execute_query', 'k8s_get_pods'
+      description: `[${serverNamespace}] ${tool.description}`
+    }));
+    ```
+- **Incremental Tool Output Streaming via Notifications**:
+  - For long-running operations (builds, test suites, multi-step queries), do not wait until total completion to return a massive monolithic payload.
+  - Emit real-time stderr/stdout chunks to the agent client using `notifications/message` or logging notifications:
+    ```json
+    {
+      "jsonrpc": "2.0",
+      "method": "notifications/message",
+      "params": {
+        "level": "info",
+        "logger": "git-runner",
+        "data": "Running test suite 14/85..."
+      }
+    }
+    ```
+- **Session Boundary & Tenant Isolation in Remote SSE Gateways**:
+  - Never store tool cache, client tokens, or workspace paths in module-level global variables in SSE MCP servers.
+  - All ephemeral state must be strictly keyed by `sessionId` with an automatic eviction TTL (e.g. 30 minutes of inactivity) to prevent cross-client state leaks and memory leaks.
+
+
 

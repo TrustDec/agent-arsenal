@@ -1257,6 +1257,69 @@ alwaysApply: false
       <p class="text-error">Failed to load analytics: {error.message}</p>
     {/await}
     ```
+- **Svelte 5 `$effect.tracking()` for Safe Reactivity Detection in Utility Helpers**:
+  - ❌ **The Reactive Tracking Context Blindness Trap**: Invoking reactive logic or signal subscriptions from general-purpose utility libraries or event handlers. If the utility assumes an active reactive tracking context, it may silently fail to update or throw Svelte runtime warnings when invoked outside an effect or component template.
+  - ✅ **Production Invariant**: In Svelte 5, use `$effect.tracking()` to detect whether the caller is executing within an active reactive tracking scope before registering reactive subscriptions:
+    ```svelte
+    <script lang="ts">
+      import { untrack } from 'svelte';
+
+      export function readStateSafely<T>(getter: () => T): T {
+        // If we are currently inside an active tracking context (effect or template),
+        // we can safely read the signal directly; otherwise, read untracked:
+        if ($effect.tracking()) {
+          return getter();
+        }
+        return untrack(getter);
+      }
+    </script>
+    ```
+- **SvelteKit `use:enhance` Form Submission Lifecycle & Optimistic State Invariants**:
+  - ❌ **The Naive `use:enhance` Form Reset Trap**: Using unconfigured `<form method="POST" use:enhance>` on critical mutation forms (e.g. settings, inline editing). When the server returns validation errors (`fail(400, { ... })`), the default enhance behavior can wipe unsaved form field inputs, causing frustrating data loss for users.
+  - ✅ **Production Invariant**: Always provide a custom submission lifecycle callback to `use:enhance`. Explicitly disable form reset on validation failure (`update({ reset: false })`), manage local `isSubmitting` reactive states to prevent double-submit race conditions, and capture optimistic UI rollbacks:
+    ```svelte
+    <script lang="ts">
+      import { enhance } from '$app/forms';
+      import type { SubmitFunction } from './$types';
+
+      let isSubmitting = $state(false);
+      let errorMessage = $state<string | null>(null);
+
+      const handleSubmit: SubmitFunction = ({ cancel }) => {
+        if (isSubmitting) {
+          cancel(); // Prevent concurrent double-submits
+          return;
+        }
+
+        isSubmitting = true;
+        errorMessage = null;
+
+        return async ({ result, update }) => {
+          try {
+            if (result.type === 'failure') {
+              errorMessage = (result.data?.message as string) ?? 'Submission failed.';
+              // Crucial: preserve user input on validation failure!
+              await update({ reset: false });
+            } else {
+              await update({ reset: true });
+            }
+          } finally {
+            isSubmitting = false;
+          }
+        };
+      };
+    </script>
+
+    <form method="POST" action="?/saveSettings" use:enhance={handleSubmit}>
+      {#if errorMessage}
+        <div class="alert-error" role="alert">{errorMessage}</div>
+      {/if}
+      <button type="submit" disabled={isSubmitting}>
+        {isSubmitting ? 'Saving...' : 'Save Settings'}
+      </button>
+    </form>
+    ```
+
 
 
 

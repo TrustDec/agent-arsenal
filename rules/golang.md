@@ -1391,6 +1391,52 @@ alwaysApply: false
 - **`sync.Mutex` Copylock & Pointer Receiver Invariant**:
   - ❌ **The Mutex Pass-by-Value State Desynchronization**: Defining methods on structs that contain `sync.Mutex` or `sync.RWMutex` with value receivers (`func (c Counter) Value() int`). Passing the struct by value creates a shallow copy of the mutex's internal atomic state. The caller's lock is completely disassociated from the copy's lock, leading to race conditions and data corruption.
   - ✅ **Production Invariant**: Always define pointer receivers (`func (c *Counter) ...`) on any struct containing synchronization primitives, and enforce `go vet` in CI to fail on `copylocks` violations.
+- **Go 1.24+ `testing.B.Loop()` Idiomatic Benchmarks & Dead-Code Optimization Defense**:
+  - ❌ **The Legacy `b.N` Loop Pitfalls & Compiler Optimization Trap**: The classic `for i := 0; i < b.N; i++` benchmark loop suffers from common anti-patterns: expensive setup code placed before the loop executes multiple times if the benchmark framework adjusts `b.N`, manual `b.ResetTimer()` calls are easily forgotten, and if the loop body does not consume its results, the Go optimizing compiler dead-code eliminates the entire computation, reporting misleading zero-nanosecond runs.
+  - ✅ **Production Invariant**: In Go 1.24+, exclusively use `b.Loop()`. It automatically resets timers before iterations begin, manages loop execution bounds, prevents outer iteration re-execution bugs, and provides clean semantics:
+    ```go
+    // Go 1.24+ idiomatic benchmark
+    func BenchmarkVectorCosineSimilarity(b *testing.B) {
+        v1 := generateRandomVector(1536)
+        v2 := generateRandomVector(1536)
+        var result float32
+
+        // b.Loop() automatically handles timer resets and iteration pacing:
+        for b.Loop() {
+            result = CosineSimilarity(v1, v2)
+        }
+
+        // Prevent compiler dead-code elimination:
+        _ = result
+    }
+    ```
+- **Go 1.24+ `runtime.AddCleanup` Over `runtime.SetFinalizer` for Low-Level Resource Reclamation**:
+  - ❌ **The Object Resurrection & Cycle Leak Trap of `SetFinalizer`**: `runtime.SetFinalizer(ptr, fn)` passes the target pointer directly into the finalizer closure, resurrecting the object and preventing immediate reclamation. If two finalizable objects form a cyclic reference, neither finalizer ever executes, causing permanent memory leaks. Furthermore, finalizers delay memory reclamation across multiple GC sweeps.
+  - ✅ **Production Invariant**: In Go 1.24+, use `runtime.AddCleanup(target, cleanupFn, arg)`. The target object is never resurrected because `cleanupFn` only receives a decoupled cleanup handle (`arg`), never the target itself. This eliminates resurrection cycles, prevents GC leaks, and runs safely when the target becomes unreachable:
+    ```go
+    // Go 1.24+ safe handle cleanup without object resurrection
+    type MmapBuffer struct {
+        handle *os.File
+        data   []byte
+    }
+
+    func NewMmapBuffer(path string) (*MmapBuffer, error) {
+        f, err := os.Open(path)
+        if err != nil {
+            return nil, err
+        }
+        rawFd := f.Fd()
+
+        buf := &MmapBuffer{handle: f}
+        // Attach cleanup function to buf, passing raw file descriptor as decoupled argument:
+        runtime.AddCleanup(buf, func(fd uintptr) {
+            _ = syscall.Close(int(fd))
+        }, rawFd)
+
+        return buf, nil
+    }
+    ```
+
 
 
 
