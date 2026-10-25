@@ -865,6 +865,66 @@ alwaysApply: false
       }
     </script>
     ```
+- **Svelte 5 `$host()` Rune for Web Components & Custom Elements**:
+  - ❌ **Legacy Component Host Access**: Attempting to access custom element host properties or dispatch custom DOM events across the Shadow DOM boundary via hacky `document.querySelector` or deprecated `createEventDispatcher`.
+  - ✅ **Production Invariant**: In Svelte 5 custom elements (`<svelte:options customElement="x-element" />`), use `$host()` to obtain a direct reference to the enclosing Custom Element instance:
+    ```svelte
+    <svelte:options customElement="project-badge" />
+
+    <script lang="ts">
+      let { title = 'Active' } = $props<{ title?: string }>();
+      
+      // Svelte 5: Direct, type-safe custom element host reference
+      const hostElement = $host<HTMLElement>();
+
+      function emitCustomEvent() {
+        hostElement.dispatchEvent(new CustomEvent('badge-click', {
+          bubbles: true,
+          composed: true, // Cross shadow DOM boundaries cleanly
+          detail: { title },
+        }));
+      }
+    </script>
+
+    <button onclick={emitCustomEvent} class="px-2 py-1 bg-zinc-900 text-zinc-100 rounded text-xs">
+      {title}
+    </button>
+    ```
+- **SvelteKit Server Route Streaming via `ReadableStream` & Controller Invariants**:
+  - ❌ **Memory Buffering LLM / NDJSON Responses**: Awaiting an entire stream or large dataset in `+server.ts` before calling `json(fullPayload)` creates long multi-second TTFB, memory spikes, and poor user responsiveness.
+  - ✅ **Production Invariant**: Return a native streaming `Response` utilizing `ReadableStream` with proper chunk encoding and client abort cancellation:
+    ```ts
+    // src/routes/api/stream/+server.ts
+    import type { RequestHandler } from './$types';
+
+    export const GET: RequestHandler = ({ request }) => {
+      const encoder = new TextEncoder();
+
+      const stream = new ReadableStream({
+        async start(controller) {
+          // Listen to client disconnect signal
+          request.signal.addEventListener('abort', () => {
+            controller.close();
+          });
+
+          for (let i = 0; i < 5; i++) {
+            if (request.signal.aborted) break;
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ step: i, ts: Date.now() })}\n\n`));
+            await new Promise((r) => setTimeout(r, 100));
+          }
+          controller.close();
+        },
+      });
+
+      return new Response(stream, {
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+        },
+      });
+    };
+    ```
 
 
 

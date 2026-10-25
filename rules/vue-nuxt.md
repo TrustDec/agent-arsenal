@@ -721,6 +721,59 @@ alwaysApply: false
     }
     </script>
     ```
+- **Vue 3.5+ `useTemplateRef` vs Legacy `ref(null)` Linkage**:
+  - ❌ **The Mismatched Identifier Trap**: Declaring `const inputRef = ref<HTMLInputElement | null>(null)` while the template has `ref="user-input"`. If the identifier names diverge during refactoring, Vue fails to bind silently, leaving the ref `null` and producing mysterious runtime crashes when calling `.focus()`.
+  - ✅ **Production Invariant**: In Vue 3.5+, use `useTemplateRef<T>('templateRefKey')` for explicit, refactor-safe template bindings:
+    ```vue
+    <script setup lang="ts">
+    import { useTemplateRef, onMounted } from 'vue';
+
+    // Strongly-typed reference bound to template ref="editorCanvas"
+    const canvasRef = useTemplateRef<HTMLCanvasElement>('editorCanvas');
+
+    onMounted(() => {
+      if (canvasRef.value) {
+        const ctx = canvasRef.value.getContext('2d');
+        // Initialize canvas drawing...
+      }
+    });
+    </script>
+
+    <template>
+      <canvas ref="editorCanvas" class="w-full h-96 border border-zinc-800 rounded-lg" />
+    </template>
+    ```
+- **SSR-Safe Teleport Invariant in Nuxt 3**:
+  - ❌ **Hydration Failure on Direct `<Teleport to="body">`**: During SSR rendering, `document.body` does not exist on the server. If a `<Teleport>` renders unconditionally on initial page load, Nuxt throws `Cannot read properties of undefined (reading 'insertBefore')` or produces severe client-side DOM hydration mismatches.
+  - ✅ **Production Invariant**: Always wrap target Teleports with `<ClientOnly>` or guard rendering with a mounted state check:
+    ```vue
+    <script setup lang="ts">
+    import { ref, onMounted } from 'vue';
+
+    const isMounted = ref(false);
+    onMounted(() => {
+      isMounted.value = true;
+    });
+    </script>
+
+    <template>
+      <!-- Option A: ClientOnly wrapper -->
+      <ClientOnly>
+        <Teleport to="#modal-root">
+          <div role="dialog" aria-modal="true" class="fixed inset-0 z-50 bg-black/60">
+            <!-- Modal Content -->
+          </div>
+        </Teleport>
+      </ClientOnly>
+
+      <!-- Option B: Mounted guard -->
+      <Teleport v-if="isMounted" to="body">
+        <aside class="fixed bottom-4 right-4 z-50">
+          <NotificationToast />
+        </aside>
+      </Teleport>
+    </template>
+    ```
 
 
 

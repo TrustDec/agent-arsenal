@@ -633,6 +633,30 @@ alwaysApply: false
       AND version = :expected_version 
       AND stock >= :quantity;
     ```
+- **PostgreSQL Connection Starvation Defense: `idle_in_transaction_session_timeout`**:
+  - ❌ **The Hanging Transaction Autovacuum Freeze**: A web server begins a transaction (`BEGIN`), queries rows, and then makes an external slow HTTP call or crashes. The connection remains in `idle in transaction` status, holding row/table locks and preventing PostgreSQL's autovacuum from advancing the `datfrozenxid` horizon. Eventually, this leads to cluster-wide database write freeze from transaction ID wraparound.
+  - ✅ **Production Invariant**: Enforce a strict session ceiling at the user or database level to terminate abandoned transactions automatically:
+    ```sql
+    -- Kill any session lingering in an open transaction beyond 15 seconds:
+    ALTER DATABASE app_production SET idle_in_transaction_session_timeout = '15s';
+    
+    -- Or configure per connection in pooled application roles:
+    ALTER ROLE app_user SET idle_in_transaction_session_timeout = '10s';
+    ```
+- **PostgreSQL JSONB Subscripting (PG 14+) & Functional Expression Indexing**:
+  - ❌ **The String Extraction Type Coercion Trap**: Using text extraction `(metadata->>'price')::numeric > 100` without matching expression indexes causes PostgreSQL to perform full sequential table scans over multi-gigabyte JSONB tables.
+  - ✅ **Production Invariant**: In PostgreSQL 14+, use native bracket subscripting `metadata['price']` and build targeted functional indexes matching exact type casts:
+    ```sql
+    -- Functional B-tree index on casted numeric JSONB property:
+    CREATE INDEX CONCURRENTLY idx_orders_metadata_amount 
+    ON orders (((metadata['payment']['amount_cents'])::text::bigint))
+    WHERE metadata['payment'] IS NOT NULL;
+
+    -- Query executes via high-speed Index Scan:
+    SELECT id, tenant_id 
+    FROM orders 
+    WHERE (metadata['payment']['amount_cents'])::text::bigint >= 5000;
+    ```
 
 
 

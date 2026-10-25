@@ -1026,6 +1026,68 @@ alwaysApply: false
         }
     }
     ```
+- **`sync.Cond` Spurious Wakeup Invariant & Loop Predicate Checking**:
+  - ❌ **The Single `if` Predicate Bug**: Calling `cond.Wait()` inside a single `if !condition` branch. Under POSIX thread scheduling and multi-core runtime wakeups, `Wait()` can return spuriously without `Broadcast()` or `Signal()` having occurred, or another goroutine may have already consumed the resource between the wake signal and lock acquisition:
+    ```go
+    // DANGEROUS: Spurious wakeup or race condition leads to nil pointer / empty queue panic!
+    cond.L.Lock()
+    if len(queue) == 0 {
+        cond.Wait()
+    }
+    item := queue[0] // Crash if another worker drained the item first!
+    cond.L.Unlock()
+    ```
+  - ✅ **Production Invariant**: Always execute `cond.Wait()` inside a `for !condition` loop to re-validate invariants upon every wakeup:
+    ```go
+    // Go: Bulletproof sync.Cond loop predicate
+    cond.L.Lock()
+    for len(queue) == 0 && !closed {
+        cond.Wait()
+    }
+    if closed && len(queue) == 0 {
+        cond.L.Unlock()
+        return ErrQueueClosed
+    }
+    item := queue[0]
+    queue = queue[1:]
+    cond.L.Unlock()
+    ```
+- **Go 1.22+ `net/http` Enhanced Path Routing & Method Matching**:
+  - ❌ **External Router Overhead for Standard APIs**: Pulling heavy third-party routing dependencies (`chi`, `mux`) solely for method routing or path wildcards, or manually parsing `req.URL.Path` string splits in standard `http.ServeMux`.
+  - ✅ **Production Invariant**: Leverage Go 1.22+ standard pattern routing with HTTP methods, wildcards (`{id}`), and path segment extraction via `req.PathValue("id")`:
+    ```go
+    // Go 1.22+ Standard ServeMux with exact method matching & route parameters
+    mux := http.NewServeMux()
+
+    mux.HandleFunc("GET /api/v1/projects/{id}", func(w http.ResponseWriter, r *http.Request) {
+        projectID := r.PathValue("id")
+        if projectID == "" {
+            http.Error(w, "missing project id", http.StatusBadRequest)
+            return
+        }
+        w.Header().Set("Content-Type", "application/json")
+        fmt.Fprintf(w, `{"id":%q,"status":"active"}`, projectID)
+    })
+
+    // Subtree routing with trailing wildcard:
+    mux.HandleFunc("GET /static/{path...}", func(w http.ResponseWriter, r *http.Request) {
+        assetPath := r.PathValue("path")
+        serveStaticSafe(w, r, assetPath)
+    })
+    ```
+- **Subprocess Execution & Environment Isolation (`exec.Cmd.Env`)**:
+  - ❌ **The Total Environment Wiping Trap**: Assigning a slice literal directly to `cmd.Env = []string{"MY_VAR=value"}` wipes all standard environment variables (`PATH`, `HOME`, `SYSTEMROOT`, `TMPDIR`). This results in catastrophic `executable file not found in $PATH` errors or broken child runtime initialization.
+  - ✅ **Production Invariant**: Always preserve host environment variables by appending overrides to `os.Environ()`:
+    ```go
+    // Go: Safe child process environment inheritance
+    cmd := exec.CommandContext(ctx, "ffmpeg", "-i", inputPath, outputPath)
+    
+    // Inherit host environment, then append isolated overrides:
+    cmd.Env = append(os.Environ(),
+        "FFREPORT=file=/tmp/ffmpeg.log:level=32",
+        "AV_LOG_FORCE_NOCOLOR=1",
+    )
+    ```
 
 
 
