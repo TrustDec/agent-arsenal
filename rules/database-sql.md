@@ -751,6 +751,33 @@ alwaysApply: false
         END LOOP;
     END $$;
     ```
+- **PostgreSQL `GENERATED ALWAYS AS IDENTITY` vs Deprecated `SERIAL`**:
+  - ❌ **The Desynchronized Sequence Collision Bug**: Declaring primary keys with legacy `SERIAL` / `BIGSERIAL`. `SERIAL` is non-standard syntactic sugar that merely creates an independent sequence with default values. It allows applications to manually insert explicit IDs (`INSERT INTO users (id, name) VALUES (10, 'Alice')`) without advancing the underlying sequence. Days or weeks later, normal sequence-driven inserts collide with ID 10 and crash with duplicate key violation `23505`. Furthermore, dropping or altering the column does not automatically clean up permissions or sequence dependencies.
+  - ✅ **Production Invariant**: In PostgreSQL 10+, always use SQL-standard `GENERATED ALWAYS AS IDENTITY` (or `BY DEFAULT` if explicit external migration IDs are needed). `GENERATED ALWAYS` strictly blocks accidental manual ID injection unless the caller explicitly supplies `OVERRIDING SYSTEM VALUE`:
+    ```sql
+    -- Production standard: SQL-conforming, tamper-proof auto-incrementing key
+    CREATE TABLE orders (
+        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        customer_id UUID NOT NULL REFERENCES customers(id),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    ```
+- **Top-N per Category / Cohort Queries: `LATERAL` Joins vs Window Function Scans**:
+  - ❌ **The Full-Table Sort Window Function Trap**: Writing `ROW_NUMBER() OVER (PARTITION BY category_id ORDER BY created_at DESC) as rn` to retrieve the latest 3 items per category. The query planner is forced to perform a complete sequential scan and sort across the ENTIRE table (e.g. 50 million rows) before discarding rows where `rn > 3`.
+  - ✅ **Production Invariant**: Use `CROSS JOIN LATERAL` or `LEFT JOIN LATERAL` paired with a composite index `(category_id, created_at DESC)`. The database performs an instantaneous index seek for each category, dropping query latency from 8,500ms to 1.2ms:
+    ```sql
+    -- Requires index: CREATE INDEX idx_products_cat_created ON products (category_id, created_at DESC);
+    SELECT c.name AS category_name, p.id, p.title, p.price_cents, p.created_at
+    FROM categories c
+    CROSS JOIN LATERAL (
+        SELECT id, title, price_cents, created_at
+        FROM products
+        WHERE category_id = c.id
+        ORDER BY created_at DESC
+        LIMIT 3
+    ) p;
+    ```
+
 
 
 

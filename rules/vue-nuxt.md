@@ -889,6 +889,62 @@ alwaysApply: false
     const fullName = toRef(() => `${props.user.firstName} ${props.user.lastName}`);
     </script>
     ```
+- **Vue 3.5 `onWatcherCleanup` for Stale Async Watcher Race Elimination**:
+  - ❌ **The Stale Promise Overwrite Bug**: Firing asynchronous fetches inside `watch` without aborting in-flight requests. Fast consecutive input changes trigger multiple simultaneous HTTP calls. If an earlier request finishes after a later request, the earlier stale response overwrites the latest UI state.
+  - ✅ **Production Invariant**: In Vue 3.5+, use the first-class `onWatcherCleanup()` API to cleanly bind an `AbortController` that cancels obsolete in-flight network requests before the watcher re-executes:
+    ```typescript
+    import { ref, watch, onWatcherCleanup } from 'vue';
+
+    const searchQuery = ref('');
+    const searchResults = ref<SearchResult[]>([]);
+
+    watch(searchQuery, async (newQuery) => {
+      if (!newQuery.trim()) {
+        searchResults.value = [];
+        return;
+      }
+
+      const controller = new AbortController();
+      // Automatically triggered when searchQuery changes again or component unmounts:
+      onWatcherCleanup(() => controller.abort());
+
+      try {
+        const response = await fetch(`/api/search?q=${encodeURIComponent(newQuery)}`, {
+          signal: controller.signal,
+        });
+        if (response.ok) {
+          searchResults.value = await response.json();
+        }
+      } catch (err: unknown) {
+        if ((err as Error).name !== 'AbortError') {
+          console.error('Search request failed:', err);
+        }
+      }
+    });
+    ```
+- **Nuxt 3 `useRequestEvent()` Server-Only Isolation in Shared Composables**:
+  - ❌ **The Cross-Environment Hydration Crash**: Invoking `useRequestEvent()` inside universal composables used across both SSR and client-side hydration. On the browser client, `useRequestEvent()` returns `undefined`, and accessing properties like `event.node.req` throws an uncaught `TypeError` that breaks client-side routing.
+  - ✅ **Production Invariant**: Always guard server event access with `import.meta.server`, or delegate to portable Nuxt composables (`useRequestURL`, `useRequestHeader`):
+    ```typescript
+    // In composables/useClientGeo.ts:
+    export function useClientGeo() {
+      const geoCountry = useState<string>('geo_country', () => 'US');
+
+      if (import.meta.server) {
+        const event = useRequestEvent();
+        if (event) {
+          // Safe server-side header extraction via H3:
+          const cloudflareCountry = getHeader(event, 'cf-ipcountry');
+          if (cloudflareCountry) {
+            geoCountry.value = cloudflareCountry;
+          }
+        }
+      }
+
+      return { geoCountry: readonly(geoCountry) };
+    }
+    ```
+
 
 
 

@@ -1206,6 +1206,47 @@ alwaysApply: false
         return u, ok && u != nil
     }
     ```
+- **High-Contention Atomic Counters & CPU Cache-Line False Sharing Defense**:
+  - ❌ **The False Sharing Throughput Collapse**: Placing multiple independently updated `atomic.Int64` or `atomic.Uint64` fields adjacent to each other in a shared struct:
+    ```go
+    // ❌ Flawed: Adjacent atomic fields share the same 64-byte L1 CPU cache line.
+    // Core 0 updating readCount continuously invalidates Core 1's cache line updating writeCount!
+    type Metrics struct {
+        readCount  atomic.Uint64
+        writeCount atomic.Uint64
+    }
+    ```
+    Under high multi-core concurrency, the CPU cores trigger constant MESI cache coherency bus traffic, causing a 10x-50x degradation in throughput despite zero lock contention.
+  - ✅ **Production Invariant**: Insert explicit 64-byte padding (`_ [64]byte`) or `cpu.CacheLinePad` between high-frequency atomic variables to ensure each field occupies its own independent CPU cache line:
+    ```go
+    type ResilientMetrics struct {
+        readCount atomic.Uint64
+        _         [56]byte // 64 - 8 = 56 bytes padding to isolate readCount on its own cache line
+
+        writeCount atomic.Uint64
+        _          [56]byte // Isolates writeCount on its own cache line
+    }
+    ```
+- **Prohibition of `runtime.SetFinalizer` for Critical Resource Cleanup**:
+  - ❌ **The Delayed GC & OOM Finalizer Trap**: Relying on `runtime.SetFinalizer(obj, cleanupFunc)` to close database connections, release Cgo pointers, or unmap memory. Finalizers delay object reclamation by at least two GC cycles, are not guaranteed to run before process termination, never run on cyclic object references, and block internal finalizer goroutines if `cleanupFunc` stalls on I/O.
+  - ✅ **Production Invariant**: Mandate explicit deterministic cleanup via `io.Closer` patterns protected by `sync.Once`:
+    ```go
+    type ResilientHandle struct {
+        closer sync.Once
+        fd     int
+        closed bool
+    }
+
+    func (h *ResilientHandle) Close() error {
+        var err error
+        h.closer.Do(func() {
+            h.closed = true
+            err = syscall.Close(h.fd)
+        })
+        return err
+    }
+    ```
+
 
 
 

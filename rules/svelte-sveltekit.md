@@ -1067,6 +1067,47 @@ alwaysApply: false
       <button onclick={() => dispatchCustomStatus('playing')}>Play</button>
     </div>
     ```
+- **Svelte 5 `$inspect.trace()` for Granular Signal Dependency Diagnostics**:
+  - ❌ **The Console Log Reactivity Mystery**: Debugging unexpected `$effect` re-runs or derived re-evaluations by manually logging state variables. It fails to expose the exact internal signal or deep object property that triggered the invalidation.
+  - ✅ **Production Invariant**: In Svelte 5, invoke `$inspect.trace()` inside complex derived or effect blocks. Svelte emits structured browser console traces identifying the exact signal mutation responsible for re-running the computation. The compiler automatically strips all `$inspect` invocations from production builds with zero bundle overhead:
+    ```svelte
+    <script lang="ts">
+      let items = $state<Item[]>([]);
+      let filterTag = $state('active');
+
+      const filteredItems = $derived.by(() => {
+        // Traces which signal (items vs filterTag) triggered this derivation in DEV mode:
+        $inspect.trace();
+        return items.filter(i => i.status === filterTag);
+      });
+    </script>
+    ```
+- **SvelteKit `preloadCode` vs `preloadData` Intent-Driven Warming Invariants**:
+  - ❌ **The Speculative Load Server Flooding Trap**: Blindly calling `preloadData('/dashboard/analytics')` on all menu items or list items on initial page load. `preloadData` executes the route's server-side `load` function, hammering upstream databases and microservices with expensive queries for views the user may never visit.
+  - ✅ **Production Invariant**: Decouple asset chunk warming from server data loading. Use `preloadCode` to download JS/CSS bundles without server execution, and reserve `preloadData` strictly for high-intent interactions (e.g., hover lasting >150ms or pointerdown):
+    ```svelte
+    <script lang="ts">
+      import { preloadCode, preloadData } from '$app/navigation';
+
+      function handleHover(href: string) {
+        // Fast-path: Preload JavaScript and CSS assets immediately on pointer enter:
+        preloadCode(href);
+      }
+
+      function handleIntentionalHover(href: string) {
+        // Execute server load() only after confirmed user dwell time (>150ms):
+        preloadData(href);
+      }
+    </script>
+
+    <a
+      href="/app/reports"
+      onmouseenter={() => handleHover('/app/reports')}
+    >
+      Reports
+    </a>
+    ```
+
 
 
 
