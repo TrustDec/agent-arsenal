@@ -1839,6 +1839,67 @@ alwaysApply: false
       </button>
     </form>
     ```
+- **Svelte 5 `$derived.by` for Complex Multi-Statement Computed Computations**:
+  - ❌ **Anti-Pattern: IIFEs Inside `$derived` or Misusing `$effect` to Sync State**: Wrapping immediately invoked function expressions `(() => { ... })()` inside `$derived(...)` or writing `$effect(() => { computedValue = ... })` which introduces an extra render tick and risks infinite reactivity loops.
+  - ✅ **Production Invariant**: Use `$derived.by(() => { ... })` for multi-branch, try-catch, or iterative derived values. It creates a clean reactive computation closure with automatic dependency tracking:
+    ```svelte
+    <script lang="ts">
+    let rawTransactions = $state<Transaction[]>([]);
+    let filterCategory = $state<string>('all');
+
+    // Multi-statement derived state with branch filtering and aggregation:
+    const activeSummary = $derived.by(() => {
+      const filtered = filterCategory === 'all'
+        ? rawTransactions
+        : rawTransactions.filter(t => t.category === filterCategory);
+
+      return {
+        count: filtered.length,
+        totalUsd: filtered.reduce((acc, t) => acc + t.amountUsd, 0)
+      };
+    });
+    </script>
+    ```
+- **SvelteKit Fine-Grained Invalidation via `depends()` vs Blunt `invalidateAll()`**:
+  - ❌ **Anti-Pattern: Triggering Global Cascade with `invalidateAll()`**: Invoking `invalidateAll()` after a small mutation (e.g., toggling a star or liking an item). This forces SvelteKit to re-run every `load()` function across all active layout and page routes, wasting database queries and introducing layout flicker.
+  - ✅ **Production Invariant**: Declare explicit semantic cache keys using `depends('app:resource')` in `load` functions, and invalidate only the affected sub-tree with `invalidate('app:resource')`:
+    ```typescript
+    // +page.ts (or +page.server.ts)
+    export const load = async ({ fetch, depends }) => {
+      depends('data:notifications'); // Register cache tag
+      const res = await fetch('/api/notifications');
+      return { notifications: await res.json() };
+    };
+
+    // Client-side mutation handler:
+    import { invalidate } from '$app/navigation';
+    async function markAsRead(id: string) {
+      await fetch(`/api/notifications/${id}/read`, { method: 'POST' });
+      // Invalidate ONLY the notification stream, sparing all other page/layout load calls:
+      await invalidate('data:notifications');
+    }
+    ```
+- **Svelte 5 `$effect.root` for Isolated Non-Component Reactive Lifecycles**:
+  - ❌ **Anti-Pattern: Running Unbounded Effects Outside Component Hierarchies**: Initializing global event listeners, WebSockets, or worker managers in standalone TypeScript modules using `$effect`, which triggers compile-time errors or leaks memory because there is no owning component to tear it down.
+  - ✅ **Production Invariant**: Use `$effect.root(cleanupFn)` to establish an explicit, manually tearable reactive scope in external state machines or service classes:
+    ```typescript
+    export class RealtimeChannel {
+      private cleanup: () => void;
+
+      constructor(private topic: string) {
+        this.cleanup = $effect.root(() => {
+          $effect(() => {
+            const socket = new WebSocket(`wss://api.example.com/${this.topic}`);
+            return () => socket.close();
+          });
+        });
+      }
+
+      public destroy() {
+        this.cleanup(); // Cleanly teardowns all effects within the root
+      }
+    }
+    ```
 
 
 

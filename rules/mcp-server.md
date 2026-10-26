@@ -650,6 +650,58 @@ alwaysApply: false
     });
     ```
 
+## 36. Logging Protocol (`logging/setLevel` & `notifications/message`) Discipline
+- **Polluting Transport Stdout with Raw Diagnostic Logs**:
+  - ❌ **Anti-Pattern: `console.log` on Stdio Transports**: Calling `console.log("Processing...")` or raw `fmt.Println` inside an stdio MCP server. This emits non-JSON-RPC lines into stdout, corrupting the host's JSON-RPC framing parser and killing the session.
+  - ✅ **Production Invariant**: Support the MCP `logging/setLevel` protocol to route structured, level-filtered diagnostic logs to the client via `notifications/message` without corrupting JSON-RPC framing:
+    ```typescript
+    let currentLogLevel = 'info';
+    const LOG_LEVEL_SEVERITY: Record<string, number> = {
+      debug: 10, info: 20, notice: 30, warning: 40, error: 50, critical: 60
+    };
+
+    server.setRequestHandler(SetLevelRequestSchema, async (request) => {
+      currentLogLevel = request.params.level;
+      return {};
+    });
+
+    function mcpLog(level: 'debug' | 'info' | 'warning' | 'error', data: unknown) {
+      if ((LOG_LEVEL_SEVERITY[level] ?? 20) >= (LOG_LEVEL_SEVERITY[currentLogLevel] ?? 20)) {
+        server.notification({
+          method: 'notifications/message',
+          params: { level, data: typeof data === 'string' ? data : JSON.stringify(data) }
+        }).catch(() => {});
+      }
+    }
+    ```
+
+## 37. Resource Subscriptions & Real-Time Change Notifications
+- **Stale Cache Invalidation via `notifications/resources/updated`**:
+  - ❌ **Anti-Pattern: Host Polling vs Silent Staleness**: Clients polling `resources/read` on a tight timer to detect file changes or database updates, or clients caching resource URIs indefinitely with no awareness of server-side mutations.
+  - ✅ **Production Invariant**: Maintain a registry of subscribed URIs via `resources/subscribe` and publish granular `notifications/resources/updated` when the underlying resource mutates:
+    ```typescript
+    const activeSubscribers = new Set<string>();
+
+    server.setRequestHandler(SubscribeRequestSchema, async (request) => {
+      activeSubscribers.add(request.params.uri);
+      return {};
+    });
+
+    server.setRequestHandler(UnsubscribeRequestSchema, async (request) => {
+      activeSubscribers.delete(request.params.uri);
+      return {};
+    });
+
+    function notifyResourceMutation(uri: string) {
+      if (activeSubscribers.has(uri)) {
+        server.notification({
+          method: 'notifications/resources/updated',
+          params: { uri }
+        }).catch((err) => console.error('Failed to dispatch resource update notification', err));
+      }
+    }
+    ```
+
 
 
 

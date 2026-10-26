@@ -1141,6 +1141,71 @@ alwaysApply: false
     CREATE UNIQUE INDEX uq_users_normalized_email 
     ON users (normalized_email);
     ```
+- **PostgreSQL UUIDv7 (Time-Ordered Sequential) vs UUIDv4 Random B-Tree Index Fragmentation**:
+  - ❌ **Anti-Pattern: Unsorted `gen_random_uuid()` (UUIDv4) Primary Keys at Scale**: Using completely random UUIDv4 as primary keys on high-ingestion tables ($> 10\text{M}$ rows). Because UUIDv4 values are uniformly random, each insert lands on an arbitrary page across the entire B-tree index, causing continuous cache misses, random disk I/O thrashing, and massive index page splitting/bloat.
+  - ✅ **Production Invariant**: Use time-ordered sequential UUIDv7 (RFC 9562). The timestamp prefix ensures inserts append sequentially to right-most B-tree index pages, preserving cache locality and reducing index disk footprint by up to $60\%$:
+    ```sql
+    -- PostgreSQL 16/17 extension or custom function for sequential UUIDv7:
+    CREATE OR REPLACE FUNCTION generate_uuid_v7()
+    RETURNS uuid AS $$
+    DECLARE
+      unix_time_ms bytea;
+      rand_bytes bytea;
+    BEGIN
+      unix_time_ms := substring(int8send(floor(extract(epoch from clock_timestamp()) * 1000)::bigint) from 3 for 6);
+      rand_bytes := gen_random_bytes(10);
+      RETURN encode(
+        set_bit(set_bit(set_byte(unix_time_ms || rand_bytes, 6, get_byte(rand_bytes, 0) & 15 | 112), 52, 1), 53, 0),
+        'hex'
+      )::uuid;
+    END;
+    $$ LANGUAGE plpgsql VOLATILE;
+
+    -- Sequential primary key with zero index page thrashing:
+    CREATE TABLE events (
+      id uuid PRIMARY KEY DEFAULT generate_uuid_v7(),
+      payload jsonb NOT NULL,
+      created_at timestamptz DEFAULT clock_timestamp() NOT NULL
+    );
+    ```
+- **High-Throughput Distributed Task Queues via `SELECT ... FOR UPDATE SKIP LOCKED`**:
+  - ❌ **Lock Contention Anti-Pattern: Blocking `FOR UPDATE` Without `SKIP LOCKED`**: Multiple worker instances running `SELECT * FROM queue WHERE status = 'pending' LIMIT 1 FOR UPDATE;`. When Worker 1 acquires the row, Workers 2 through 10 block completely on Worker 1's lock, collapsing concurrent worker throughput down to sequential serialization.
+  - ✅ **Production Invariant**: Always append `SKIP LOCKED`. Concurrent workers skip rows currently locked by other transactions, achieving lock-free parallel job dispatch with zero blocking:
+    ```sql
+    -- Atomically dequeue next actionable job without worker contention:
+    WITH next_job AS (
+      SELECT id 
+      FROM task_queue
+      WHERE status = 'pending' AND run_at <= clock_timestamp()
+      ORDER BY priority DESC, run_at ASC
+      LIMIT 1
+      FOR UPDATE SKIP LOCKED
+    )
+    UPDATE task_queue
+    SET status = 'processing', locked_at = clock_timestamp(), attempts = attempts + 1
+    WHERE id = (SELECT id FROM next_job)
+    RETURNING id, payload, attempts;
+    ```
+- **Declarative Table Partitioning & Partition Pruning Verification**:
+  - ❌ **Anti-Pattern: Unpartitioned Multi-Terabyte Time-Series / Audit Tables**: Keeping 500 million immutable audit logs or sensor readings in a single monolithic table. Vacuuming takes hours, deletes cause massive dead-tuple bloat, and queries must traverse gigantic indexes.
+  - ✅ **Production Invariant**: Use declarative range partitioning on immutable time dimensions (`PARTITION BY RANGE (created_at)`), and verify partition pruning in `EXPLAIN ANALYZE`:
+    ```sql
+    CREATE TABLE audit_logs (
+      id uuid NOT NULL,
+      tenant_id uuid NOT NULL,
+      action text NOT NULL,
+      created_at timestamptz NOT NULL
+    ) PARTITION BY RANGE (created_at);
+
+    -- Monthly sub-tables (or automated pg_partman):
+    CREATE TABLE audit_logs_2026_10 PARTITION OF audit_logs
+      FOR VALUES FROM ('2026-10-01 00:00:00+00') TO ('2026-11-01 00:00:00+00');
+
+    -- Ensure query planner prunes irrelevant partitions:
+    -- Verify in EXPLAIN that "Partitions removed: N" appears:
+    EXPLAIN SELECT * FROM audit_logs 
+    WHERE created_at >= '2026-10-15' AND created_at < '2026-10-20';
+    ```
 
 
 

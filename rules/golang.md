@@ -1813,6 +1813,70 @@ alwaysApply: false
         })
     }
     ```
+- **Go 1.22+ `math/rand/v2` High-Throughput Thread-Safe PRNG vs Legacy Global Lock Contention**:
+  - ❌ **Anti-Pattern: Legacy `math/rand` Global Seed & Contended Mutex**: Calling legacy `rand.Intn(100)` or seeding with `rand.Seed(time.Now().UnixNano())` in multi-threaded microservices. The legacy top-level generator locks a shared global `sync.Mutex` on every invocation, turning high-concurrency token generators or randomized backoffs into a severe CPU bottleneck.
+  - ✅ **Production Invariant**: In Go 1.22+, use `math/rand/v2`. Top-level functions like `rand.IntN(n)` use per-thread ChaCha8 or PCG generators with zero mutex lock overhead:
+    ```go
+    import (
+        "math/rand/v2"
+        "time"
+    )
+
+    // Lock-free, cryptographically sound, high-throughput pseudo-random jitter:
+    func jitteredBackoff(baseDelay time.Duration, attempt int) time.Duration {
+        backoff := baseDelay * (1 << attempt)
+        // rand/v2 Int64N is lock-free and thread-safe:
+        jitter := time.Duration(rand.Int64N(int64(backoff / 2)))
+        return backoff + jitter
+    }
+    ```
+- **Go 1.20+ Zero-Copy `unsafe.String` / `unsafe.Slice` Invariants with Immutability Boundaries**:
+  - ❌ **Anti-Pattern: Allocating `string([]byte)` in Ultra-High-Throughput Hot Loops or Mutating Backing Arrays**: Doing `string(b)` in packet parsers that process millions of packets per second (causing GC allocation thrashing), OR using raw pointer casting to convert `[]byte` to `string` and subsequently mutating the underlying slice, violating Go's string immutability invariant and causing data races.
+  - ✅ **Production Invariant**: In Go 1.20+, use `unsafe.String` and `unsafe.Slice` for zero-allocation conversions ONLY when the backing byte slice is guaranteed to be discarded or never mutated again:
+    ```go
+    import "unsafe"
+
+    // Zero-alloc byte-to-string for read-only deserialization/lookup:
+    func ReadOnlyLookup(key []byte) string {
+        if len(key) == 0 {
+            return ""
+        }
+        // Zero allocations; valid ONLY if key is immutable during string lifetime
+        return unsafe.String(unsafe.SliceData(key), len(key))
+    }
+    ```
+- **Structured Goroutine Concurrency via `errgroup.WithContext`**:
+  - ❌ **Anti-Pattern: Fire-and-Forget Goroutines & Orphaned Worker Memory Leaks**: Launching naked `go worker()` loops without lifecycle context. If one worker fails or encounters an unrecoverable error, other peer goroutines continue executing in the background, consuming CPU, I/O, and leaking database connections.
+  - ✅ **Production Invariant**: Always wrap coordinated parallel goroutines with `errgroup.WithContext(ctx)` so that any worker failure instantly cancels sibling workers and cleans up in-flight resources:
+    ```go
+    import (
+        "context"
+        "golang.org/x/sync/errgroup"
+    )
+
+    func FetchBatchMetadata(ctx context.Context, ids []string) ([]Metadata, error) {
+        g, ctx := errgroup.WithContext(ctx)
+        g.SetLimit(10) // Bound concurrency ceiling
+
+        results := make([]Metadata, len(ids))
+        for i, id := range ids {
+            i, id := i, id
+            g.Go(func() error {
+                meta, err := fetchSingle(ctx, id)
+                if err != nil {
+                    return err // Cancels ctx, aborting in-flight sibling tasks
+                }
+                results[i] = meta
+                return nil
+            })
+        }
+
+        if err := g.Wait(); err != nil {
+            return nil, err
+        }
+        return results, nil
+    }
+    ```
 
 
 

@@ -1569,6 +1569,73 @@ alwaysApply: false
       </div>
     </template>
     ```
+- **Nuxt 3 `useAsyncData` & `useFetch` Unique Key Invariants & Deduplication**:
+  - ❌ **Anti-Pattern: Auto-Key Collisions in Reusable Components or Double Fetching**: Calling `useFetch('/api/user')` without an explicit key inside reusable child components. Nuxt auto-generates keys based on file/line numbers; rendering multiple instances can share an accidental key collision, or navigating between pages triggers redundant network requests without caching.
+  - ✅ **Production Invariant**: Always provide explicit semantic keys with reactive dependencies, and configure `dedupe: 'defer'` to eliminate concurrent duplicate network requests:
+    ```typescript
+    const route = useRoute();
+    const userId = computed(() => route.params.id as string);
+
+    // Explicit unique key tied to reactive identifier + dedupe
+    const { data: user, status, error, refresh } = await useAsyncData(
+      `user-profile-${userId.value}`,
+      () => $fetch(`/api/users/${userId.value}`),
+      {
+        watch: [userId],
+        dedupe: 'defer',
+        lazy: true,
+        transform: (raw) => ({ id: raw.id, displayName: raw.name.trim() })
+      }
+    );
+    ```
+- **Pinia State SSR Cross-Request Pollution Defense**:
+  - ❌ **SSR Memory Leak & User Session Leak Anti-Pattern**: Declaring state outside the store definition function or mutating global shared objects in SSR setup. When running Node.js / Nitro SSR, a single Node process handles requests from hundreds of different users; shared references leak authenticated user tokens or private data between concurrent requests.
+  - ✅ **Production Invariant**: Always define Pinia stores using function syntax or factory options where state is strictly returned from a fresh closure:
+    ```typescript
+    import { defineStore } from 'pinia';
+    import { ref } from 'vue';
+
+    export const useSessionStore = defineStore('session', () => {
+      // Fresh ref created per SSR request context:
+      const currentUser = ref<User | null>(null);
+      const authToken = ref<string | null>(null);
+
+      function reset() {
+        currentUser.value = null;
+        authToken.value = null;
+      }
+
+      return { currentUser, authToken, reset };
+    });
+    ```
+- **Vue 3.5+ Custom Directives with SSR Clean-Up & Hydration Guardrails**:
+  - ❌ **Anti-Pattern: Attaching Direct Event Listeners in Directives Without Unmount Cleanup**: Using custom directives (`v-click-outside`, `v-tooltip`) that attach global window/document event listeners in `mounted` but fail to clean them up in `unmounted`, or crashing the SSR server by attempting DOM access during SSR render.
+  - ✅ **Production Invariant**: Always implement `unmounted` lifecycle cleanup and provide `getSSRProps` when custom directives are used in SSR applications:
+    ```typescript
+    import type { Directive } from 'vue';
+
+    export const vClickOutside: Directive<HTMLElement, (e: MouseEvent) => void> = {
+      mounted(el, binding) {
+        const handler = (event: MouseEvent) => {
+          if (!el.contains(event.target as Node)) {
+            binding.value(event);
+          }
+        };
+        (el as any).__clickOutsideHandler__ = handler;
+        document.addEventListener('pointerdown', handler, { passive: true });
+      },
+      unmounted(el) {
+        if ((el as any).__clickOutsideHandler__) {
+          document.removeEventListener('pointerdown', (el as any).__clickOutsideHandler__);
+          delete (el as any).__clickOutsideHandler__;
+        }
+      },
+      // SSR safety: prevent SSR engine from crashing on custom DOM attributes
+      getSSRProps() {
+        return {};
+      }
+    };
+    ```
 
 
 
