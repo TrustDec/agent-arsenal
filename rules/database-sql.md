@@ -1297,6 +1297,39 @@ alwaysApply: false
     FROM audit_logs 
     WHERE created_at >= NOW() - INTERVAL '7 days';
     ```
+- **PostgreSQL 16+ `VACUUM (BUFFER_USAGE_LIMIT)` & Shared Buffer Cache Protection**:
+  - ❌ **Anti-Pattern: Unconstrained Vacuum Flushing Hot Cache Pages**: Running manual or scheduled vacuums on massive tables without buffer limits. The vacuum operation sweeps through gigabytes of table pages, evicting frequently queried index blocks and hot data from `shared_buffers`, causing sudden latency spikes on production APIs.
+  - ✅ **Production Invariant**: In PostgreSQL 16+, use `BUFFER_USAGE_LIMIT` to constrain the vacuum process to a dedicated ring buffer (e.g. 128MB or 256MB), preventing cache eviction while aggressively freeing dead tuples:
+    ```sql
+    -- Vacuum large table with bounded shared_buffers consumption:
+    VACUUM (VERBOSE, BUFFER_USAGE_LIMIT '128 MB') high_volume_events;
+    ```
+- **Transaction Timeout Hierarchy: Preventing Connection Pool Starvation & Zombie Locks**:
+  - ❌ **Anti-Pattern: Relying Solely on `statement_timeout`**: Setting only `statement_timeout = '30s'`. If an application opens a transaction, runs an `UPDATE`, and then pauses waiting for an external HTTP call or crashes, the transaction remains open (`idle in transaction`), holding row exclusive locks and exhausting the connection pool.
+  - ✅ **Production Invariant**: Enforce a strict 3-tier timeout hierarchy at the role or database level:
+    ```sql
+    -- 1. Abort idle transactions holding locks after 10s:
+    ALTER ROLE app_user SET idle_in_transaction_session_timeout = '10000'; -- 10s
+
+    -- 2. Fail fast if unable to acquire lock within 5s (prevents queue buildup behind DDL):
+    ALTER ROLE app_user SET lock_timeout = '5000'; -- 5s
+
+    -- 3. Hard ceiling for individual SQL statement execution:
+    ALTER ROLE app_user SET statement_timeout = '30000'; -- 30s
+    ```
+- **TOAST Out-of-Line Storage Amplification & LZ4 Compression**:
+  - ❌ **Anti-Pattern: Blind JSONB Updates on Massive Documents without Compression**: Storing 100KB JSON documents with default `pglz` compression and repeatedly executing small `jsonb_set` updates. Each update re-writes out-of-line TOAST chunks, causing immense write amplification and WAL bloat.
+  - ✅ **Production Invariant**: In PostgreSQL 14+, configure modern LZ4 compression for TOAST columns for $2\times$ faster decompression and reduced CPU overhead. For columns frequently queried but rarely modified, set storage parameters appropriately:
+    ```sql
+    -- Enable fast LZ4 compression for wide JSONB or TEXT columns:
+    ALTER TABLE user_profiles ALTER COLUMN metadata SET COMPRESSION lz4;
+
+    -- Inspect TOAST size and table bloat:
+    SELECT relname, pg_size_pretty(pg_total_relation_size(relid)) AS total_size
+    FROM pg_catalog.pg_statio_user_tables
+    WHERE relname = 'user_profiles';
+    ```
+
 
 
 

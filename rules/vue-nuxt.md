@@ -1794,6 +1794,67 @@ alwaysApply: false
       }
     );
     ```
+- **Vue 3.5+ Reactive Props Destructuring & Default Values**:
+  - ❌ **Anti-Pattern: Legacy `toRefs(props)` or `withDefaults` Overhead**: Writing verbose `withDefaults(defineProps<Props>(), { count: 0 })` or wrapping destructured props in `toRefs` to prevent losing reactivity.
+  - ✅ **Production Invariant**: In Vue 3.5+, destructuring from `defineProps` is compiled directly into reactive variable getters. Default values are declared using native JavaScript assignment:
+    ```vue
+    <script setup lang="ts">
+    interface Props {
+      count?: number;
+      label?: string;
+    }
+
+    // Vue 3.5+: Clean native destructure with defaults, retaining 100% reactivity!
+    const { count = 0, label = 'Submit' } = defineProps<Props>();
+
+    // Watching a destructured prop: pass a getter function
+    watch(() => count, (newCount) => {
+      console.log('Count changed:', newCount);
+    });
+    </script>
+
+    <template>
+      <button>{{ label }} ({{ count }})</button>
+    </template>
+    ```
+- **Vue 3.5+ `useTemplateRef()` Compile-Time Type Safety vs Untyped String Refs**:
+  - ❌ **Anti-Pattern: Fragile String Matching with `ref<HTMLElement | null>(null)`**: Declaring `const myInput = ref<HTMLInputElement | null>(null)` and trusting that the template has `<input ref="myInput" />`. If the variable or template string is renamed during a refactor, it silently fails without compiler feedback.
+  - ✅ **Production Invariant**: Use Vue 3.5+ `useTemplateRef<T>(refName)` for explicit, typed template references:
+    ```vue
+    <script setup lang="ts">
+    import { useTemplateRef, onMounted } from 'vue';
+
+    // Type-safe template ref linked to ref="searchBox" in template:
+    const searchInput = useTemplateRef<HTMLInputElement>('searchBox');
+
+    onMounted(() => {
+      searchInput.value?.focus();
+    });
+    </script>
+
+    <template>
+      <input ref="searchBox" type="search" placeholder="Search..." />
+    </template>
+    ```
+- **SSR Hydration Mismatch Defense: Deterministic `useId()` for Accessible Forms**:
+  - ❌ **Anti-Pattern: Dynamic Random IDs (`Math.random()` or Global Counters)**: Generating unique IDs for form labels and `aria-describedby` via random strings. Client and server evaluate different random values, triggering Vue hydration mismatch warnings and accessibility degradation.
+  - ✅ **Production Invariant**: Use Vue 3.5+ / Nuxt 3 built-in `useId()` to generate deterministic, SSR-safe unique identifiers guaranteed to match between server render and client hydration:
+    ```vue
+    <script setup lang="ts">
+    import { useId } from 'vue';
+
+    const emailId = useId();
+    const helperId = useId();
+    </script>
+
+    <template>
+      <div>
+        <label :for="emailId">Work Email</label>
+        <input :id="emailId" type="email" :aria-describedby="helperId" />
+        <span :id="helperId" class="text-xs text-gray-500">We never share your email.</span>
+      </div>
+    </template>
+    ```
 
 
 

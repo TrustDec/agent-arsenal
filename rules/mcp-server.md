@@ -839,6 +839,74 @@ alwaysApply: false
       }
     }
     ```
+- **MCP 2024-11-05 Specification: Binary Content & Image Framing vs Naked Strings**:
+  - ❌ **Anti-Pattern: Returning Raw Base64 or Binary Blobs in Text Content**: Returning screenshots or file buffers embedded in plain text strings (`{ type: "text", text: "data:image/png;base64,iVBORw..." }`). This confuses LLM tokenizers, bloats context with raw character sequences, and prevents multimodal models from rendering the visual artifact.
+  - ✅ **Production Invariant**: In MCP servers adhering to the 2024-11-05 spec, always return binary data as structured image blocks or resource references:
+    ```typescript
+    import { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+
+    function formatScreenshotResult(base64Png: string): CallToolResult {
+      return {
+        content: [
+          {
+            type: 'image',
+            data: base64Png,
+            mimeType: 'image/png',
+          },
+          {
+            type: 'text',
+            text: 'Screenshot captured successfully at 375x812 viewport.',
+          },
+        ],
+      };
+    }
+    ```
+- **MCP Tool Error Framing: Protocol Error vs Tool Execution Error (`isError: true`)**:
+  - ❌ **Anti-Pattern: Throwing JSON-RPC Errors for Business / Validation Failures**: Returning a JSON-RPC error response (`{ error: { code: -32603, message: "File not found" } }`) when a user argument is invalid or a target file does not exist. The MCP client treats protocol errors as fatal harness crashes, preventing the agent from reading the explanation and self-correcting.
+  - ✅ **Production Invariant**: Reserve JSON-RPC protocol error codes (`-32600`, `-32602`, `-32603`) strictly for transport or protocol decoding failures. For tool execution errors, return a standard tool result with `isError: true`:
+    ```typescript
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      const { name, arguments: args } = request.params;
+
+      if (name === 'read_workspace_file') {
+        const filePath = String(args?.path);
+        if (!isSafePath(filePath)) {
+          // Self-correctable tool execution error:
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Error: Access denied. Path '${filePath}' is outside the authorized project root.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+      // ...
+    });
+    ```
+- **MCP StdIO Transport Lifecycle: Graceful Client Disconnect & Process Group Teardown**:
+  - ❌ **Anti-Pattern: Orphaned Background Child Processes on Host Disconnect**: When the IDE or CLI closes, the parent closes `stdin`. If the MCP server does not monitor `stdin` closure, background child processes (e.g. database proxies, headless browsers, file watchers) remain running indefinitely, consuming system memory and holding port locks.
+  - ✅ **Production Invariant**: Listen to `process.stdin.on('close')` and `process.on('SIGTERM')`. Cleanly close active database connection pools, terminate child process groups via negative PID (`-child.pid`), and exit immediately:
+    ```typescript
+    import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+
+    const cleanupAndExit = async () => {
+      console.error('MCP Client disconnected. Terminating server and child processes...');
+      // Clean up headless browsers, database pools, and child worker trees
+      await browser?.close().catch(() => {});
+      await dbPool?.end().catch(() => {});
+      process.exit(0);
+    };
+
+    process.stdin.on('close', cleanupAndExit);
+    process.on('SIGTERM', cleanupAndExit);
+    process.on('SIGINT', cleanupAndExit);
+    ```
 
 
 

@@ -2088,6 +2088,86 @@ alwaysApply: false
       </div>
     {/if}
     ```
+- **Svelte 5 Runes: `$effect.pre` for Pre-DOM Layout & Scroll Position Preservation**:
+  - ❌ **Anti-Pattern: Post-Paint Visual Jitter with Standard `$effect`**: Measuring DOM element dimensions or restoring scroll positions inside `$effect`. Because `$effect` runs *after* the browser paints the DOM update, users experience visible layout jumping or flickering.
+  - ✅ **Production Invariant**: Use `$effect.pre(() => { ... })` to run logic *before* DOM updates are flushed to the screen. Ideal for scroll locking, measurements, and pre-paint layout stabilization:
+    ```svelte
+    <script lang="ts">
+    let messages = $state<string[]>([]);
+    let chatContainer: HTMLElement | null = $state(null);
+    let shouldAutoScroll = false;
+
+    // Runs immediately before DOM mutation:
+    $effect.pre(() => {
+      if (chatContainer) {
+        // Detect if user was scrolled to bottom before new message arrived:
+        const { scrollTop, scrollHeight, clientHeight } = chatContainer;
+        shouldAutoScroll = scrollHeight - scrollTop - clientHeight < 50;
+      }
+    });
+
+    // Runs after DOM mutation:
+    $effect(() => {
+      if (shouldAutoScroll && chatContainer) {
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+      }
+    });
+    </script>
+
+    <div bind:this={chatContainer} class="overflow-y-auto h-64">
+      {#each messages as msg}
+        <p>{msg}</p>
+      {/each}
+    </div>
+    ```
+- **Svelte 5 `untrack()` for Fine-Grained Reactive Dependency Isolation**:
+  - ❌ **Anti-Pattern: Unintended Effect Re-triggers on Incidental State Reads**: Reading multiple reactive variables inside an `$effect` or `$derived.by` block. Svelte 5 automatically tracks every reactive read as an active dependency, causing the effect to re-run on changes to variables that were only meant for snapshot reads.
+  - ✅ **Production Invariant**: Wrap non-dependency reads inside `untrack(() => ...)` so the effect only triggers on intentional reactive dependencies:
+    ```svelte
+    <script lang="ts">
+    import { untrack } from 'svelte';
+
+    let activeTab = $state('overview');
+    let analyticsPayload = $state({ userRole: 'admin', teamId: 42 });
+
+    // Re-run ONLY when activeTab changes, taking a snapshot of analyticsPayload:
+    $effect(() => {
+      const currentTab = activeTab;
+      // untrack prevents analyticsPayload mutations from re-triggering this effect:
+      const meta = untrack(() => analyticsPayload);
+
+      sendAnalyticsEvent('tab_switched', { tab: currentTab, ...meta });
+    });
+    </script>
+    ```
+- **SvelteKit Progressive Enhancement with Form Actions & `use:enhance`**:
+  - ❌ **Anti-Pattern: Manual `fetch()` Handlers Breaking Built-in Invalidation**: Replacing native `<form>` elements with custom `onclick={handleSubmit}` calling `fetch('/api/...')`. This loses zero-JS fallback accessibility and forces manual cache-busting of all active load functions (`invalidateAll()`).
+  - ✅ **Production Invariant**: Use standard SvelteKit Form Actions with `use:enhance`. SvelteKit transparently intercepts the form submission via client-side fetch, manages pending states, and automatically re-runs active page load functions:
+    ```svelte
+    <script lang="ts">
+    import { enhance } from '$app/forms';
+
+    let isPending = $state(false);
+    </script>
+
+    <form
+      method="POST"
+      action="?/updateProfile"
+      use:enhance={() => {
+        isPending = true;
+        return async ({ update }) => {
+          await update();
+          isPending = false;
+        };
+      }}
+    >
+      <input name="displayName" required />
+      <button disabled={isPending}>
+        {isPending ? 'Saving...' : 'Save Profile'}
+      </button>
+    </form>
+    ```
+
 
 
 

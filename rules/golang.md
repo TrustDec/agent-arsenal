@@ -2020,6 +2020,71 @@ alwaysApply: false
         s.currentConf.Store(newConf)
     }
     ```
+- **Go 1.22+ Loop Variable Per-Iteration Scoping Semantics vs Pointer Escape Traps**:
+  - ❌ **Anti-Pattern: Old Go <= 1.21 Shadow Variable Habits or Misunderstanding Pointer Lifetimes**: Assuming loop variables are still shared across iterations, or mistakenly assuming that taking `&item.Field` protects against concurrent modifications if the underlying slice is mutated in-place by another goroutine.
+  - ✅ **Production Invariant**: In Go 1.22+, each iteration of a `for i, v := range slice` or 3-clause loop (`for i := 0; i < n; i++`) creates a distinct lexical variable. Passing `v` by value directly into closures or goroutines is completely race-free:
+    ```go
+    // Go 1.22+: Clean, safe goroutine fan-out without shadow variable boilerplate (v := v)
+    func DispatchJobs(jobs []Job) {
+        for _, job := range jobs {
+            go func() {
+                // job is a per-iteration copy, safe against loop-variable races
+                processJob(job)
+            }()
+        }
+    }
+    ```
+- **Go 1.24+ `testing/synctest` Deterministic Synthetic Time & Goroutine Bubble Testing**:
+  - ❌ **Anti-Pattern: Flaky `time.Sleep` in Concurrency & Timer Tests**: Inserting wall-clock sleeps (`time.Sleep(50 * time.Millisecond)`) in unit tests to wait for background goroutines or channel timeouts. This causes CI flakiness, race conditions on slow runners, and bloats test suite runtime.
+  - ✅ **Production Invariant**: In Go 1.24+, use `testing/synctest.Run` to execute concurrent tests inside an isolated synthetic time bubble. In synctest, `time.Sleep` and timers advance synthetic clock time instantaneously when all goroutines in the bubble are blocked:
+    ```go
+    import (
+        "testing"
+        "testing/synctest"
+        "time"
+    )
+
+    func TestDebouncedCacheExpiry(t *testing.T) {
+        synctest.Run(func() {
+            cache := NewExpiringCache(5 * time.Second)
+            cache.Set("key-1", "value-1")
+
+            // Synthetic time advances instantly without waiting 5 real seconds:
+            time.Sleep(5 * time.Second)
+
+            if _, found := cache.Get("key-1"); found {
+                t.Fatalf("expected key to expire after synthetic 5s")
+            }
+        })
+    }
+    ```
+- **Zero-Allocation Buffer Pooling with `sync.Pool` Slicing & Capacity Reset Invariants**:
+  - ❌ **Anti-Pattern: Memory Bloat via Oversized Buffers Pinned in `sync.Pool`**: Storing byte slices in `sync.Pool` without capacity thresholds. If a single burst request reads a 64MB file, the 64MB slice remains pinned in the pool indefinitely, starving heap memory and wasting GC cycles.
+  - ✅ **Production Invariant**: Reset length to zero (`buf[:0]`) before returning to the pool, and reject buffers exceeding a maximum capacity threshold (e.g., 64KB) so that oversized buffers are naturally collected by the runtime GC:
+    ```go
+    const maxPooledBufferSize = 64 * 1024 // 64 KB ceiling
+
+    var bufferPool = sync.Pool{
+        New: func() any {
+            b := make([]byte, 0, 4*1024) // 4 KB initial capacity
+            return &b
+        },
+    }
+
+    func GetBuffer() *[]byte {
+        return bufferPool.Get().(*[]byte)
+    }
+
+    func PutBuffer(buf *[]byte) {
+        if buf == nil || cap(*buf) > maxPooledBufferSize {
+            // Drop oversized buffer; let GC reclaim it to prevent memory bloat
+            return
+        }
+        *buf = (*buf)[:0] // Reset length to 0 while preserving allocated capacity
+        bufferPool.Put(buf)
+    }
+    ```
+
 
 
 
