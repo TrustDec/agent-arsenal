@@ -1526,6 +1526,70 @@ alwaysApply: false
       });
     </script>
     ```
+- **Svelte 5 Snippets (`{#snippet ...}`) & Render Tags (`{@render ...}`)**:
+  - ❌ **The Fragile Legacy `<slot />` and `let:` Binding Anti-Pattern**: Using legacy Svelte 3/4 `<slot>` and `slot="name"` directives for component composition. Slots had ambiguous scoping, lacked strict TypeScript argument checking, suffered from awkward `let:data` syntax, and could not be passed as first-class function arguments.
+  - ✅ **Production Invariant**: In Svelte 5, use `{#snippet name(args)}` and `{@render name(args)}`. Snippets are first-class typed closures that can be defined inline, passed as standard component props, and assigned default fallback implementations:
+    ```svelte
+    <script lang="ts">
+      import type { Snippet } from 'svelte';
+
+      interface TableProps<T> {
+        items: T[];
+        rowHeader: Snippet<[item: T]>;
+        rowDetails?: Snippet<[item: T]>;
+      }
+
+      let { items, rowHeader, rowDetails }: TableProps<{ id: string; name: string; status: string }> = $props();
+    </script>
+
+    <div class="table-container divide-y divide-zinc-800">
+      {#each items as item (item.id)}
+        <div class="row-wrapper p-3">
+          <!-- Render required snippet with typed argument -->
+          {@render rowHeader(item)}
+
+          <!-- Conditional snippet rendering with fallback -->
+          {#if rowDetails}
+            {@render rowDetails(item)}
+          {/if}
+        </div>
+      {/each}
+    </div>
+    ```
+- **SvelteKit Progressive Enhancement Form Actions with `use:enhance`**:
+  - ❌ **Manual `preventDefault` and Ad-hoc `fetch` POST Handling**: Intercepting form submissions with manual `on:submit|preventDefault`, constructing `FormData`, calling `fetch('/api/...')`, and manually managing loading state and validation errors. This breaks when JavaScript is loading or disabled, and fails to handle native SvelteKit form action invalidation.
+  - ✅ **Production Invariant**: Use SvelteKit's built-in `use:enhance` on native HTML forms. It automatically handles progressive enhancement, updates `$page.form` errors, re-runs affected `load` functions via `invalidateAll()`, and allows clean optimistic UI updates:
+    ```svelte
+    <script lang="ts">
+      import { enhance } from '$app/forms';
+      import type { ActionData } from './$types';
+
+      let { form }: { form: ActionData } = $props();
+      let isSubmitting = $state(false);
+    </script>
+
+    <form
+      method="POST"
+      action="?/createProject"
+      use:enhance={() => {
+        isSubmitting = true;
+        return async ({ update }) => {
+          isSubmitting = false;
+          await update();
+        };
+      }}
+      class="flex flex-col gap-3"
+    >
+      <input name="projectName" required placeholder="Project Name" class="input" />
+      {#if form?.error}
+        <p class="text-xs text-red-400">{form.error}</p>
+      {/if}
+      <button type="submit" disabled={isSubmitting} class="btn-primary">
+        {isSubmitting ? 'Creating...' : 'Create Project'}
+      </button>
+    </form>
+    ```
+
 
 
 

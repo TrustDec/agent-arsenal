@@ -1552,6 +1552,56 @@ alwaysApply: false
 - **Go 1.24+ Generic Type Aliases for Zero-Downtime Package Migration**:
   - ❌ **The Monolithic Package Refactoring Breaking Change**: Moving generic structures or interfaces from an internal package to a public API (e.g. `internal/cache.Store[K, V]` to `cache.Store[K, V]`). Prior to Go 1.24, type aliases did not support type parameters (`type Store[K, V] = internal.Store[K, V]` was forbidden), forcing breaking API changes or duplicate boilerplate wrapper types.
   - ✅ **Production Invariant**: In Go 1.24+, utilize generic type aliases (`type Cache[K comparable, V any] = internal.Cache[K, V]`) to seamlessly refactor package hierarchies and decouple interfaces without breaking downstream consumer type signatures.
+- **Go 1.24+ `os.Root` Filesystem Sandboxing & Traversal Defense**:
+  - ❌ **Naive Path Sanitization & Symlink Traversal Vulnerabilities**: Relying on string manipulation (`strings.HasPrefix(cleanPath, rootDir)`) or `filepath.Clean` to restrict file access within a workspace directory. Attackers bypass string-based checks using symlinks pointing outside the target tree (`symlink -> /etc/passwd`), relative race conditions (TOCTOU), or absolute paths.
+  - ✅ **Production Invariant**: In Go 1.24+, use `os.OpenRoot(dir)` which returns an `*os.Root` handle backed by OS-level sandbox primitives (such as Linux `openat2` with `RESOLVE_BENEATH`). All subsequent operations (`root.Open`, `root.Create`, `root.Stat`, `root.Remove`) are strictly confined within the directory subtree, rejecting symlinks and `..` paths escaping the root at the kernel syscall level:
+    ```go
+    package workspace
+
+    import (
+        "fmt"
+        "io"
+        "os"
+    )
+
+    func SafeReadUserFile(rootDir, relativePath string) ([]byte, error) {
+        root, err := os.OpenRoot(rootDir)
+        if err != nil {
+            return nil, fmt.Errorf("failed to open workspace root: %w", err)
+        }
+        defer root.Close()
+
+        // Root.Open enforces OS-level confinement; cannot escape rootDir via symlinks or '..'
+        f, err := root.Open(relativePath)
+        if err != nil {
+            return nil, fmt.Errorf("path access denied or not found: %w", err)
+        }
+        defer f.Close()
+
+        stat, err := f.Stat()
+        if err != nil || stat.IsDir() {
+            return nil, fmt.Errorf("invalid file target")
+        }
+
+        return io.ReadAll(f)
+    }
+    ```
+- **Go 1.24+ `testing.B.Loop` Benchmark Invariant**:
+  - ❌ **The `b.N` Setup-Timing Leak & Dead Code Elimination Trap**: Writing Go benchmarks with legacy `for i := 0; i < b.N; i++`. If expensive initialization code is run before the loop, developers frequently forget `b.ResetTimer()`. Furthermore, compilers frequently optimize away loop bodies whose return values are unused, skewing benchmarks to deceptive sub-nanosecond figures.
+  - ✅ **Production Invariant**: In Go 1.24+, use `for b.Loop()`:
+    ```go
+    func BenchmarkPayloadSerialization(b *testing.B) {
+        payload := generateComplexTestPayload()
+
+        // b.Loop() automatically handles timer resets before iteration begins,
+        // adjusts iteration count, and prevents compiler dead-code elimination
+        for b.Loop() {
+            _ = serializePayload(payload)
+        }
+    }
+    ```
+    `b.Loop()` guarantees that per-benchmark setup code executed before the loop is automatically excluded from the timing measurements without requiring manual `b.ResetTimer()` invocations.
+
 
 
 

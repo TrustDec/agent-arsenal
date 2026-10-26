@@ -982,6 +982,22 @@ alwaysApply: false
 - **B-Tree Index Deduplication & High-Cardinality Sizing (PostgreSQL 13+)**:
   - ❌ **Disabling B-Tree Deduplication on Low-Uniqueness Columns**: Leaving default un-deduplicated B-tree structures on columns with recurring duplicates (e.g., status flags, category codes, foreign keys). This inflates index sizes on NVMe by 300–400% and triggers unnecessary page splits.
   - ✅ **Production Invariant**: Ensure B-Tree deduplication is enabled (`deduplicate_items = on`, default since PG13) on non-unique indexes. This coalesces duplicate posting lists into compact B-tree leaf pages, dramatically boosting shared buffer hit ratios and reducing index scan latency.
+- **PostgreSQL 17+ Radix Tree Vacuum Optimization (`tidstore`) & Dead Tuple Management**:
+  - ❌ **Inflating `maintenance_work_mem` to Prevent Multi-Pass Vacuuming**: In PostgreSQL 16 and older, `VACUUM` tracked dead tuple TIDs in a flat array limited by `maintenance_work_mem` (up to 1 GB holding ~178 million TIDs). When dead tuples exceeded this threshold, `VACUUM` was forced into expensive multi-pass index vacuuming, causing severe NVMe I/O thrashing.
+  - ✅ **Production Invariant**: PostgreSQL 17 replaces flat TID arrays with an adaptive radix tree structure (`tidstore`). It reduces vacuum memory consumption by up to 20× and completely eliminates multi-pass index vacuuming on large bloats. Keep `maintenance_work_mem` reasonably bounded (e.g. 512MB to 1GB) rather than over-allocating, and monitor `pg_stat_progress_vacuum` to verify that `index_vacuum_count` remains 1 even under tens of millions of dead tuples.
+- **Logical Replication Standby Failover Slots (`failover = true` & `sync_replication_slots`)**:
+  - ❌ **The Post-Failover Replication Slot Desynchronization Disaster**: Promoting a physical read replica to primary during high-availability failover (e.g. Patroni) when downstream logical subscribers (ETL pipelines, analytics, microservices) consume logical slots from the old primary. The newly promoted primary lacks the subscriber's confirmed flush LSN, resulting in broken subscriptions (`replication slot does not exist`) and requiring catastrophic full table re-syncs.
+  - ✅ **Production Invariant**: In PostgreSQL 17+, enable logical replication slot synchronization on physical standbys:
+    ```sql
+    -- On primary: Create logical failover slot
+    SELECT pg_create_logical_replication_slot('sub_orders_slot', 'pgoutput', false, false, true); -- failover = true
+
+    -- In postgresql.conf on physical standby:
+    sync_replication_slots = true
+    hot_standby_feedback = on
+    ```
+    Standby instances continuously synchronize logical slot confirmation points from the primary, enabling zero-downtime subscriber reconnection after primary failover without replay gap data loss.
+
 
 
 

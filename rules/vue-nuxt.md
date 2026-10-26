@@ -1279,6 +1279,50 @@ alwaysApply: false
       searchResults.value = results;
     });
     ```
+- **Nuxt 3 / Vue 3.5 `useId()` Deterministic Hydration Identifier**:
+  - ❌ **The Math.random / Ephemeral Counter Hydration Mismatch**: Generating client-side component IDs using `Math.random()`, `nanoid()`, or local variable counters inside `<script setup>` for HTML form `id` and `label for` binding. During Server-Side Rendering (SSR), the server generates one ID while the client hydrates with a different ID, triggering hydration mismatch warnings and accessibility degradation.
+  - ✅ **Production Invariant**: In Vue 3.5+ and Nuxt 3, always use `useId()`:
+    ```vue
+    <script setup lang="ts">
+    import { useId } from 'vue';
+
+    // useId generates stable, unique, SSR-safe deterministic IDs across server and client
+    const emailInputId = useId();
+    const helperTextId = useId();
+    </script>
+
+    <template>
+      <div class="form-group flex flex-col gap-1.5">
+        <label :for="emailInputId" class="text-sm font-medium text-zinc-300">Email Address</label>
+        <input
+          :id="emailInputId"
+          type="email"
+          :aria-describedby="helperTextId"
+          class="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-zinc-100"
+        />
+        <p :id="helperTextId" class="text-xs text-zinc-500">We never share your email with third parties.</p>
+      </div>
+    </template>
+    ```
+- **Nuxt Declarative `routeRules` vs Heavy Server Middleware**:
+  - ❌ **The Blocking Server Middleware Bottleneck**: Enforcing caching, headers, or client-only rendering via custom Nitro middleware scripts that execute on every single incoming HTTP request, blocking Node.js event loops and adding unnecessary TTFT latency.
+  - ✅ **Production Invariant**: Offload static optimization, stale-while-revalidate (SWR), and edge caching directly to `nuxt.config.ts` via `routeRules`:
+    ```ts
+    // nuxt.config.ts
+    export default defineNuxtConfig({
+      routeRules: {
+        // Edge CDN stale-while-revalidate caching for public feeds
+        '/api/public/**': { swr: 3600, headers: { 'cache-control': 's-maxage=3600' } },
+        // Static pre-rendered marketing pages
+        '/blog/**': { prerender: true },
+        // Client-only single-page app mode for dense interactive dashboards
+        '/dashboard/**': { ssr: false },
+        // Proxy microservice routes without server overhead
+        '/legacy-api/**': { proxy: 'https://backend.internal.org/api/**' }
+      }
+    });
+    ```
+
 
 
 

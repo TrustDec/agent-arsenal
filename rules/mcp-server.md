@@ -378,6 +378,50 @@ alwaysApply: false
   - ❌ **The 10k-Token Schema Bloat Disaster**: Declaring massive nested objects with hundreds of optional properties, verbose comments, or duplicated enum strings. 20 verbose tools can easily consume 8,000+ tokens of prompt context, exhausting cache boundaries and reducing LLM reasoning depth.
   - ✅ **Production Invariant**: Keep tool parameter schemas lean and flat. Restrict tool declarations to essential parameters, provide concise 1-sentence descriptions, and avoid deep nesting. For complex configurations, accept a path to a configuration file rather than inlining 50-field JSON objects.
 
+## 19. MCP Dynamic Client Sampling Protocol (`sampling/createMessage`)
+- **Leveraging Host LLM Reasoning without Hardcoded Keys**:
+  - When an MCP server tool needs AI-driven evaluation, sentiment distillation, or schema translation, the tool should NOT bundle separate OpenAI or Anthropic API client libraries or require duplicate API keys in its environment.
+  - ❌ **The Leaked Secondary Key & Provider Lock-in Trap**: Requiring users to configure `OPENAI_API_KEY` inside the MCP server configuration just to parse an unstructured string, bypassing user-configured privacy filters and rate limit pools.
+  - ✅ **Production Invariant**: Use the Model Context Protocol `sampling/createMessage` client capability. The MCP server requests an LLM completion directly from the connecting host agent (e.g. Claude Code, Desktop, Cursor), inheriting the host's active model tier, user permissions, and privacy boundaries:
+    ```ts
+    import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+    import { CreateMessageRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+
+    export async function requestHostLLMSummary(server: Server, textToSummarize: string): Promise<string> {
+      const response = await server.request(
+        {
+          method: 'sampling/createMessage',
+          params: {
+            messages: [
+              {
+                role: 'user',
+                content: {
+                  type: 'text',
+                  text: `Distill the key architectural decisions from this log into 3 bullet points:\n\n${textToSummarize}`,
+                },
+              },
+            ],
+            systemPrompt: 'You are an isolated architectural extractor. Be concise and factual.',
+            maxTokens: 300,
+          },
+        },
+        CreateMessageRequestSchema
+      );
+
+      if (response.content.type === 'text') {
+        return response.content.text;
+      }
+      throw new Error('Unexpected non-text sampling response from host');
+    }
+    ```
+
+## 20. Remote MCP Transport Resiliency & Session Resumption (`Last-Event-ID`)
+- **Handling SSE Transport Network Blips**:
+  - When hosting MCP servers over HTTP Server-Sent Events (SSE) in distributed microservices or remote developer containers, transient network disconnections must not abruptly abort in-flight agent sessions.
+  - ❌ **The Silent Stream Abandonment Failure**: Dropping client connections on TCP resets and discarding session state, causing the host agent to fail catastrophically midway through an autonomous workflow.
+  - ✅ **Production Invariant**: Implement `Last-Event-ID` tracking on SSE streams. The MCP server assigns monotonically incrementing event IDs to all notifications and tool results, buffering the last $K$ events ($K \approx 100$) in memory or Redis. When the client reconnects with `Last-Event-ID`, replay missing messages to seamlessly resume the session without re-running side-effecting operations.
+
+
 
 
 
