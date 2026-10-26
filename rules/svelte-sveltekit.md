@@ -1981,6 +1981,113 @@ alwaysApply: false
       });
     }
     ```
+- **Svelte 5 `untrack()` for Non-Triggering Reactive Reads**:
+  - ❌ **Anti-Pattern: Unintended Dependency Tracking in `$effect`**: Reading secondary state (e.g. telemetry trackers, analytics IDs, or routing breadcrumbs) inside an `$effect`. The effect re-runs every time any read signal mutates, creating infinite re-render loops or flooding the server with duplicate analytical beacons.
+  - ✅ **Production Invariant**: Wrap secondary or non-triggering reads in `untrack()`. The effect will only re-execute when primary, tracked dependencies change:
+    ```svelte
+    <script lang="ts">
+    import { untrack } from 'svelte';
+
+    let { count, telemetryUserId }: { count: number; telemetryUserId: string } = $props();
+
+    $effect(() => {
+      // Primary tracked dependency: effect triggers ONLY when count changes
+      const currentCount = count;
+
+      // untrack() reads telemetryUserId without creating a reactive subscription:
+      untrack(() => {
+        sendAnalyticsBeacon({
+          userId: telemetryUserId,
+          metric: 'counter_updated',
+          value: currentCount
+        });
+      });
+    });
+    </script>
+    ```
+- **SvelteKit Non-Blocking Streaming SSR via Unawaited Promises**:
+  - ❌ **Anti-Pattern: Blocking Full SSR Response on Slow Third-Party APIs**: Awaiting slow secondary data (e.g. recommendations, related comments, analytics) directly inside `PageServerLoad`. This stalls the initial HTML response, degrading Time to First Byte (TTFB) from 60ms to over 2000ms.
+  - ✅ **Production Invariant**: Return the unresolved Promise directly from the load function. SvelteKit will immediately stream the main page HTML to the client and resolve the nested stream as the data completes:
+    ```typescript
+    // src/routes/dashboard/+page.server.ts
+    import type { PageServerLoad } from './$types';
+
+    export const load: PageServerLoad = async ({ fetch }) => {
+      // 1. Await critical fast data required for initial viewport render:
+      const userRes = await fetch('/api/user/me');
+      const user = await userRes.json();
+
+      // 2. Return slow promise WITHOUT await to stream asynchronously:
+      const slowStatsPromise = fetch('/api/reports/analytics')
+        .then(r => r.json());
+
+      return {
+        user,
+        streamed: {
+          stats: slowStatsPromise
+        }
+      };
+    };
+    ```
+    ```svelte
+    <!-- src/routes/dashboard/+page.svelte -->
+    <script lang="ts">
+      let { data } = $props();
+    </script>
+
+    <h1>Welcome, {data.user.name}</h1>
+
+    <!-- Streamed asynchronously without stalling initial SSR: -->
+    {#await data.streamed.stats}
+      <div class="skeleton-loader">Loading analytics...</div>
+    {:then stats}
+      <div class="analytics-card">Total Revenue: {stats.totalRevenue}</div>
+    {:catch error}
+      <p class="error">Failed to load analytics: {error.message}</p>
+    {/await}
+    ```
+- **Svelte 5 Callback Props vs Deprecated `createEventDispatcher`**:
+  - ❌ **Anti-Pattern: Using Legacy `createEventDispatcher` in Svelte 5**: In Svelte 5 Runes mode, `createEventDispatcher` is legacy and lacks native TypeScript return value typing and async promise propagation.
+  - ✅ **Production Invariant**: Use standard typed callback props (`onclick`, `onchange`, `onSelect`). They support strict typing, optional arguments, and can return Promises:
+    ```svelte
+    <!-- ModalDialog.svelte (Svelte 5) -->
+    <script lang="ts">
+    import type { Snippet } from 'svelte';
+
+    let { 
+      isOpen = false, 
+      onConfirm, 
+      onCancel, 
+      children 
+    }: {
+      isOpen: boolean;
+      onConfirm: () => Promise<void> | void;
+      onCancel: () => void;
+      children?: Snippet;
+    } = $props();
+
+    let isSubmitting = $state(false);
+
+    async function handleConfirm() {
+      isSubmitting = true;
+      try {
+        await onConfirm();
+      } finally {
+        isSubmitting = false;
+      }
+    }
+    </script>
+
+    {#if isOpen}
+      <div class="dialog">
+        {@render children?.()}
+        <button disabled={isSubmitting} onclick={handleConfirm}>
+          {isSubmitting ? 'Saving...' : 'Confirm'}
+        </button>
+        <button onclick={onCancel}>Cancel</button>
+      </div>
+    {/if}
+    ```
 
 
 

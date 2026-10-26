@@ -1715,6 +1715,85 @@ alwaysApply: false
     }
     </style>
     ```
+- **SSR Hydration Mismatch Defense: Non-Deterministic State & `useId()`**:
+  - ❌ **Anti-Pattern: Rendering Browser-Dependent State in SSR Tree**: Directly interpolating non-deterministic or client-only values in templates (e.g. `new Date().toLocaleTimeString()`, `Math.random()`, or `window.innerWidth`). This causes the Vue SSR hydration algorithm to fail with `Hydration completed but contains mismatches`, forcing a full client-side DOM teardown and violent visual flash.
+  - ✅ **Production Invariant**: Use Vue 3.5+ native `useId()` for deterministic accessible IDs across SSR and client boundaries. Wrap browser-specific elements in `<ClientOnly>` with explicit fallback skeletons, or defer non-deterministic rendering to `onMounted()`:
+    ```vue
+    <script setup lang="ts">
+    import { ref, onMounted } from 'vue';
+
+    // Vue 3.5+ deterministic SSR-safe ID generation:
+    const inputId = useId();
+    const formattedTimestamp = ref<string>('');
+
+    onMounted(() => {
+      // Safe client-only localization:
+      formattedTimestamp.value = new Date().toLocaleTimeString();
+    });
+    </script>
+
+    <template>
+      <div class="field">
+        <label :for="inputId">Username</label>
+        <input :id="inputId" type="text" />
+
+        <ClientOnly>
+          <span class="client-time">Last active: {{ formattedTimestamp }}</span>
+          <template #fallback>
+            <span class="animate-pulse bg-slate-200 h-4 w-24 rounded inline-block" />
+          </template>
+        </ClientOnly>
+      </div>
+    </template>
+    ```
+- **`shallowRef` & `markRaw` for Heavy Third-Party Engine Instances (Monaco, Three.js, Leaflet)**:
+  - ❌ **Anti-Pattern: Deeply Wrapping Complex Class Instances in `ref()` / `reactive()`**: Assigning complex engine instances (e.g. Monaco Editor, Three.js Scene, Leaflet Map, or Chart.js) to standard `ref()` or `reactive()`. Vue recursively traverses thousands of private internal properties and prototype chains with ES Proxies, causing catastrophic UI thread freezing, memory bloat, and breaking internal library state machines.
+  - ✅ **Production Invariant**: Always wrap third-party instances in `shallowRef()` or use `markRaw()` to completely opt out of recursive reactivity:
+    ```vue
+    <script setup lang="ts">
+    import { shallowRef, onMounted, onBeforeUnmount } from 'vue';
+    import * as monaco from 'monaco-editor';
+
+    const editorContainer = shallowRef<HTMLElement | null>(null);
+    // shallowRef only tracks reference assignment, never internal properties:
+    const editorInstance = shallowRef<monaco.editor.IStandaloneCodeEditor | null>(null);
+
+    onMounted(() => {
+      if (editorContainer.value) {
+        editorInstance.value = monaco.editor.create(editorContainer.value, {
+          value: 'const greeting = "hello";',
+          language: 'typescript'
+        });
+      }
+    });
+
+    onBeforeUnmount(() => {
+      editorInstance.value?.dispose();
+    });
+    </script>
+
+    <template>
+      <div ref="editorContainer" class="h-96 w-full" />
+    </template>
+    ```
+- **Nuxt 3 `useAsyncData` & `useFetch` Key Deduplication Invariants**:
+  - ❌ **Anti-Pattern: Implicit Dynamic Keys Causing Over-Fetching or Stale Caches**: Calling `useAsyncData(() => fetchUser(userId))` without an explicit key or without binding the key to the reactive param. When `userId` updates or the component is mounted across route transitions, Nuxt either serves stale cached data or triggers duplicate redundant network requests across SSR payload serialization.
+  - ✅ **Production Invariant**: Provide a unique, deterministic cache key incorporating all reactive query dependencies:
+    ```typescript
+    const route = useRoute();
+    const userId = computed(() => route.params.id as string);
+
+    // Explicit unique key guarantees safe SSR caching and re-fetches when key changes:
+    const { data: user, pending, error } = await useAsyncData(
+      `user-${userId.value}`,
+      () => $fetch(`/api/users/${userId.value}`),
+      {
+        watch: [userId],
+        lazy: true,
+        default: () => null
+      }
+    );
+    ```
 
 
 

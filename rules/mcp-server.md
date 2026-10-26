@@ -779,6 +779,67 @@ alwaysApply: false
     process.stdin.on('close', () => gracefulShutdown('stdin-close'));
     ```
 
+## 40. MCP SSE Stream Heartbeats & Client Disconnect Cleanup
+- **Zombie SSE Connections & Proxy Timeout Dropouts**:
+  - ❌ **Anti-Pattern: Passive SSE Streams Without Keep-Alive Heartbeats**: Relying on passive SSE connections. When behind reverse proxies (NGINX, Cloudflare, Envoy), connections with $>60\text{s}$ of inactivity are terminated with `504 Gateway Timeout` or socket reset errors, severing the agent's MCP channel mid-task.
+  - ✅ **Production Invariant**: Emit periodic 15-second SSE keep-alive comment frames (`: ping\n\n`) and bind client abort event listeners (`req.on('close')`) to evict stale session state:
+    ```typescript
+    import type { Request, Response } from 'express';
+
+    const activeSessions = new Map<string, { res: Response; timer: NodeJS.Timeout }>();
+
+    export function handleSseConnection(sessionId: string, req: Request, res: Response) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders();
+
+      // Send periodic keep-alive heartbeat every 15s
+      const heartbeatTimer = setInterval(() => {
+        res.write(': keep-alive\n\n');
+      }, 15000);
+
+      activeSessions.set(sessionId, { res, timer: heartbeatTimer });
+
+      req.on('close', () => {
+        clearInterval(heartbeatTimer);
+        activeSessions.delete(sessionId);
+        console.error(`MCP SSE session ${sessionId} disconnected and cleaned up.`);
+      });
+    }
+    ```
+
+## 41. Zero-Allocation Streaming Tool Progress Reporting (`ProgressToken`)
+- **Long-Running Tool Hang Assumptions & Agent Timeout Aborts**:
+  - ❌ **Anti-Pattern: Silent 60-Second Batch Executions**: Running large operations (e.g. database migrations, bulk file re-indexing, integration test suites) without sending intermediate progress notifications. The LLM agent host interprets the prolonged silence as a hung subprocess and forcibly aborts the tool call.
+  - ✅ **Production Invariant**: Intercept `_meta.progressToken` from the client request and emit JSON-RPC `notifications/progress` updates as discrete chunks complete:
+    ```typescript
+    import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+
+    async function executeLongRunningBatch(
+      server: Server,
+      items: string[],
+      progressToken?: string | number
+    ) {
+      const total = items.length;
+      for (let i = 0; i < total; i++) {
+        await processItem(items[i]);
+
+        if (progressToken !== undefined) {
+          // Emit non-blocking progress notification to client host:
+          await server.notification({
+            method: 'notifications/progress',
+            params: {
+              progressToken,
+              progress: i + 1,
+              total
+            }
+          }).catch(() => {});
+        }
+      }
+    }
+    ```
+
 
 
 

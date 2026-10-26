@@ -1936,6 +1936,90 @@ alwaysApply: false
         _ = resp.Body.Close()
     }()
     ```
+- **Go 1.24+ `weak.Pointer` for Ephemeral Object Caching without GC Memory Pinning**:
+  - ❌ **Anti-Pattern: Strong Reference Caches & Finalizer Leak Hazards**: Holding strong pointers in in-memory registries or global maps to "cache" shared entities, or relying on `runtime.SetFinalizer` to detect object deallocation. Strong pointers permanently pin objects in heap memory across GC cycles even when no active worker is using them, causing unbounded RSS growth.
+  - ✅ **Production Invariant**: In Go 1.24+, use `weak.Make[T]()` to create weak pointers. Weak pointers allow the Go garbage collector to reclaim the referenced object when all strong references are dropped. Always verify whether the cached value is still alive via `ptr.Value()`:
+    ```go
+    import "weak"
+
+    type SessionCache struct {
+        mu    sync.RWMutex
+        store map[string]weak.Pointer[UserSession]
+    }
+
+    func (c *SessionCache) Get(sessionID string) (*UserSession, bool) {
+        c.mu.RLock()
+        defer c.mu.RUnlock()
+
+        wp, exists := c.store[sessionID]
+        if !exists {
+            return nil, false
+        }
+        // Go 1.24+: ptr.Value() returns nil if GC reclaimed the target
+        val := wp.Value()
+        if val == nil {
+            return nil, false
+        }
+        return val, true
+    }
+
+    func (c *SessionCache) Put(sessionID string, session *UserSession) {
+        c.mu.Lock()
+        defer c.mu.Unlock()
+        c.store[sessionID] = weak.Make(session)
+    }
+    ```
+- **Go 1.21+ `context.WithTimeoutCause` & `context.Cause` for Precise Error Attribution**:
+  - ❌ **Anti-Pattern: Generic `context.DeadlineExceeded` Masking Root Cause**: Using standard `context.WithTimeout(ctx, dur)` across multi-stage service pipelines. When a request times out, downstream telemetry records generic `context deadline exceeded`, masking whether the timeout originated from a database lock, a slow third-party payment gateway, or an upstream client cancellation.
+  - ✅ **Production Invariant**: Use `context.WithTimeoutCause` (or `WithDeadlineCause`) and inspect the causal error with `context.Cause(ctx)` to achieve deterministic observability and precise SLA attribution:
+    ```go
+    var (
+        ErrDBQueryTimeout     = errors.New("database query exceeded 250ms SLA")
+        ErrDownstreamRPCSlow  = errors.New("pricing rpc gateway exceeded 500ms SLA")
+    )
+
+    func ExecuteOrderWorkflow(parentCtx context.Context) error {
+        // Attach deterministic cause error to the context timeout:
+        ctx, cancel := context.WithTimeoutCause(parentCtx, 250*time.Millisecond, ErrDBQueryTimeout)
+        defer cancel()
+
+        if err := runDatabaseQuery(ctx); err != nil {
+            if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+                // Returns exact cause: ErrDBQueryTimeout instead of generic DeadlineExceeded
+                return fmt.Errorf("order step failed: %w", context.Cause(ctx))
+            }
+            return err
+        }
+        return nil
+    }
+    ```
+- **Go Typed Atomics (`sync/atomic.Uint64`, `sync/atomic.Pointer[T]`) vs Alignment Fault Hazards**:
+  - ❌ **Anti-Pattern: Raw Low-Level Atomics with 32-Bit Alignment Risks**: Using package-level functions like `atomic.LoadUint64(&s.val)` on struct fields. On 32-bit ARM or x86 architectures, 64-bit atomic operations crash with panic: unaligned 64-bit atomic operation if the field is not guaranteed 8-byte aligned, and raw pointers lack compiler type checking.
+  - ✅ **Production Invariant**: Always use Go 1.19+ typed atomic wrappers (`atomic.Uint64`, `atomic.Pointer[T]`, `atomic.Bool`). They guarantee proper internal memory alignment across all target architectures and enforce compile-time type safety:
+    ```go
+    import "sync/atomic"
+
+    type ServiceHealthState struct {
+        isHealthy   atomic.Bool
+        totalReqs   atomic.Uint64
+        currentConf atomic.Pointer[ServiceConfig]
+    }
+
+    func NewServiceHealth(initial *ServiceConfig) *ServiceHealthState {
+        s := &ServiceHealthState{}
+        s.isHealthy.Store(true)
+        s.currentConf.Store(initial)
+        return s
+    }
+
+    func (s *ServiceHealthState) IncrementRequests() uint64 {
+        return s.totalReqs.Add(1)
+    }
+
+    func (s *ServiceHealthState) UpdateConfig(newConf *ServiceConfig) {
+        s.currentConf.Store(newConf)
+    }
+    ```
 
 
 

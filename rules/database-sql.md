@@ -1250,6 +1250,53 @@ alwaysApply: false
     -- Bounded grace period for DDL / table lock conflicts:
     max_standby_streaming_delay = '180s';
     ```
+- **PostgreSQL Transaction Wraparound Defense & Autovacuum Freeze Optimization**:
+  - ❌ **Anti-Pattern: Ignoring XID Consumption Until Emergency Single-User Shutdown**: Allowing transaction ID (`txid`) consumption to climb unmonitored towards the 2-billion transaction horizon. When unvacuumed tables exceed `autovacuum_freeze_max_age` (default 200M XIDs), PostgreSQL initiates aggressive, I/O-saturating anti-wraparound vacuums that ignore cost delay limits, and eventually forces the cluster into read-only single-user mode to prevent data corruption.
+  - ✅ **Production Invariant**: Continuously monitor `datfrozenxid` age, allocate dedicated freeze vacuum resources, and proactively tune freeze parameters:
+    ```sql
+    -- Query transaction ID age across databases (Alert when age > 100,000,000):
+    SELECT datname, age(datfrozenxid) AS xid_age,
+           current_setting('autovacuum_freeze_max_age')::bigint AS freeze_max_age
+    FROM pg_database
+    ORDER BY age(datfrozenxid) DESC;
+
+    -- Tune aggressive freeze parameters on high-write tables:
+    ALTER TABLE transactions SET (
+      autovacuum_vacuum_cost_limit = 2000,
+      autovacuum_vacuum_cost_delay = 2,
+      vacuum_freeze_min_age = 50000000,
+      vacuum_freeze_table_age = 150000000
+    );
+    ```
+- **PgBouncer Transaction-Mode Prepared Statement Conflict Defense**:
+  - ❌ **Anti-Pattern: Named Prepared Statements in Transaction Pooling Mode**: Executing `PREPARE stmt ...` or using ORMs (Prisma, GORM, Hibernate) with default server-side named prepared statements when connected through PgBouncer in `pool_mode = transaction`. Because each transaction is assigned a different backend PostgreSQL connection, queries crash with `ERROR: prepared statement "s0" does not exist`.
+  - ✅ **Production Invariant**: In transaction pooling setups, either use client-side prepared statement parameter substitution, configure the database driver to use unnamed prepared statements (`statement_cache_size = 0` / `prefer_simple_protocol = true`), or enable PgBouncer 1.21+ protocol-level prepared statement tracking:
+    ```ini
+    ; In pgbouncer.ini (PgBouncer 1.21+):
+    pool_mode = transaction
+    max_prepared_statements = 100
+
+    ; In database connection string / ORM configuration:
+    ; Go pgx driver:
+    ; connConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+    ; Prisma:
+    ; DATABASE_URL="postgresql://user:pass@bouncer:6432/db?pgbouncer=true"
+    ```
+- **PostgreSQL BRIN (Block Range Index) for Massive Append-Only Time-Series Tables**:
+  - ❌ **Anti-Pattern: Giant B-Tree Indexes on Monotonic Time-Series & Audit Tables**: Creating standard B-tree indexes (`CREATE INDEX idx_logs_timestamp ON logs(created_at)`) on tables with 100+ million append-only rows. The B-tree index consumes 10GB–50GB of RAM and disk, pushing hot business tables out of `shared_buffers` and causing severe write amplification.
+  - ✅ **Production Invariant**: Use a BRIN (Block Range Index) on naturally ordered or append-only time columns. A BRIN index stores only the min/max values for groups of disk pages (`pages_per_range`), reducing index footprint by up to $99.5\%$ (e.g. 15MB instead of 10GB) while maintaining fast range queries:
+    ```sql
+    -- Compact BRIN index for append-only audit trail:
+    CREATE INDEX idx_audit_logs_brin_created_at 
+    ON audit_logs USING brin (created_at) 
+    WITH (pages_per_range = 32);
+
+    -- Ensure query planner leverages BRIN index range scans:
+    EXPLAIN ANALYZE 
+    SELECT COUNT(*) 
+    FROM audit_logs 
+    WHERE created_at >= NOW() - INTERVAL '7 days';
+    ```
 
 
 
