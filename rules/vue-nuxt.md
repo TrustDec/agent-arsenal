@@ -1376,3 +1376,33 @@ alwaysApply: false
       results.value = data;
     });
     ```
+- **Vue 3.5+ `shallowRef` & `triggerRef` for Massive Tabular & Streaming Data**:
+  - ❌ **Wrapping Large Collections in Deep `ref()`**: Storing arrays with 10,000+ items or real-time streaming feeds in a standard `ref()`. Vue recursively wraps every nested object in a reactive `Proxy`, causing massive GC pauses, high memory footprint, and frame drops during table updates.
+  - ✅ **Production Invariant**: Use `shallowRef()` for large collections, Three.js/WebGL scene graphs, or external class instances. Trigger explicit render notifications using `triggerRef()` when in-place mutations occur:
+    ```ts
+    import { shallowRef, triggerRef } from 'vue';
+
+    const largeMatrix = shallowRef<MetricRecord[]>([]);
+
+    function appendRecords(newRecords: MetricRecord[]) {
+      // In-place update without deep proxy wrapping overhead
+      largeMatrix.value.push(...newRecords);
+      triggerRef(largeMatrix); // Notify template observers in O(1)
+    }
+    ```
+- **Nuxt 3 `useAsyncData` Deduplication & `getCachedData` Cache Warming**:
+  - ❌ **Duplicate Network Roundtrips on Client Route Transitions**: Leaving `useAsyncData` with default behavior when navigating between routes sharing common datasets (e.g., category trees or profile headers), causing redundant HTTP requests and layout flicker.
+  - ✅ **Production Invariant**: Define explicit deduplication keys and implement `getCachedData` to serve warm cache data instantly while validating freshness in background:
+    ```ts
+    const { data: categories } = await useAsyncData('global-categories', () => $fetch('/api/categories'), {
+      getCachedData(key, nuxtApp) {
+        // Return cached payload from Nuxt payload state if fresh (< 5 minutes)
+        const cached = nuxtApp.payload.data[key] || nuxtApp.static.data[key];
+        if (cached && Date.now() - cached.fetchedAt < 300_000) {
+          return cached;
+        }
+        return undefined;
+      }
+    });
+    ```
+

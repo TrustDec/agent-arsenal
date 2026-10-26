@@ -1629,3 +1629,31 @@ alwaysApply: false
 - **SvelteKit `preloadData` & `preloadCode` Predictive Navigation Prefetching**:
   - ❌ **Relying Solely on Default Hover Prefetching on Slow Connections**: Depending entirely on `data-sveltekit-preload-data="hover"` which triggers network requests only when the pointer physically enters a link boundary (leaving <100ms before click on mobile touch).
   - ✅ **Production Invariant**: For high-confidence next steps (e.g. wizard navigation, checkout step transitions), imperatively invoke `preloadData('/checkout/payment')` and `preloadCode('/checkout/payment')` on step validation to achieve instant 0ms perceived transitions.
+- **Svelte 5 `$bindable()` Two-Way Binding Discipline**:
+  - ❌ **Uncontrolled Prop Two-Way Binding Across Deep Hierarchies**: Exposing all component props as two-way bindable via `$bindable()`, creating tight bidirectional coupling and making state mutations unpredictable across parent/child boundaries.
+  - ✅ **Production Invariant**: Restrict `$bindable()` strictly to leaf form control primitives (e.g., custom input, checkbox, slider). For domain models or complex state, enforce unidirectional data flow with explicit event callbacks:
+    ```svelte
+    <!-- Leaf primitive: OK for bindable value -->
+    <script lang="ts">
+    let { value = $bindable(''), oncommit }: { value?: string; oncommit?: () => void } = $props();
+    </script>
+
+    <!-- Composite container: Prefer unidirectional events -->
+    <script lang="ts">
+    let { user, onUserUpdate }: { user: User; onUserUpdate: (updated: User) => void } = $props();
+    </script>
+    ```
+- **SvelteKit `handleFetch` Server Hook for Internal Service Auth Forwarding**:
+  - ❌ **Manual Header Clones in Every Server Load Function**: Manually copying JWT authorization headers and cookies in every `+page.server.ts` or `+layout.server.ts` `fetch()` call, prone to accidental leakage of session credentials to third-party endpoints.
+  - ✅ **Production Invariant**: Intercept and forward internal microservice credentials centrally inside `hooks.server.ts` via `handleFetch`:
+    ```ts
+    export const handleFetch: HandleFetch = async ({ event, request, fetch }) => {
+      // Forward authentication headers ONLY to trusted internal API domains
+      if (request.url.startsWith('https://internal-api.service.local/')) {
+        request.headers.set('authorization', event.request.headers.get('authorization') ?? '');
+        request.headers.set('x-forwarded-for', event.getClientAddress());
+      }
+      return fetch(request);
+    };
+    ```
+

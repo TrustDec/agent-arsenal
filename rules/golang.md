@@ -1640,3 +1640,29 @@ alwaysApply: false
     })
     defer stop() // Mandatory: unregisters callback upon normal handler exit!
     ```
+- **Go 1.23/1.24+ `iter.Pull` Goroutine Leak Defense**:
+  - ❌ **Abandoned Pull Iterators Leaking Driving Goroutines**: Go 1.23+ introduced range-over-function iterators (`iter.Seq[V]`). When converting a push iterator to a pull iterator via `next, stop := iter.Pull(seq)`, Go internally allocates a hidden helper goroutine to coordinate yield channels. If the consuming loop breaks or returns early without invoking `stop()`, this background goroutine remains blocked indefinitely, leaking memory and runtime stacks.
+  - ✅ **Production Invariant**: ALWAYS defer `stop()` immediately after calling `iter.Pull` or `iter.Pull2`:
+    ```go
+    next, stop := iter.Pull(streamIterator)
+    defer stop() // Mandatory: terminates hidden background iteration goroutine on early exit!
+
+    for {
+        val, ok := next()
+        if !ok || shouldBreak(val) {
+            break
+        }
+    }
+    ```
+- **Go 1.21+ `sync.OnceValue` & `sync.OnceValues` for Safe Lazy Instantiation**:
+  - ❌ **Manual `sync.Once` Boilerplate with Exposed Shared Variables**: Writing manual `var once sync.Once`, `var instance *Service`, and `var initErr error` at package level, risking accidental un-synchronized reads before initialization finishes or error loss.
+  - ✅ **Production Invariant**: Use `sync.OnceValues` for thread-safe single-computation closures returning values and errors:
+    ```go
+    var getClient = sync.OnceValues(func() (*http.Client, error) {
+        return buildSecureTLSClient()
+    })
+
+    // Safe concurrent invocation across all goroutines:
+    client, err := getClient()
+    ```
+

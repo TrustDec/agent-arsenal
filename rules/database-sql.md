@@ -1031,3 +1031,26 @@ alwaysApply: false
     );
     ```
     Monitor skipped rows via `pg_stat_progress_copy` to inspect error counts without stalling critical ingestion pipelines.
+- **`idle_in_transaction_session_timeout` & Vacuum Freeze Starvation Defense**:
+  - ❌ **Abandoned Transactions Blocking Autovacuum & Fueling Wraparound**: A client opens a transaction (`BEGIN`), performs a query, and either stalls on a slow network call or crashes without calling `COMMIT` or `ROLLBACK`. The idle transaction holds the database-wide transaction horizon ($x_{\text{min}}$) hostage, preventing `VACUUM` from cleaning dead tuples across all tables, leading to catastrophic table bloat and emergency shutdowns from transaction ID wraparound.
+  - ✅ **Production Invariant**: Always enforce a strict `idle_in_transaction_session_timeout` (e.g. `SET idle_in_transaction_session_timeout = '30s';` globally in `postgresql.conf` or per connection pool). Any connection idling inside an open transaction is forcibly terminated, reclaiming locks and advancing the vacuum horizon.
+- **Transactional Queue Polling via `FOR UPDATE SKIP LOCKED`**:
+  - ❌ **Head-of-Line Blocking & Deadlocks with Naked `SELECT ... FOR UPDATE`**: Polling job or task queues with `SELECT id FROM queue WHERE status = 'pending' LIMIT 1 FOR UPDATE;`. Multiple concurrent worker threads block on the exact same row lock, causing high latency, thread starvation, and frequent deadlock exceptions.
+  - ✅ **Production Invariant**: Always append `SKIP LOCKED` in queue consumer workers:
+    ```sql
+    WITH next_task AS (
+        SELECT id
+        FROM task_queue
+        WHERE status = 'pending'
+        ORDER BY priority DESC, created_at ASC
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+    )
+    UPDATE task_queue
+    SET status = 'processing', locked_at = NOW()
+    FROM next_task
+    WHERE task_queue.id = next_task.id
+    RETURNING task_queue.*;
+    ```
+    Workers concurrently skip in-flight rows without blocking, achieving lock-free linear scale.
+

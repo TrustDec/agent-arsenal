@@ -464,3 +464,27 @@ alwaysApply: false
   - Repeatedly fetching static resources (such as large schema definitions, system architecture diagrams, or OpenAPI specs) on every agent tool turn, saturating IPC bandwidth and burning host context memory.
   - ✅ **Production Invariant**: Attach content hashes / ETags to resource metadata and support conditional reads or client-side caching to eliminate redundant serialization roundtrips.
 
+## 25. MCP Resource Subscriptions & Live Invalidation (`notifications/resources/updated`)
+- **Stale Context Desynchronization from Polling Latency**:
+  - Relying on the host agent to manually re-read dynamic resources (e.g. database schema migrations, active git branch status, or live service metrics) on every turn, causing the agent to act on stale state.
+  - ✅ **Production Invariant**: Support the MCP `resources/subscribe` and `resources/unsubscribe` protocol handlers. When underlying files or models change on disk, emit `notifications/resources/updated` with the affected URI so the host agent's context cache is invalidated instantly:
+    ```typescript
+    server.setRequestHandler(SubscribeRequestSchema, async (request) => {
+      activeSubscriptions.add(request.params.uri);
+      return {};
+    });
+
+    // On disk file watcher change event:
+    function onFileModified(uri: string) {
+      if (activeSubscriptions.has(uri)) {
+        server.sendResourceUpdated({ uri });
+      }
+    }
+    ```
+
+## 26. Dynamic Roots Re-Validation (`notifications/roots/list_changed`)
+- **Stale Root Boundaries After Host Folder Open/Close**:
+  - Caching the host's permitted root directories only once during `initialize`, failing to detect when a user adds a new project folder or closes an existing workspace in Cursor or Claude Code.
+  - ✅ **Production Invariant**: Register a notification handler for `notifications/roots/list_changed`. Whenever emitted, immediately re-query `roots/list` and rebuild the canonical path resolution allowlist to enforce boundary integrity without requiring a server process restart.
+
+
