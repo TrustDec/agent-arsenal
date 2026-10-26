@@ -1628,3 +1628,15 @@ alwaysApply: false
 - **Go 1.24+ `sync.Map.Clear()` Atomic Flush**:
   - ❌ **Iterating and Deleting Keys Individually from `sync.Map`**: In high-throughput servers, clearing a `sync.Map` by calling `m.Range(func(key, _ any) bool { m.Delete(key); return true })` acquires internal lock segments repeatedly, incurs $O(N)$ dirty-to-read promotions, and causes severe lock contention.
   - ✅ **Production Invariant**: In Go 1.24+, call `m.Clear()` which atomically flushes both read and dirty maps in $O(1)$ amortized time, resetting internal allocation counters without lock thrashing.
+- **Go 1.24+ `testing.T.Chdir()` for Hermetic Test Isolation**:
+  - ❌ **Process-Wide `os.Chdir()` Race Conditions in Parallel Unit Tests**: Calling `os.Chdir(tmpDir)` inside unit tests with `t.Parallel()`. Because the working directory is process-global across all OS threads, changing it in one test corrupts file resolution in all concurrently running tests.
+  - ✅ **Production Invariant**: In Go 1.24+, call `t.Chdir(tmpDir)`. It scopes directory mutations to the test lifecycle, automatically restoring the original working directory when the test completes, and strictly blocks `t.Parallel()` invocations that would introduce race conditions.
+- **Go `context.AfterFunc` Closure Memory Leak Defense**:
+  - ❌ **Unstopped `context.AfterFunc` Closures on Long-Lived Parent Contexts**: Registering teardown callbacks via `stop := context.AfterFunc(ctx, cleanupFn)` on server-wide root contexts (e.g., `appCtx` or HTTP server context) without ever invoking `stop()`. If the child task finishes normally long before the parent context is canceled, the registered closure and all its captured pointers remain pinned in heap memory until server shutdown.
+  - ✅ **Production Invariant**: Always invoke the returned `stop()` function via `defer` or immediate completion to deregister the callback and release captured references:
+    ```go
+    stop := context.AfterFunc(reqCtx, func() {
+        conn.Close()
+    })
+    defer stop() // Mandatory: unregisters callback upon normal handler exit!
+    ```

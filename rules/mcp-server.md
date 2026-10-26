@@ -453,3 +453,14 @@ alwaysApply: false
 - **The Split Multi-Byte Character Parsing Crash**:
   - In stdio transports, OS pipe buffer chunks (typically 4096 or 8192 bytes) can slice right through the middle of a 3-byte or 4-byte UTF-8 character (e.g. emojis or CJK glyphs). Converting raw buffer chunks directly to strings with `chunk.toString('utf-8')` produces replacement characters (`\uFFFD`) and corrupts JSON-RPC payloads.
   - ✅ **Production Invariant**: Always pipe raw stream buffers through `string_decoder.StringDecoder('utf-8')` in Node.js or maintain a byte buffer prior to UTF-8 decoding to preserve character boundary integrity across chunk boundaries.
+
+## 23. Structured Logging Protocol (`notifications/message`) vs Console Corruption
+- **The Stdio Pipe Log Pollution Catastrophe**:
+  - Printing diagnostic logs or stack traces to `console.log()` or `process.stdout` in a stdio MCP server. This injects arbitrary unstructured strings into the JSON-RPC wire, crashing the host's parser with fatal deserialization errors.
+  - ✅ **Production Invariant**: Route all application logs strictly to `process.stderr` or emit formal MCP logging notifications (`notifications/message` via `server.sendLoggingMessage({ level: 'info', data: ... })`) adhering to the client's configured `logging/setLevel` filter.
+
+## 24. MCP Resource ETag Verification & Cache Hydration
+- **Uncached Multi-Megabyte Resource Re-Transmissions**:
+  - Repeatedly fetching static resources (such as large schema definitions, system architecture diagrams, or OpenAPI specs) on every agent tool turn, saturating IPC bandwidth and burning host context memory.
+  - ✅ **Production Invariant**: Attach content hashes / ETags to resource metadata and support conditional reads or client-side caching to eliminate redundant serialization roundtrips.
+

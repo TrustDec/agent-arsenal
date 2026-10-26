@@ -1017,3 +1017,17 @@ alwaysApply: false
 - **GIN `fastupdate` Bloat Defense & Background List Vacuuming**:
   - ❌ **Uncontrolled GIN Pending List Bloat**: Leaving `fastupdate = on` on high-ingestion JSONB or full-text GIN indexes without tuning `gin_pending_list_limit`. The pending list grows to tens of megabytes, causing random reader queries to stall for hundreds of milliseconds while performing inline list in-place reorganization (`gin_clean_pending_list`).
   - ✅ **Production Invariant**: Bound `gin_pending_list_limit` (e.g. `ALTER INDEX idx_events_payload SET (gin_pending_list_limit = '4MB')`) and schedule periodic off-peak invocations of `SELECT gin_clean_pending_list('idx_events_payload');` or disable `fastupdate` on read-critical search tables.
+- **NVMe Storage `effective_io_concurrency` & `random_page_cost` Tuning**:
+  - ❌ **Leaving Spinning-Disk Defaults on Cloud NVMe Instances**: Running modern cloud SSD / NVMe instances with default PostgreSQL settings (`effective_io_concurrency = 1`, `random_page_cost = 4.0`). The query planner penalizes index scans and executes slow sequential table scans, while the engine submits synchronous, serialized I/O requests that leave NVMe read queues idle.
+  - ✅ **Production Invariant**: On SSD/NVMe storage (AWS EBS gp3/io2, Google Extreme SSD), set `random_page_cost = 1.1` (reflecting nearly identical random vs sequential latency) and tune `effective_io_concurrency = 200` to 300. This enables asynchronous prefetching (`posix_fadvise`) during Bitmap Heap Scans, saturating NVMe controller parallelism.
+- **PostgreSQL 17+ Resilient `COPY` Streaming Ingestion (`ON_ERROR ignore`)**:
+  - ❌ **Single-Row Failure Aborting Multi-Gigabyte Bulk Ingestions**: In PostgreSQL 16 and older, executing `COPY raw_events FROM STDIN` failed entirely if a single malformed row or invalid encoding was encountered after ingesting 50 million records, discarding all progress and rolling back the transaction.
+  - ✅ **Production Invariant**: In PostgreSQL 17+, leverage `ON_ERROR ignore` to stream high-throughput batch imports without atomic total aborts:
+    ```sql
+    COPY raw_events FROM '/tmp/events_stream.csv' WITH (
+        FORMAT csv,
+        HEADER true,
+        ON_ERROR ignore
+    );
+    ```
+    Monitor skipped rows via `pg_stat_progress_copy` to inspect error counts without stalling critical ingestion pipelines.

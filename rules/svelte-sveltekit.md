@@ -1606,3 +1606,26 @@ alwaysApply: false
       {/snippet}
     </svelte:boundary>
     ```
+- **Svelte 5 `$derived.by()` for Multi-Statement Reactive Computations**:
+  - ❌ **Using `$effect` to Mutate Secondary State for Complex Calculations**: Calculating complex derived values (filtering, sorting, aggregations) by modifying a `$state` variable inside an `$effect`, causing infinite reactive loops, out-of-order layout renders, and memory overhead.
+  - ✅ **Production Invariant**: Use `$derived.by(() => { ... })` for pure, multi-statement reactive derivations:
+    ```svelte
+    <script lang="ts">
+    let transactions = $state<Transaction[]>([]);
+    let filterCategory = $state<string>('all');
+
+    // Clean, isolated, pure derivation without side-effect cascades
+    const filteredTotal = $derived.by(() => {
+      let sum = 0;
+      for (const t of transactions) {
+        if (filterCategory === 'all' || t.category === filterCategory) {
+          sum += t.amountInCents;
+        }
+      }
+      return sum;
+    });
+    </script>
+    ```
+- **SvelteKit `preloadData` & `preloadCode` Predictive Navigation Prefetching**:
+  - ❌ **Relying Solely on Default Hover Prefetching on Slow Connections**: Depending entirely on `data-sveltekit-preload-data="hover"` which triggers network requests only when the pointer physically enters a link boundary (leaving <100ms before click on mobile touch).
+  - ✅ **Production Invariant**: For high-confidence next steps (e.g. wizard navigation, checkout step transitions), imperatively invoke `preloadData('/checkout/payment')` and `preloadCode('/checkout/payment')` on step validation to achieve instant 0ms perceived transitions.

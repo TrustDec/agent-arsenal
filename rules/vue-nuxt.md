@@ -1344,3 +1344,35 @@ alwaysApply: false
 - **Nuxt Nitro Streaming Payloads (`sendStream`) vs Large Array Buffering**:
   - ❌ **Buffering Multi-Megabyte JSON Payloads in V8 Heap**: Returning massive arrays (`event.node.res.end(JSON.stringify(hugeDataset))`) in server API routes, triggering aggressive V8 GC pauses and driving container memory spikes under concurrent client traffic.
   - ✅ **Production Invariant**: Stream large tabular exports, NDJSON, or logs directly to the HTTP response using Nitro's `sendStream(event, readableStream)` with backpressure preservation.
+- **Vue 3.5+ `useTemplateRef` Type-Safe Template References**:
+  - ❌ **Manual String-Ref Typing & Casting (`ref<InstanceType<typeof Comp> | null>(null)`)**: Declaring template refs with generic ref variables whose names must match template strings, susceptible to silent ref name drift and awkward TypeScript null assertions.
+  - ✅ **Production Invariant**: In Vue 3.5+, use `useTemplateRef`:
+    ```vue
+    <script setup lang="ts">
+    import { useTemplateRef, onMounted } from 'vue';
+
+    const searchInput = useTemplateRef<HTMLInputElement>('searchInput');
+
+    onMounted(() => {
+      searchInput.value?.focus();
+    });
+    </script>
+
+    <template>
+      <input ref="searchInput" type="text" placeholder="Search..." />
+    </template>
+    ```
+- **Vue 3.5+ `onWatcherCleanup` for Asynchronous Effect Hygiene**:
+  - ❌ **Boilerplate Boolean Flags for Aborting Stale Async Watchers**: Managing manual `let isStale = false` flags inside asynchronous watchers to discard out-of-order network responses, leading to memory leaks and race condition bugs.
+  - ✅ **Production Invariant**: Use `onWatcherCleanup` inside `watch` or `watchEffect`:
+    ```ts
+    import { watch, onWatcherCleanup } from 'vue';
+
+    watch(searchQuery, async (newQuery) => {
+      const controller = new AbortController();
+      onWatcherCleanup(() => controller.abort());
+
+      const data = await fetchResults(newQuery, controller.signal);
+      results.value = data;
+    });
+    ```
