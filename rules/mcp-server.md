@@ -942,6 +942,41 @@ alwaysApply: false
       throw new McpError(ErrorCode.MethodNotFound, `Tool '${name}' is not recognized.`);
     });
     ```
+- **MCP Resource Subscriptions & Proactive Invalidation (`notifications/resources/updated`)**:
+  - ❌ **Anti-Pattern: Polling MCP Resources via Repeated Tool Invocations**: Forcing autonomous agents to repeatedly invoke query tools or read resource endpoints in tight loops to detect when external files, database tables, or log buffers change. This burns tokens, wastes context window capacity, and saturates the host CPU.
+  - ✅ **Production Invariant**: In servers exposing dynamic resources (e.g., config files, test run logs, active database tables), support MCP Resource Subscriptions (`resources/subscribe` and `resources/unsubscribe`). Whenever underlying state changes, emit a proactive JSON-RPC notification (`notifications/resources/updated`) with the affected resource URI so the client agent invalidates its internal cache:
+    ```typescript
+    import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+    import {
+      SubscribeRequestSchema,
+      UnsubscribeRequestSchema,
+    } from '@modelcontextprotocol/sdk/types.js';
+
+    const subscribedUris = new Set<string>();
+
+    server.setRequestHandler(SubscribeRequestSchema, async (request) => {
+      const { uri } = request.params;
+      subscribedUris.add(uri);
+      return {};
+    });
+
+    server.setRequestHandler(UnsubscribeRequestSchema, async (request) => {
+      const { uri } = request.params;
+      subscribedUris.delete(uri);
+      return {};
+    });
+
+    // When file or external event triggers an update:
+    export async function notifyResourceChanged(server: Server, changedUri: string): Promise<void> {
+      if (subscribedUris.has(changedUri)) {
+        await server.notification({
+          method: 'notifications/resources/updated',
+          params: { uri: changedUri },
+        });
+      }
+    }
+    ```
+
 
 
 

@@ -1356,6 +1356,43 @@ alwaysApply: false
     ON users (tenant_id, email)
     WHERE deleted_at IS NULL;
     ```
+- **PostgreSQL `SERIALIZABLE` Isolation & Exclusion Constraints for Write Skew Defense**:
+  - ❌ **Anti-Pattern: Relying on `SELECT ... FOR UPDATE` to Guard Missing Row Invariants**: Using row-level locking (`FOR UPDATE`) to verify conditions across non-existent rows (e.g. "at least one doctor on duty", "room cannot be double-booked between times $T_1$ and $T_2$"). `FOR UPDATE` only locks rows that already exist in the snapshot; concurrent transactions insert overlapping rows simultaneously because neither blocks the other, violating the business invariant (Write Skew).
+  - ✅ **Production Invariant**: For time-range overlaps or resource allocations, utilize PostgreSQL Exclusion Constraints (`EXCLUDE USING gist`) with the `btree_gist` extension, or execute the transaction under true `SERIALIZABLE` isolation with automated retry loops on serialization failures (`SQLSTATE 40001`):
+    ```sql
+    -- 1. Deterministic database-level exclusion constraint preventing overlapping bookings:
+    CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+    CREATE TABLE room_reservations (
+        reservation_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        room_id INT NOT NULL,
+        during TSTZRANGE NOT NULL,
+        EXCLUDE USING gist (
+            room_id WITH =,
+            during WITH &&
+        )
+    );
+
+    -- 2. For complex multi-table predicate invariants, use SERIALIZABLE isolation with exponential retry backoff:
+    -- BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+    -- Catch SQLSTATE '40001' (serialization_failure) and retry transaction up to 3 times.
+    ```
+- **Deterministic `GENERATED ALWAYS AS (expr) STORED` Columns with B-Tree Indexing**:
+  - ❌ **Anti-Pattern: Application-Side Normalization or Trigger Overhead for Query Filters**: Maintaining denormalized lowercase columns or JSON field extractions via `BEFORE INSERT OR UPDATE` triggers or application code. If any bulk insert or script bypasses the application layer, the index and search results become inconsistent.
+  - ✅ **Production Invariant**: In PostgreSQL 12+, define deterministic expressions as `GENERATED ALWAYS AS (...) STORED` columns, and attach standard B-Tree or unique indexes directly to the generated column:
+    ```sql
+    CREATE TABLE customer_orders (
+        order_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        raw_metadata JSONB NOT NULL,
+        -- Deterministic stored generated column extracting nested JSON key:
+        customer_tier TEXT GENERATED ALWAYS AS (raw_metadata ->> 'tier') STORED,
+        order_amount_cents INT GENERATED ALWAYS AS ((raw_metadata ->> 'amount_cents')::INT) STORED
+    );
+
+    -- Clean, high-performance B-Tree index on generated column:
+    CREATE INDEX idx_customer_orders_tier_amount ON customer_orders (customer_tier, order_amount_cents);
+    ```
+
 
 
 

@@ -2165,6 +2165,67 @@ alwaysApply: false
         }
     }
     ```
+- **Go 1.21+ `sync.OnceValue` / `sync.OnceValues` for Thread-Safe Lazy Initialization**:
+  - ❌ **Anti-Pattern: Manual Double-Checked Locking or Raw `sync.Once` Boilerplate**: Implementing custom `sync.RWMutex` double-checked locking patterns or declaring package-level variables alongside manual `sync.Once.Do` closures. This introduces race conditions, uninitialized variable reads, or verbose error-handling boilerplate.
+  - ✅ **Production Invariant**: In Go 1.21+, use standard generic helpers `sync.OnceValue(f)` for single returns, `sync.OnceValues(f)` for `(value, error)` returns, and `sync.OnceFunc(f)` for void side-effects. The runtime guarantees exactly-once execution, memory barriers, and caches the returned values:
+    ```go
+    import (
+        "context"
+        "database/sql"
+        "sync"
+    )
+
+    // Lazy, thread-safe database connection singleton initialized only upon first request:
+    var getDBPool = sync.OnceValues(func() (*sql.DB, error) {
+        db, err := sql.Open("pgx", "postgres://user:pass@localhost:5432/production?sslmode=verify-full")
+        if err != nil {
+            return nil, err
+        }
+        db.SetMaxOpenConns(50)
+        db.SetMaxIdleConns(25)
+        return db, nil
+    })
+
+    func QueryUser(ctx context.Context, userID string) (*User, error) {
+        db, err := getDBPool()
+        if err != nil {
+            return nil, err
+        }
+        // Proceed with query using initialized pool...
+        return nil, nil
+    }
+    ```
+- **Go `slog.LogValuer` for Deterministic PII & Secret Redaction in Structured Logs**:
+  - ❌ **Anti-Pattern: Raw Struct Logging with Sensitive Fields**: Passing raw domain structs (e.g. `UserAccount`, `PaymentMethod`, `AuthToken`) directly to `slog.InfoContext(ctx, "user login", "account", user)`. Password hashes, authorization bearer tokens, and customer tax IDs are serialized directly into centralized log aggregation backends (Datadog, Loki, CloudWatch).
+  - ✅ **Production Invariant**: Implement `slog.LogValuer` on sensitive domain types to return a redacted or masked `slog.Value`. Even if developers accidentally pass the entire entity to an arbitrary logger, the logging handler automatically invokes `LogValue()` and suppresses the plaintext secret:
+    ```go
+    import (
+        "log/slog"
+    )
+
+    type APIKey struct {
+        KeyID  string
+        Secret string
+    }
+
+    // LogValue implements slog.LogValuer to ensure secrets never leak into log collectors:
+    func (k APIKey) LogValue() slog.Value {
+        maskedSecret := "REDACTED"
+        if len(k.Secret) > 4 {
+            maskedSecret = "***" + k.Secret[len(k.Secret)-4:]
+        }
+        return slog.GroupValue(
+            slog.String("key_id", k.KeyID),
+            slog.String("secret", maskedSecret),
+        )
+    }
+
+    func Authenticate(key APIKey) {
+        // Output: {"level":"INFO","msg":"authenticating key","key":{"key_id":"k_991","secret":"***a81f"}}
+        slog.Info("authenticating key", "key", key)
+    }
+    ```
+
 
 
 

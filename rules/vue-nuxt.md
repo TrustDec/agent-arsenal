@@ -1909,6 +1909,59 @@ alwaysApply: false
       </div>
     </template>
     ```
+- **Nuxt 3 `useAsyncData` & `useFetch` Deterministic Key Invariant**:
+  - ❌ **Anti-Pattern: Implicit Dynamic URLs Without Explicit Cache Keys**: Calling `useFetch(() => '/api/user/' + userId.value)` without providing an explicit unique key string as the first parameter. Nuxt auto-generates keys based on file path and line number; when components are reused across dynamic routes or tabs, responses collide and display stale data or cause hydration mismatches between SSR and client.
+  - ✅ **Production Invariant**: Always provide a deterministic, scoped cache key to `useAsyncData` or `useFetch`. Use `watch` options to trigger refetches when dependent route params change:
+    ```vue
+    <script setup lang="ts">
+    const route = useRoute();
+    const userId = computed(() => route.params.id as string);
+
+    // Deterministic scoped cache key bound to current resource identity:
+    const { data: userProfile, status, error, refresh } = await useAsyncData(
+      () => `user:profile:${userId.value}`,
+      () => $fetch(`/api/users/${userId.value}`),
+      {
+        watch: [userId],
+        lazy: false,
+        transform: (raw: any) => ({
+          id: raw.id,
+          name: raw.full_name,
+          email: raw.email,
+        }),
+      }
+    );
+    </script>
+    ```
+- **Vue 3.5+ `shallowRef` & `markRaw` for Massive Datasets & Heavy Third-Party Instances**:
+  - ❌ **Anti-Pattern: Wrapping Large Collections or External SDK Instances in Deep `ref()`**: Placing 50,000-row tabular datasets or complex non-reactive class instances (e.g., Monaco Editor, Three.js scenes, Leaflet maps, Chart.js instances) into standard `ref()`. Vue recursively wraps thousands of nested properties in `Proxy` objects, causing massive GC pressure, multi-second freezes, and memory leaks.
+  - ✅ **Production Invariant**: Use `shallowRef` for large immutable collections (mutating via `.value = nextArray` or `triggerRef`) and wrap external object graphs with `markRaw()` to explicitly opt them out of the reactivity system:
+    ```vue
+    <script setup lang="ts">
+    import { shallowRef, markRaw, onMounted, onBeforeUnmount } from 'vue';
+    import * as monaco from 'monaco-editor';
+
+    const editorContainer = ref<HTMLDivElement | null>(null);
+    // shallowRef ensures Vue never wraps internal Monaco state in Proxies:
+    const editorInstance = shallowRef<monaco.editor.IStandaloneCodeEditor | null>(null);
+
+    onMounted(() => {
+      if (editorContainer.value) {
+        const rawEditor = monaco.editor.create(editorContainer.value, {
+          value: 'console.log("hello world");',
+          language: 'javascript',
+        });
+        // markRaw prevents any accidental reactivity wrapping
+        editorInstance.value = markRaw(rawEditor);
+      }
+    });
+
+    onBeforeUnmount(() => {
+      editorInstance.value?.dispose();
+    });
+    </script>
+    ```
+
 
 
 

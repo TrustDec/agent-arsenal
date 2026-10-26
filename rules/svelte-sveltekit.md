@@ -2219,6 +2219,67 @@ alwaysApply: false
     });
     </script>
     ```
+- **SvelteKit `snapshot` Invariant for History & Ephemeral Form State Preservation**:
+  - ❌ **Anti-Pattern: Losing Unsubmitted Form Drafts on Browser Navigation**: When a user navigates away from a complex multi-step form to consult documentation and clicks the browser back button, the component re-mounts from scratch, wiping all unsubmitted inputs. Storing drafts in `localStorage` requires manual cleanup and risks leaking stale data across user sessions.
+  - ✅ **Production Invariant**: Export a `snapshot` object containing `capture` and `restore` handlers from the page component. SvelteKit automatically serializes this state to `sessionStorage` associated with the current history entry and restores it when the user navigates back/forward:
+    ```svelte
+    <script lang="ts">
+    import type { Snapshot } from './$types';
+
+    let draftComment = $state('');
+    let selectedCategory = $state('feedback');
+
+    export const snapshot: Snapshot<{ draft: string; category: string }> = {
+      capture: () => ({ draft: draftComment, category: selectedCategory }),
+      restore: (value) => {
+        draftComment = value.draft;
+        selectedCategory = value.category;
+      },
+    };
+    </script>
+
+    <form>
+      <input bind:value={draftComment} placeholder="Draft your review..." />
+      <select bind:value={selectedCategory}>
+        <option value="feedback">Feedback</option>
+        <option value="bug">Bug Report</option>
+      </select>
+    </form>
+    ```
+- **Svelte 5 `$bindable()` Macro for Two-Way Contract Invariants**:
+  - ❌ **Anti-Pattern: Implicit Two-Way Prop Mutation or Clumsy Event Plumbing**: Attempting to mutate non-bindable child props directly, or writing verbose custom event dispatches (`on:change` / callback props) for simple bidirectional form controls.
+  - ✅ **Production Invariant**: In Svelte 5, child components must explicitly declare which props are permitted to participate in two-way binding using the `$bindable()` macro with an optional fallback. Consumers can then choose to use `bind:value={...}` or provide a normal one-way prop:
+    ```svelte
+    <!-- NumericStepper.svelte -->
+    <script lang="ts">
+    let {
+      value = $bindable(0),
+      min = 0,
+      max = 100,
+      step = 1,
+    }: {
+      value?: number;
+      min?: number;
+      max?: number;
+      step?: number;
+    } = $props();
+
+    function increment() {
+      if (value + step <= max) value += step;
+    }
+
+    function decrement() {
+      if (value - step >= min) value -= step;
+    }
+    </script>
+
+    <div class="stepper">
+      <button onclick={decrement} disabled={value <= min}>-</button>
+      <span>{value}</span>
+      <button onclick={increment} disabled={value >= max}>+</button>
+    </div>
+    ```
+
 
 
 
