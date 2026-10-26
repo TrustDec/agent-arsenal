@@ -1739,6 +1739,42 @@ alwaysApply: false
         log.Printf("validation failed on field: %s", validationErr.Field)
     }
     ```
+- **Go 1.24+ `t.Context()` Sub-Test Lifecycle & Goroutine Leak Defense**:
+  - ❌ **Manual Test Contexts Causing Zombie Goroutines & Flaky Mock Races**: Creating ad-hoc `context.WithCancel(context.Background())` in sub-tests and failing to cancel it, or cancelling it too late. Lingering goroutines continue invoking mock expectations during subsequent parallel tests, resulting in intermittent `-race` detector failures.
+  - ✅ **Production Invariant**: In Go 1.24+, pass `t.Context()` directly to client calls, database transactions, and background workers under test. `t.Context()` is deterministically cancelled as soon as the test or subtest returns:
+    ```go
+    func TestOrderProcessing(t *testing.T) {
+        t.Parallel()
+        ctx := t.Context() // Automatically cancelled when TestOrderProcessing completes
+
+        server := startMockPaymentServer(t)
+        res, err := server.Process(ctx, Order{ID: "ord_101"})
+        if err != nil {
+            t.Fatalf("unexpected error: %v", err)
+        }
+    }
+    ```
+- **Go HTTP Request Body Bounded Ingestion (`http.MaxBytesReader`)**:
+  - ❌ **Unbounded `io.ReadAll(r.Body)` Memory Exhaustion (OOM DOS)**: Reading untrusted HTTP request bodies directly via `body, err := io.ReadAll(r.Body)` or passing `r.Body` unconstrained to `json.NewDecoder(r.Body)`. A malicious actor streaming a 2GB request payload consumes memory until the host kills the container via Linux OOM killer.
+  - ✅ **Production Invariant**: Always wrap `r.Body` in `http.MaxBytesReader(w, r.Body, maxBytes)` before reading or decoding JSON, enforcing strict body size ceilings (e.g. 1MB or 4MB):
+    ```go
+    const MaxRequestBodyBytes = 1 << 20 // 1 MB ceiling
+
+    func handleWebhook(w http.ResponseWriter, r *http.Request) {
+        r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBodyBytes)
+        defer r.Body.Close()
+
+        var payload WebhookPayload
+        dec := json.NewDecoder(r.Body)
+        dec.DisallowUnknownFields() // Reject unmapped fields
+
+        if err := dec.Decode(&payload); err != nil {
+            http.Error(w, "request entity too large or malformed", http.StatusBadRequest)
+            return
+        }
+    }
+    ```
+
 
 
 

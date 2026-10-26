@@ -1089,6 +1089,29 @@ alwaysApply: false
     CREATE INDEX idx_orders_tenant_status_created 
     ON orders (tenant_id, status, created_at DESC);
     ```
+- **PostgreSQL Partial Indexes for High-Churn Soft-Delete & State Queues**:
+  - ❌ **Full-Table B-Tree Bloat on Soft-Deleted or Terminal States**: Indexing every row in a 50-million row `users` or `jobs` table when 95% of rows are soft-deleted (`deleted_at IS NOT NULL`) or in a completed state (`status = 'completed'`). The index consumes tens of gigabytes of RAM, bloats the buffer pool, and forces costly index write maintenance on every status update.
+  - ✅ **Production Invariant**: Always create partial indexes scoped strictly to active, queryable rows via `WHERE deleted_at IS NULL` or active queue states:
+    ```sql
+    -- Index only active, un-deleted rows (slashing index RAM footprint by up to 90%)
+    CREATE UNIQUE INDEX uq_users_active_email
+    ON users (email)
+    WHERE deleted_at IS NULL;
+
+    -- Index only actionable pending jobs for queue consumer polling
+    CREATE INDEX idx_jobs_pending_priority
+    ON background_jobs (priority DESC, run_at ASC)
+    WHERE status = 'pending';
+    ```
+- **PostgreSQL Transactional Advisory Locks (`pg_advisory_xact_lock`) for Single-Flight Worker Coordination**:
+  - ❌ **Row-Level Mutex Contention & Table Bloat for Singleton Jobs**: Creating a `lock_table` in the database and issuing `UPDATE locks SET locked = true` to ensure only one worker runs a periodic cron task. If the worker crashes, the row remains locked indefinitely, requiring manual cleanup, or generates deadlocks under connection drops.
+  - ✅ **Production Invariant**: Use 64-bit transactional advisory locks (`pg_advisory_xact_lock(bigint)` or `pg_try_advisory_xact_lock`). They require zero table storage, survive worker process crashes, and release automatically when the transaction completes or rolls back:
+    ```sql
+    -- Non-blocking attempt to acquire singleton cron lock:
+    SELECT pg_try_advisory_xact_lock(hashtext('daily_subscription_renewal'));
+    -- Returns TRUE if lock acquired; FALSE if another worker is currently executing.
+    ```
+
 
 
 

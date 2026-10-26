@@ -1484,6 +1484,53 @@ alwaysApply: false
       },
     });
     ```
+- **Vue 3.5+ `useTemplateRef` Type-Safe Template Referencing**:
+  - ❌ **Legacy `ref<HTMLElement | null>(null)` Variable Name Coupling**: Declaring template refs via `const input = ref<HTMLInputElement | null>(null)` matching `<input ref="input" />`. Renaming the TypeScript variable silently breaks the template binding without compiler warnings, and dynamic component refs require manual typecasting.
+  - ✅ **Production Invariant**: In Vue 3.5+, use `useTemplateRef<T>(key)` for type-safe template referencing decoupled from local variable identifiers:
+    ```vue
+    <script setup lang="ts">
+    import { useTemplateRef, onMounted } from 'vue';
+
+    // Typed directly to the HTMLInputElement interface:
+    const searchInput = useTemplateRef<HTMLInputElement>('search-input-ref');
+
+    onMounted(() => {
+      searchInput.value?.focus();
+    });
+    </script>
+
+    <template>
+      <input ref="search-input-ref" placeholder="Search orders..." />
+    </template>
+    ```
+- **Vue 3.5+ `onWatcherCleanup` for Async Request Race Condition Elimination**:
+  - ❌ **Stale Response Race Conditions in Async Watchers**: Launching asynchronous fetches inside `watch(userId, async (id) => { ... })` without cancelling in-flight requests. If `userId` changes from `A` to `B` quickly, response `A` may arrive after `B`, corrupting the UI state with stale data.
+  - ✅ **Production Invariant**: Use Vue 3.5+ `onWatcherCleanup` to abort pending HTTP requests or clear timers whenever the watcher re-executes or the component unmounts:
+    ```vue
+    <script setup lang="ts">
+    import { ref, watch, onWatcherCleanup } from 'vue';
+
+    const userId = ref('usr_101');
+    const userProfile = ref<UserProfile | null>(null);
+
+    watch(userId, async (newId) => {
+      const controller = new AbortController();
+
+      // Automatically abort the previous fetch when userId changes:
+      onWatcherCleanup(() => controller.abort());
+
+      try {
+        const res = await fetch(`/api/users/${newId}`, { signal: controller.signal });
+        userProfile.value = await res.json();
+      } catch (err: any) {
+        if (err.name !== 'AbortError') {
+          console.error('Fetch failed', err);
+        }
+      }
+    });
+    </script>
+    ```
+
 
 
 

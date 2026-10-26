@@ -1747,6 +1747,59 @@ alwaysApply: false
       },
     };
     ```
+- **Svelte 5 `$derived.by()` for Multi-Branch State Derivation**:
+  - ❌ **Complex Inline Ternaries or Untracked External Functions in `$derived`**: Writing nested ternary chains inside `$derived(cond1 ? (cond2 ? a : b) : c)` or calling helper functions outside the reactivity graph, leading to unreadable code or missed dependency tracking.
+  - ✅ **Production Invariant**: In Svelte 5, use `$derived.by(() => { ... })` for calculations requiring local variables, early returns, loops, or complex filtering:
+    ```svelte
+    <script lang="ts">
+    interface Transaction {
+      id: string;
+      amount: number;
+      category: string;
+    }
+
+    let { transactions, activeCategory }: { transactions: Transaction[]; activeCategory: string } = $props();
+
+    // Clean multi-statement computation with automatic signal tracking:
+    const filteredTotal = $derived.by(() => {
+      let sum = 0;
+      for (const t of transactions) {
+        if (activeCategory === 'all' || t.category === activeCategory) {
+          sum += t.amount;
+        }
+      }
+      return sum;
+    });
+    </script>
+    ```
+- **Svelte 5 Snippet Parameter Typing & Callback Props (Deprecating Legacy Slots & `createEventDispatcher`)**:
+  - ❌ **Using Deprecated `<slot>` and `createEventDispatcher`**: Relying on Svelte 4 slot mechanisms and event dispatchers in Svelte 5 components. Slots lack TypeScript parameter safety, and event dispatchers bypass standard DOM bubbling semantics.
+  - ✅ **Production Invariant**: Declare typed snippets with `Snippet<[T]>` and callback props (`onSelect: (item: T) => void`) for 100% type-safe component composition:
+    ```svelte
+    <!-- ListBox.svelte -->
+    <script lang="ts" generics="T">
+    import type { Snippet } from 'svelte';
+
+    let { 
+      items, 
+      renderRow, 
+      onSelect 
+    }: { 
+      items: T[]; 
+      renderRow: Snippet<[item: T]>; 
+      onSelect?: (item: T) => void;
+    } = $props();
+    </script>
+
+    <div class="list-container">
+      {#each items as item}
+        <div class="row" onclick={() => onSelect?.(item)}>
+          {@render renderRow(item)}
+        </div>
+      {/each}
+    </div>
+    ```
+
 
 
 

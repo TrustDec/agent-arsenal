@@ -565,6 +565,48 @@ alwaysApply: false
     process.on('SIGTERM', () => cleanTeardown('SIGTERM'));
     ```
 
+## 32. MCP Protocol Error Classification vs Business Failures (`isError: true`)
+- **Protocol-Level JSON-RPC Crashes on Business Logic Failures**:
+  - ❌ Throwing raw exceptions or returning top-level JSON-RPC error frames (`code: -32603 Internal error`) when an argument fails validation (e.g. `order_id not found` or `insufficient_funds`). Top-level JSON-RPC errors cause the host agent harness (Claude Code, Cursor) to suspect a broken server transport, leading to connection teardown or tool eviction.
+  - ✅ **Production Invariant**: Distinguish between transport/protocol violations and tool execution outcomes. Application errors MUST return HTTP 200 / JSON-RPC success response containing `{ isError: true, content: [{ type: 'text', text: 'Error details and remediation hint' }] }`. Protocol errors are reserved strictly for invalid JSON (`-32700`) or unregistered methods (`-32601`):
+    ```typescript
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      const { name, arguments: args } = request.params;
+      
+      try {
+        const result = await executeTool(name, args);
+        return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+      } catch (err: any) {
+        // Safe tool error containment:
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: `Tool execution failed: ${err.message}. Please verify the arguments and try again.`,
+            },
+          ],
+        };
+      }
+    });
+    ```
+
+## 33. Dynamic Resource Subscriptions & Targeted Invalidation
+- **Stale Context Caches & Thunderous Herd Invalidation**:
+  - MCP servers serving static resource caches (`resources/read`) that fail to notify the host agent when underlying database tables or workspace files are updated. Alternatively, broadcasting global invalidations causing the agent to re-fetch all resources at once.
+  - ✅ **Production Invariant**: Track active client resource subscriptions and emit granular `notifications/resources/updated` messages pinned to the exact mutated resource URI:
+    ```typescript
+    export async function notifyResourceUpdated(server: Server, resourceUri: string) {
+      await server.notification({
+        method: 'notifications/resources/updated',
+        params: {
+          uri: resourceUri,
+        },
+      });
+    }
+    ```
+
+
 
 
 
