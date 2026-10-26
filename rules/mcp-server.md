@@ -606,6 +606,50 @@ alwaysApply: false
     }
     ```
 
+## 34. Client Cancellation Handling (`notifications/cancelled`) & Abort Propagation
+- **Runaway Long-Running Queries & Zombie Background Workers**:
+  - When an autonomous agent or human interrupts a slow tool execution (e.g. database query, web scrape, heavy build task), the client sends a `notifications/cancelled` notification containing the `requestId`.
+  - ❌ **Anti-Pattern: Ignoring Client Cancellations**: Continuing to execute the database transaction or network request to completion in the background, consuming CPU, I/O, and holding locks on resources.
+  - ✅ **Production Invariant**: Maintain an active request-to-AbortController registry. When `notifications/cancelled` is received, invoke `abortController.abort()` to terminate in-flight HTTP requests, database contexts, or child processes instantly:
+    ```typescript
+    const activeRequests = new Map<string | number, AbortController>();
+
+    server.setNotificationHandler(CancelledNotificationSchema, (notification) => {
+      const { requestId } = notification.params;
+      const controller = activeRequests.get(requestId);
+      if (controller) {
+        controller.abort();
+        activeRequests.delete(requestId);
+      }
+    });
+    ```
+
+## 35. Prompt Templates Protocol (`prompts/list` & `prompts/get`) Discipline
+- **Unvalidated Dynamic Prompts & Context Boundary Escapes**:
+  - Exposing prompt templates via MCP without input argument validation or schema guards, allowing arbitrary text injection into template parameters that compromise host system directives.
+  - ✅ **Production Invariant**: Validate all prompt template arguments with strict schema constraints, provide clear parameter documentation, and wrap user-supplied arguments in defensive XML tags (`<user_prompt_input>`):
+    ```typescript
+    server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+      const { name, arguments: args } = request.params;
+      if (name === 'review_pull_request') {
+        const prNumber = z.string().regex(/^\d+$/).parse(args?.prNumber);
+        return {
+          description: `Code review template for PR #${prNumber}`,
+          messages: [
+            {
+              role: 'user',
+              content: {
+                type: 'text',
+                text: `Review PR #${prNumber}.\n<user_prompt_input>\n${args?.guidelines || 'Follow standard production rules.'}\n</user_prompt_input>`,
+              },
+            },
+          ],
+        };
+      }
+      throw new McpError(ErrorCode.MethodNotFound, `Unknown prompt: ${name}`);
+    });
+    ```
+
 
 
 

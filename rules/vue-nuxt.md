@@ -1530,6 +1530,45 @@ alwaysApply: false
     });
     </script>
     ```
+- **Vue 3.5+ Reactive Props Destructure & Default Values**:
+  - ❌ **Anti-Pattern: Legacy `withDefaults` Boilerplate or Non-Reactive Plain Destructure**: Using verbose `withDefaults(defineProps<Props>(), { ... })` or manually wrapping destructured primitives with `toRef` to avoid losing reactivity when passing them into composables or computed properties.
+  - ✅ **Production Invariant**: In Vue 3.5+, use native reactive props destructuring. Destructured variables automatically remain reactive without `toRef`:
+    ```vue
+    <script setup lang="ts">
+    import { computed } from 'vue';
+
+    interface Props {
+      count?: number;
+      label?: string;
+    }
+
+    // Native destructuring with defaults; fully reactive and tracked:
+    const { count = 0, label = 'Submit' } = defineProps<Props>();
+
+    const doubleCount = computed(() => count * 2);
+    </script>
+
+    <template>
+      <button class="px-4 py-2 font-medium">
+        {{ label }}: {{ doubleCount }}
+      </button>
+    </template>
+    ```
+- **Nuxt 3 / Vue SSR Hydration Mismatch & Client-Only Guardrails**:
+  - ❌ **Hydration Crash Anti-Pattern: Accessing Browser Globals During Setup**: Calling `window`, `localStorage`, or `navigator` in root setup scope or rendering dynamic unseeded timestamps (`new Date().toLocaleTimeString()`) on the server. The client renders different DOM from the server, triggering hydration mismatch errors and unstyled layout jumps.
+  - ✅ **Production Invariant**: Enclose client-only components or browser dependencies in `<ClientOnly>` with a semantic `#fallback` skeleton:
+    ```vue
+    <template>
+      <div class="user-panel">
+        <ClientOnly>
+          <UserLocalPreferences />
+          <template #fallback>
+            <div class="h-10 w-full animate-pulse rounded-lg bg-zinc-100 dark:bg-zinc-800" />
+          </template>
+        </ClientOnly>
+      </div>
+    </template>
+    ```
 
 
 

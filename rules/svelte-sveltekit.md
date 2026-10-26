@@ -1799,6 +1799,46 @@ alwaysApply: false
       {/each}
     </div>
     ```
+- **Svelte 5 Runes: `$inspect()` Hygiene & Production Build Elimination**:
+  - ❌ **Anti-Pattern: Stray `console.log` in Reactive Effects**: Leaving debugging `console.log()` statements inside `$effect` blocks. Under high state change frequencies, this severely degrades rendering performance, triggers memory retention in browser DevTools, and clutters server/client logs.
+  - ✅ **Production Invariant**: Use the native `$inspect(state)` rune for development debugging. Svelte compiler automatically strips `$inspect()` during production builds (`npm run build`), ensuring zero production bundle bloat or runtime overhead:
+    ```svelte
+    <script lang="ts">
+    let count = $state(0);
+
+    // Development-only reactive inspector; automatically stripped in production:
+    $inspect(count).with((type, val) => {
+      console.debug(`[Count Inspector - ${type}]:`, val);
+    });
+    </script>
+    ```
+- **SvelteKit Form Actions & Progressive Enhancement (`use:enhance`)**:
+  - ❌ **Anti-Pattern: Custom Fetch Handlers Breaking Form Degradation**: Writing manual `fetch('/api/...')` submit handlers with ad-hoc loading spinners, losing native browser form semantics and bypassing SvelteKit's built-in page data invalidation and action data typing.
+  - ✅ **Production Invariant**: Use SvelteKit's native form actions combined with `use:enhance` to achieve instant optimistic UI, automatic pending state transitions, and server response mapping:
+    ```svelte
+    <script lang="ts">
+    import { enhance } from '$app/forms';
+
+    let isSubmitting = $state(false);
+    </script>
+
+    <form 
+      method="POST" 
+      action="?/updateProfile" 
+      use:enhance={() => {
+        isSubmitting = true;
+        return async ({ update }) => {
+          isSubmitting = false;
+          await update();
+        };
+      }}
+    >
+      <input name="displayName" required disabled={isSubmitting} />
+      <button type="submit" disabled={isSubmitting}>
+        {isSubmitting ? 'Saving changes...' : 'Save Profile'}
+      </button>
+    </form>
+    ```
 
 
 

@@ -1111,6 +1111,36 @@ alwaysApply: false
     SELECT pg_try_advisory_xact_lock(hashtext('daily_subscription_renewal'));
     -- Returns TRUE if lock acquired; FALSE if another worker is currently executing.
     ```
+- **PostgreSQL Safe Column Renames & Type Alterations: Expand-Contract Zero-Downtime Migration**:
+  - ❌ **Instant Table Lock & App Crash Anti-Pattern**: Running `ALTER TABLE orders RENAME COLUMN old_name TO new_name;` or modifying column types directly on a multi-gigabyte table with live production traffic. This takes an exclusive `AccessExclusiveLock`, blocking all reads and writes until complete, and immediately causes `column does not exist` query exceptions on existing running application containers.
+  - ✅ **Production Invariant**: Always execute the 3-phase Expand-Contract pattern:
+    1. **Expand**: Add the new column as nullable (`ALTER TABLE orders ADD COLUMN new_name text;`). Attach a lightweight synchronized trigger to mirror writes from old $\to$ new:
+       ```sql
+       CREATE OR REPLACE FUNCTION sync_order_new_name()
+       RETURNS trigger AS $$
+       BEGIN
+         NEW.new_name := NEW.old_name;
+         RETURN NEW;
+       END;
+       $$ LANGUAGE plpgsql;
+
+       CREATE TRIGGER trg_sync_order_name
+       BEFORE INSERT OR UPDATE ON orders
+       FOR EACH ROW EXECUTE FUNCTION sync_order_new_name();
+       ```
+    2. **Backfill**: Incrementally backfill historical rows in small chunked transactions (`LIMIT 5000`) with short sleep pauses to yield I/O to production traffic.
+    3. **Contract**: Deploy application code pointing to `new_name`. Drop the trigger and old column asynchronously (`ALTER TABLE orders DROP COLUMN old_name;`).
+- **PostgreSQL Generated Columns (`GENERATED ALWAYS AS ... STORED`) vs Expression Indexes**:
+  - ❌ **Repetitive Expression Computation & Parsing Overhead**: Writing queries repeatedly computing string transformations or JSON extraction (e.g., `LOWER(TRIM(email))` or `(metadata->>'user_id')::uuid`). Each query forces PostgreSQL to re-evaluate the expression, wasting CPU cycles and complicating query plans.
+  - ✅ **Production Invariant**: Use deterministic `GENERATED ALWAYS AS (expr) STORED` columns with standard B-tree indexing for read-heavy synthetic or extracted keys:
+    ```sql
+    ALTER TABLE users 
+    ADD COLUMN normalized_email text 
+    GENERATED ALWAYS AS (LOWER(TRIM(email))) STORED;
+
+    CREATE UNIQUE INDEX uq_users_normalized_email 
+    ON users (normalized_email);
+    ```
 
 
 

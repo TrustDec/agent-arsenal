@@ -1774,6 +1774,45 @@ alwaysApply: false
         }
     }
     ```
+- **Go 1.21+ `sync.OnceValue` / `sync.OnceValues` for Safe Lazy Initialization**:
+  - ❌ **Anti-Pattern: Manual Mutex-Guarded Double-Checked Locking or Fragile `init()` Blocks**: Hand-rolling mutex double-checks with raw `sync.Mutex` or executing heavy network/config parsing inside package `init()` functions (causing unrecoverable panics on missing env variables or circular import headaches).
+  - ✅ **Production Invariant**: Use `sync.OnceValue(fn)` or `sync.OnceValues(fn)` to lazily compute and memoize expensive singletons (e.g. compiled regexes, connection pools, schema validators) with guaranteed single execution and thread-safe error propagation:
+    ```go
+    // Compile regex lazily on first access, thread-safely memoized forever:
+    var getEmailRegex = sync.OnceValue(func() *regexp.Regexp {
+        return regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
+    })
+
+    // Lazy singleton client with error handling:
+    var getDatabasePool = sync.OnceValues(func() (*pgxpool.Pool, error) {
+        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+        defer cancel()
+        return pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+    })
+    ```
+- **Go 1.24+ `testing/synctest` Deterministic Virtual Clock Goroutine Testing**:
+  - ❌ **Flaky Test Anti-Pattern: Sprinkling Wall-Clock `time.Sleep()` to Await Background Goroutines**: Inserting `time.Sleep(100 * time.Millisecond)` in tests to wait for worker pools, debounce channels, or token buckets. Under heavy CI load, the sleep is insufficient, producing intermittent test failures; on local machines, it wastes dozens of cumulative test seconds.
+  - ✅ **Production Invariant**: In Go 1.24+, use `synctest.Run(func() { ... })` to execute concurrent goroutines within an isolated synthetic event loop. In `synctest`, `time.Sleep()` advances virtual time instantaneously when all goroutines in the bubble are durably blocked:
+    ```go
+    func TestDebounceWorker(t *testing.T) {
+        synctest.Run(func() {
+            var counter atomic.Int32
+            d := NewDebouncer(500 * time.Millisecond, func() {
+                counter.Add(1)
+            })
+
+            d.Trigger()
+            d.Trigger()
+
+            // Instantly advances virtual time 600ms without real wall-clock delay:
+            time.Sleep(600 * time.Millisecond)
+
+            if got := counter.Load(); got != 1 {
+                t.Fatalf("expected debounced call count 1, got %d", got)
+            }
+        })
+    }
+    ```
 
 
 
