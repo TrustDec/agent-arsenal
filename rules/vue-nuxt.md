@@ -1636,6 +1636,87 @@ alwaysApply: false
       }
     };
     ```
+- **Vue 3.5+ `onWatcherCleanup` for Clean In-Flight Request Cancellation**:
+  - ❌ **Anti-Pattern: Manual Outer Scope AbortControllers & Race Conditions**: Declaring mutable `let activeController: AbortController | null` in the component script and manually checking state inside `watch()`. On rapid keystrokes or tab switching, responses from earlier requests arrive out-of-order and overwrite newer state, causing stale data bugs and memory leaks.
+  - ✅ **Production Invariant**: In Vue 3.5+, use the built-in `onWatcherCleanup` API. It cleanly decouples cleanup registration from the callback parameter list, automatically aborting prior requests before the watcher triggers again or when the component unmounts:
+    ```typescript
+    import { ref, watch, onWatcherCleanup } from 'vue';
+
+    const searchQuery = ref('');
+    const searchResults = ref<Item[]>([]);
+
+    watch(searchQuery, async (query) => {
+      if (!query.trim()) {
+        searchResults.value = [];
+        return;
+      }
+
+      const controller = new AbortController();
+      // Automatically invoked when searchQuery changes or component unmounts:
+      onWatcherCleanup(() => controller.abort());
+
+      try {
+        const response = await fetch(`/api/search?q=${encodeURIComponent(query)}`, {
+          signal: controller.signal
+        });
+        searchResults.value = await response.json();
+      } catch (err: unknown) {
+        if ((err as Error).name !== 'AbortError') {
+          console.error('Search fetch failed', err);
+        }
+      }
+    });
+    ```
+- **Vue 3.5+ Native Reactive Props Destructuring with Defaults**:
+  - ❌ **Anti-Pattern: Verbose `withDefaults` Boilerplate or Legacy `toRefs`**: Writing cumbersome `withDefaults(defineProps<Props>(), { ... })` or manually extracting properties with `toRefs(props)` to prevent losing reactivity during destructuring.
+  - ✅ **Production Invariant**: In Vue 3.5+, destructure `defineProps` directly in `<script setup>`. The compiler automatically transforms destructured variables into reactive accessors, retaining reactivity and supporting ergonomic default values:
+    ```vue
+    <script setup lang="ts">
+    interface Props {
+      count?: number;
+      label: string;
+      disabled?: boolean;
+    }
+
+    // Direct destructuring with full reactivity and TypeScript type checking:
+    const { count = 0, label, disabled = false } = defineProps<Props>();
+
+    // count and disabled remain fully reactive inside computed and watchers:
+    const formattedLabel = computed(() => `${label}: ${count} ${disabled ? '(disabled)' : ''}`);
+    </script>
+    ```
+- **`<TransitionGroup>` FLIP Animations & Absolute Leave Positioning**:
+  - ❌ **Anti-Pattern: Index Keys & Missing `.v-leave-active` Absolute Positioning**: Using array index `:key="index"` in `<TransitionGroup>` or omitting `position: absolute` on the leave transition. Removing an element causes the surrounding elements to snap instantly into their new slots before the deleted element finishes its fade animation, resulting in violent layout jumping.
+  - ✅ **Production Invariant**: Always key on immutable business identifiers (`:key="item.id"`), apply `.list-move` for CSS FLIP transitions, and set `position: absolute` on `.list-leave-active`:
+    ```vue
+    <template>
+      <TransitionGroup name="list" tag="ul" class="relative">
+        <li v-for="item in items" :key="item.id" class="list-item">
+          {{ item.title }}
+        </li>
+      </TransitionGroup>
+    </template>
+
+    <style scoped>
+    .list-move,
+    .list-enter-active,
+    .list-leave-active {
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .list-enter-from,
+    .list-leave-to {
+      opacity: 0;
+      transform: translateY(-8px);
+    }
+    /* Essential: remove leaving items from the normal document flow so siblings glide smoothly: */
+    .list-leave-active {
+      position: absolute;
+      width: 100%;
+    }
+    </style>
+    ```
+
+
 
 
 

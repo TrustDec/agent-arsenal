@@ -702,6 +702,85 @@ alwaysApply: false
     }
     ```
 
+## 38. Tool Annotations Protocol (`audience` & `priority`) Context Budgeting
+- **Unannotated Tool Saturation & Prompt Bloat**:
+  - ❌ **Anti-Pattern: Flat Uniform Tool Catalogs Without Priority Signals**: Exposing dozens of granular diagnostic tools without meta-annotations. Host LLMs cannot distinguish high-frequency core workflows from low-frequency edge tools, resulting in token exhaustion and tool selection confusion.
+  - ✅ **Production Invariant**: Provide `annotations` metadata on tool definitions indicating expected audience (`['assistant']`, `['user']`) and relative priority (`0.0` to `1.0`), enabling intelligent host-side tool pruning:
+    ```typescript
+    server.setRequestHandler(ListToolsRequestSchema, async () => {
+      return {
+        tools: [
+          {
+            name: 'run_production_query',
+            description: 'Executes analytical read-only SQL queries against replica.',
+            inputSchema: { type: 'object', properties: { sql: { type: 'string' } }, required: ['sql'] },
+            // Signals high relevance for autonomous assistant reasoning:
+            annotations: {
+              audience: ['assistant'],
+              priority: 0.95
+            }
+          },
+          {
+            name: 'dump_server_diagnostics',
+            description: 'Outputs verbose kernel and transport debugging telemetry.',
+            inputSchema: { type: 'object', properties: {} },
+            // Low priority; host can omit from prompt during context compaction:
+            annotations: {
+              audience: ['assistant'],
+              priority: 0.1
+            }
+          }
+        ]
+      };
+    });
+    ```
+
+## 39. Graceful Shutdown & Subprocess Group Cleanup
+- **Orphaned Process Leakage on Stdio Host Disconnect**:
+  - ❌ **Anti-Pattern: Unguarded Exit Leaking Zombie Child Processes**: When an stdio host abruptly closes pipes or exits, the MCP server is killed while subprocesses (e.g. Chromium, docker exec, tunnels) remain orphaned in the background, locking ports and holding file handles.
+  - ✅ **Production Invariant**: Intercept process termination signals (`SIGINT`, `SIGTERM`, stdin `close`), shut down resources cleanly, and kill subprocess process groups using negative PID (`-pid`):
+    ```typescript
+    import { ChildProcess } from 'node:child_process';
+
+    const childProcesses = new Set<ChildProcess>();
+
+    function registerChild(proc: ChildProcess) {
+      childProcesses.add(proc);
+      proc.on('exit', () => childProcesses.delete(proc));
+    }
+
+    async function gracefulShutdown(signal: string) {
+      console.error(`Received ${signal}. Shutting down MCP server...`);
+      
+      // Enforce 3-second bounded hard exit to prevent hanging on zombie handles
+      const forceExitTimer = setTimeout(() => {
+        console.error('Graceful shutdown timed out after 3s. Force terminating.');
+        process.exit(1);
+      }, 3000);
+      forceExitTimer.unref();
+
+      // Terminate all spawned child process groups
+      for (const proc of childProcesses) {
+        if (proc.pid) {
+          try {
+            process.kill(-proc.pid, 'SIGTERM'); // Signal entire process tree
+          } catch {
+            // Already exited
+          }
+        }
+      }
+
+      await server.close();
+      process.exit(0);
+    }
+
+    process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+    process.stdin.on('close', () => gracefulShutdown('stdin-close'));
+    ```
+
+
+
 
 
 

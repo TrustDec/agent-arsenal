@@ -1206,6 +1206,52 @@ alwaysApply: false
     EXPLAIN SELECT * FROM audit_logs 
     WHERE created_at >= '2026-10-15' AND created_at < '2026-10-20';
     ```
+- **Zero-Downtime PostgreSQL `NOT NULL` Constraint Addition on High-Scale Tables**:
+  - ❌ **Lock Contention Anti-Pattern: Direct `ALTER COLUMN SET NOT NULL` on Large Tables**: Executing `ALTER TABLE orders ALTER COLUMN customer_id SET NOT NULL;` on a table with 50 million rows. This acquires an `ACCESS EXCLUSIVE` lock and performs a full table sequential scan while holding the lock, completely blocking all concurrent SELECT, INSERT, and UPDATE queries for minutes.
+  - ✅ **Production Invariant**: Use a 2-step validated check constraint pattern. First, add an unvalidated check constraint (instant lock release), validate it asynchronously in the background without blocking writes, and then safely promote to a native `NOT NULL` constraint (which skips the table scan in PostgreSQL 12+):
+    ```sql
+    -- Step 1: Add constraint without scanning existing rows (instant, minimal lock):
+    ALTER TABLE orders 
+    ADD CONSTRAINT chk_orders_customer_id_not_null 
+    CHECK (customer_id IS NOT NULL) NOT VALID;
+
+    -- Step 2: Validate existing rows in the background (SHARE UPDATE EXCLUSIVE lock; writes continue unblocked):
+    ALTER TABLE orders 
+    VALIDATE CONSTRAINT chk_orders_customer_id_not_null;
+
+    -- Step 3: Convert to native NOT NULL; PostgreSQL recognizes the valid constraint and skips full scan:
+    ALTER TABLE orders 
+    ALTER COLUMN customer_id SET NOT NULL;
+
+    -- Step 4: Drop redundant check constraint:
+    ALTER TABLE orders 
+    DROP CONSTRAINT chk_orders_customer_id_not_null;
+    ```
+- **High-Performance JSONB Querying via `jsonb_path_ops` GIN Indexing vs Default GIN Bloat**:
+  - ❌ **Anti-Pattern: Default GIN Index Bloat on Deep JSONB Payloads**: Creating standard GIN indexes (`USING gin (payload)`). The default `jsonb_ops` operator class creates index entries for every distinct key and value separately, resulting in massive index bloat, elevated disk I/O, and severe write amplification on high-throughput inserts.
+  - ✅ **Production Invariant**: Use `jsonb_path_ops` GIN indexing and the `@>` containment operator. It generates compact 32-bit hashes of full key-value paths, reducing index size by up to $65\%$ and delivering orders of magnitude faster lookups:
+    ```sql
+    -- Compact, high-throughput path-based GIN index:
+    CREATE INDEX idx_events_payload_path 
+    ON events USING gin (payload jsonb_path_ops);
+
+    -- Query using containment operator (@>) to guarantee index scan:
+    SELECT id, payload 
+    FROM events 
+    WHERE payload @> '{"tenant_id": "org_987", "status": "active"}';
+    ```
+- **PostgreSQL Read Replica Recovery Conflict Defense (`hot_standby_feedback`)**:
+  - ❌ **Anti-Pattern: Unconfigured Read Replicas Aborting Analytical Queries**: Running analytical queries or batch exports on read replicas with default settings. When the primary node runs `VACUUM` and purges dead tuples, the replica WAL receiver abruptly cancels active queries with `ERROR: canceling statement due to conflict with recovery`.
+  - ✅ **Production Invariant**: Enable `hot_standby_feedback = on` on read replicas so the replica continuously informs the primary of its oldest active snapshot transaction ID (`xmin`), preventing the primary from vacuuming tuples currently read by replica queries:
+    ```sql
+    -- In postgresql.conf (or via ALTER SYSTEM) on read replica:
+    -- Prevents primary autovacuum from purging tuples needed by active replica queries:
+    hot_standby_feedback = on;
+    -- Bounded grace period for DDL / table lock conflicts:
+    max_standby_streaming_delay = '180s';
+    ```
+
+
 
 
 

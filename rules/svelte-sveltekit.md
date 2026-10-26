@@ -1900,6 +1900,89 @@ alwaysApply: false
       }
     }
     ```
+- **Svelte 5 Snippets vs Deprecated `<slot>` for Typed Dynamic Projection**:
+  - ❌ **Anti-Pattern: Legacy Svelte 4 `<slot>` with Untyped `let:` Bindings**: Using `<slot name="header" :item="data" />` in Svelte 5 projects. `<slot>` is deprecated; it cannot be type-checked by `svelte-check`, cannot be passed cleanly as props, and lacks closure scope ergonomics.
+  - ✅ **Production Invariant**: In Svelte 5, use `{#snippet}` and `{@render}`. Snippets are first-class, strongly-typed template functions that can be passed as regular component props:
+    ```svelte
+    <script lang="ts">
+    import type { Snippet } from 'svelte';
+
+    interface Props<T> {
+      items: T[];
+      // Typed snippet prop contract:
+      row: Snippet<[item: T, index: number]>;
+      fallback?: Snippet;
+    }
+
+    let { items, row, fallback }: Props<any> = $props();
+    </script>
+
+    {#if items.length === 0 && fallback}
+      {@render fallback()}
+    {:else}
+      <ul>
+        {#each items as item, i (item.id ?? i)}
+          <li>
+            {@render row(item, i)}
+          </li>
+        {/each}
+      </ul>
+    {/if}
+    ```
+- **Svelte 5 Encapsulated Reactive Model Classes with `$state`**:
+  - ❌ **Anti-Pattern: Legacy `writable()` Stores or Leaky Object References**: Exposing mutable state objects or using legacy Svelte 4 `writable()` stores in Svelte 5 projects, forcing consumers to deal with `$` syntax and manual subscriptions.
+  - ✅ **Production Invariant**: Encapsulate complex state machines into standard TypeScript classes using private `#field = $state(...)` and public getters. Svelte 5 automatically tracks property access reactively across module boundaries:
+    ```typescript
+    export class CartModel {
+      #items = $state<Array<{ id: string; price: number; qty: number }>>([]);
+
+      get totalCount(): number {
+        return this.#items.reduce((acc, item) => acc + item.qty, 0);
+      }
+
+      get subtotalUsd(): number {
+        return this.#items.reduce((acc, item) => acc + item.price * item.qty, 0);
+      }
+
+      public addItem(id: string, price: number): void {
+        const existing = this.#items.find(i => i.id === id);
+        if (existing) {
+          existing.qty += 1;
+        } else {
+          this.#items.push({ id, price, qty: 1 });
+        }
+      }
+
+      public clear(): void {
+        this.#items = [];
+      }
+    }
+    ```
+- **SvelteKit Cookie Security & Subdomain Propagation Invariants**:
+  - ❌ **Anti-Pattern: Pathless `cookies.set()` Causing Route-Scoped Auth Drift**: Calling `cookies.set('session', token)` without an explicit `path`. SvelteKit defaults the cookie path to the current request pathname (e.g. `/api/auth/login`), causing subsequent requests to `/dashboard` to omit the cookie and appear unauthenticated.
+  - ✅ **Production Invariant**: Always provide explicit security attributes and `path: '/'` on all cookie mutations:
+    ```typescript
+    import { dev } from '$app/environment';
+    import type { RequestEvent } from '@sveltejs/kit';
+
+    export function setAuthCookie(event: RequestEvent, token: string): void {
+      event.cookies.set('session_id', token, {
+        path: '/',
+        httpOnly: true,
+        sameSite: 'lax',
+        secure: !dev,
+        maxAge: 60 * 60 * 24 * 7 // 7 days
+      });
+    }
+
+    export function clearAuthCookie(event: RequestEvent): void {
+      event.cookies.delete('session_id', {
+        path: '/'
+      });
+    }
+    ```
+
+
 
 
 

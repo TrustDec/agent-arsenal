@@ -1877,6 +1877,67 @@ alwaysApply: false
         return results, nil
     }
     ```
+- **Go 1.24+ `testing.B.Loop()` for Clean Micro-Benchmark Iteration Control**:
+  - ❌ **Anti-Pattern: Legacy `b.N` Loops with Repeated Setup Contamination**: Writing `for i := 0; i < b.N; i++` where per-iteration setup code is accidentally measured or requires manual `b.ResetTimer()` invocations. If the compiler detects pure functions without side-effects inside the `b.N` loop, it may optimize away the entire benchmark.
+  - ✅ **Production Invariant**: In Go 1.24+, replace legacy `b.N` loops with `for b.Loop() { ... }`. The runtime manages iteration counts dynamically, automatically excludes warm-up cycles, and prevents compiler dead-code elimination without manual timer resetting:
+    ```go
+    func BenchmarkPayloadSerialization(b *testing.B) {
+        // One-time expensive benchmark setup:
+        payload := generateSyntheticPayload(1024)
+
+        // Go 1.24+ modern benchmark loop:
+        for b.Loop() {
+            encoded, err := Serialize(payload)
+            if err != nil {
+                b.Fatal(err)
+            }
+            if len(encoded) == 0 {
+                b.Fatal("empty output")
+            }
+        }
+    }
+    ```
+- **Go `sync.Pool` Memory Retention Defense & Capacity Bounds**:
+  - ❌ **Anti-Pattern: Recycling Mega-Buffers into Shared Pools**: Returning arbitrarily grown byte slices (`cap(buf) > 1MB`) back to `sync.Pool`. Under high-concurrency traffic spikes, several massive allocations become permanently pinned in the pool across garbage collection cycles, causing severe memory bloat and process RSS inflation.
+  - ✅ **Production Invariant**: Enforce a strict capacity threshold before returning slices to the pool. Discard oversized slices so GC reclaims them, and zero out slice headers to prevent retaining references:
+    ```go
+    const maxPooledBufferSize = 64 * 1024 // 64KB threshold
+
+    var bufferPool = sync.Pool{
+        New: func() any {
+            b := make([]byte, 0, 4096)
+            return &b
+        },
+    }
+
+    func ReleaseBuffer(buf *[]byte) {
+        if buf == nil {
+            return
+        }
+        // Discard buffers that expanded beyond the safety threshold
+        if cap(*buf) > maxPooledBufferSize {
+            return
+        }
+        *buf = (*buf)[:0] // Reset length while preserving capacity
+        bufferPool.Put(buf)
+    }
+    ```
+- **Go HTTP Client Connection Reuse & Idle Pool Exhaustion via Unread Response Bodies**:
+  - ❌ **Anti-Pattern: Naked `resp.Body.Close()` Without Discard Drain**: Closing `resp.Body` while unread bytes remain in the transport stream. When a response body is closed prematurely, `http.Transport` cannot verify the connection is cleanly at EOF, forcing it to close the underlying TCP/TLS connection instead of returning it to the idle connection pool.
+  - ✅ **Production Invariant**: Always drain remaining response bytes to `io.Discard` before closing to ensure socket reuse across requests:
+    ```go
+    resp, err := httpClient.Do(req)
+    if err != nil {
+        return err
+    }
+    defer func() {
+        // Drain unread bytes to ensure the underlying TCP socket is reused:
+        _, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512*1024))
+        _ = resp.Body.Close()
+    }()
+    ```
+
+
 
 
 
