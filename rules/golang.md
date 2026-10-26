@@ -1665,4 +1665,57 @@ alwaysApply: false
     // Safe concurrent invocation across all goroutines:
     client, err := getClient()
     ```
+- **Go 1.24+ `testing.B.Loop` Benchmark Invariant**:
+  - ❌ **Legacy `for i := 0; i < b.N; i++` Benchmark Artifacts**: Using the traditional loop structure prone to benchmark timing skew, where initialization code placed before the loop runs outside timing calibration or where compiler optimizations eliminate dead-loop iterations, skewing nanoseconds-per-op statistics.
+  - ✅ **Production Invariant**: In Go 1.24+, use `b.Loop()` which automatically resets benchmark timers before iteration, prevents unwanted loop unrolling/dead-code elimination, and executes setup code cleanly per iteration cycle:
+    ```go
+    func BenchmarkPayloadParsing(b *testing.B) {
+        payload := generateSyntheticPayload(1024)
+        for b.Loop() {
+            // Setup code per run executes with automatic timer pause/resume
+            _ = parseAndValidate(payload)
+        }
+    }
+    ```
+- **Go 1.24+ Deterministic Virtualized Concurrency Testing with `testing/synctest`**:
+  - ❌ **Flaky `time.Sleep` in Concurrent Goroutine Tests**: Simulating timeouts, heartbeats, or debouncing with real `time.Sleep(100 * time.Millisecond)`, causing race detector slowdowns, fragile CI flakiness, and bloated test suite execution times.
+  - ✅ **Production Invariant**: In Go 1.24+, wrap concurrent goroutine scheduling inside `synctest.Run(func() { ... })`. Synctest executes goroutines within a virtualized time bubble, instantly advancing synthetic clocks to test deadlines without real-world latency:
+    ```go
+    func TestWorkerHeartbeatTimeout(t *testing.T) {
+        synctest.Run(func() {
+            ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+            defer cancel()
+
+            worker := NewWorker(ctx)
+            go worker.Start()
+
+            // Instantly advance virtual clock past timeout without sleeping:
+            time.Sleep(6 * time.Second)
+            synctest.Wait() // Drain bubble until all goroutines reach quiescence
+
+            if !worker.IsTerminated() {
+                t.Fatalf("expected worker termination on virtual context timeout")
+            }
+        })
+    }
+    ```
+- **Go 1.23+ Canonical Value Interning with `unique.Make`**:
+  - ❌ **Redundant Heap Duplication for High-Cardinality Strings/Structs**: Ingesting millions of telemetry tags, HTTP path templates, or IP address strings, allocating separate duplicate heap backing arrays for identical values and wasting hundreds of megabytes of RAM.
+  - ✅ **Production Invariant**: Use Go 1.23+ `unique.Make` to intern comparable types into a globally deduplicated, concurrent-safe canonical pool with $O(1)$ pointer equality comparison:
+    ```go
+    import "unique"
+
+    type RouteKey struct {
+        Method string
+        Path   string
+    }
+
+    var internedRoute = unique.Make(RouteKey{Method: "POST", Path: "/api/v1/checkout"})
+
+    // O(1) comparison between interned handles (pointer equality):
+    if keyHandle == internedRoute {
+        // Fast-path matched
+    }
+    ```
+
 

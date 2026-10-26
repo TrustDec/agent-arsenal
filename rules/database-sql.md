@@ -1053,4 +1053,22 @@ alwaysApply: false
     RETURNING task_queue.*;
     ```
     Workers concurrently skip in-flight rows without blocking, achieving lock-free linear scale.
+- **PostgreSQL 17+ `MERGE ... RETURNING` for Atomic Upserts with Mutation Tracking**:
+  - ❌ **Two-Step Upsert or Blind `ON CONFLICT DO UPDATE` Without Action Audit**: Needing to know whether an atomic upsert operation actually inserted a new record or updated an existing one, forcing developers into separate `SELECT` pre-flight queries or ambiguous `RETURNING (xmax = 0) AS inserted` heuristics.
+  - ✅ **Production Invariant**: In PostgreSQL 17+, use `MERGE` with `RETURNING merge_action()` to atomically apply updates/inserts and determine exact mutation actions in a single roundtrip:
+    ```sql
+    MERGE INTO user_profiles AS target
+    USING incoming_profiles AS source
+    ON target.user_id = source.user_id
+    WHEN MATCHED AND target.updated_at < source.updated_at THEN
+        UPDATE SET display_name = source.display_name, updated_at = source.updated_at
+    WHEN NOT MATCHED THEN
+        INSERT (user_id, display_name, updated_at)
+        VALUES (source.user_id, source.display_name, source.updated_at)
+    RETURNING merge_action(), target.user_id;
+    ```
+- **JSONB Path Subscripting vs Legacy `->>` Operator Index Selectivity**:
+  - ❌ **Mixing Extraction Operators Breaking B-Tree Index Matching**: Creating a functional B-tree index using `(payload->>'user_id')` but querying with `payload['user_id']` or `payload->'user_id'`. PostgreSQL does not treat different extraction operators as interchangeable, resulting in silent index misses and full sequential scans.
+  - ✅ **Production Invariant**: Standardize on PostgreSQL modern JSONB path subscripting (`payload['user_id']`) consistently across both index DDL and query DML, or define typed generated columns (`GENERATED ALWAYS AS (payload->>'user_id') STORED`) to decouple application queries from JSON extraction mechanics.
+
 

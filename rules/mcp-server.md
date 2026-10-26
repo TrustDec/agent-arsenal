@@ -487,4 +487,40 @@ alwaysApply: false
   - Caching the host's permitted root directories only once during `initialize`, failing to detect when a user adds a new project folder or closes an existing workspace in Cursor or Claude Code.
   - ✅ **Production Invariant**: Register a notification handler for `notifications/roots/list_changed`. Whenever emitted, immediately re-query `roots/list` and rebuild the canonical path resolution allowlist to enforce boundary integrity without requiring a server process restart.
 
+## 27. Strict JSON Schema Validation & `additionalProperties: false`
+- **Ambiguous Tool Arguments and Undetected Hallucinated Parameters**:
+  - Defining MCP tool input schemas without `additionalProperties: false` or strict type bounds. The LLM hallucinates non-existent options or passes invalid types that bypass naive validators, leading to unpredictable runtime behavior or silent failures.
+  - ✅ **Production Invariant**: Always enforce `additionalProperties: false` on object schemas and declare explicit `required` arrays using Zod or JSON Schema Draft-07:
+    ```typescript
+    const QueryToolInputSchema = z.object({
+      query: z.string().min(1).max(500),
+      limit: z.number().int().min(1).max(100).default(20),
+    }).strict(); // Enforces additionalProperties: false
+    ```
+
+## 28. SSE Transport Disconnect & AbortSignal Propagation
+- **Zombie Execution After Host Client Disconnect**:
+  - In remote SSE (Server-Sent Events) MCP servers, when the host agent cancels a turn or closes the connection, the server continues executing heavy database queries or LLM calls in the background, wasting compute and locking resources.
+  - ✅ **Production Invariant**: Bind the HTTP request's `req.on('close')` event to an `AbortController` and pass `signal` into all downstream async operations, terminating background jobs immediately upon client disconnection.
+
+## 29. Structured Error Envelopes & Actionable Remediation Details
+- **Opaque String Errors Stalling Agent Self-Correction**:
+  - Returning raw string messages like `"Error: invalid input"` when tool validation fails. The calling agent lacks the context to understand *why* the input failed or *how* to construct a valid replacement call, falling into a repetitive failure loop.
+  - ✅ **Production Invariant**: Return structured JSON error details conforming to RFC 7807 or include actionable schema guidance within the tool result error payload:
+    ```typescript
+    return {
+      isError: true,
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          error: 'VALIDATION_FAILED',
+          message: 'Parameter "limit" must be an integer between 1 and 100',
+          received: args.limit,
+          remediation: 'Provide limit as an integer <= 100'
+        })
+      }]
+    };
+    ```
+
+
 

@@ -1656,4 +1656,40 @@ alwaysApply: false
       return fetch(request);
     };
     ```
+- **Svelte 5 `$derived.by()` for Complex Multi-Statement Reactive Computations**:
+  - ❌ **Abusing `$effect` for Computed State**: Using `$effect()` to recalculate derived values into another `$state()` variable, creating extra re-render microtasks, stale intermediate states, and infinite invalidation loops.
+  - ✅ **Production Invariant**: Use `$derived.by()` when the computed derivation requires loops, multiple branches, or complex intermediate calculations:
+    ```svelte
+    <script lang="ts">
+    let items = $state<Item[]>([]);
+    let filterCategory = $state('electronics');
+    let minRating = $state(4.0);
+
+    // Pure synchronous derivation executed only when dependencies change:
+    const filteredSummary = $derived.by(() => {
+      let totalValue = 0;
+      let count = 0;
+      for (const item of items) {
+        if (item.category === filterCategory && item.rating >= minRating) {
+          totalValue += item.price;
+          count++;
+        }
+      }
+      return { totalValue, count, avgPrice: count > 0 ? totalValue / count : 0 };
+    });
+    </script>
+    ```
+- **Svelte 5 `$inspect.trace()` for Granular Reactive Dependency Pinpointing**:
+  - ❌ **Inserting Arbitrary `console.log` in Runes**: Littering reactive components with ad-hoc `console.log()` calls that fail to identify which specific reactive signal caused an effect or derivation re-run.
+  - ✅ **Production Invariant**: Use `$inspect(signal).with(fn)` or `$inspect.trace()` in development to log the exact dependency that triggered the reactive evaluation with call-site stack traces:
+    ```svelte
+    <script lang="ts">
+    let user = $state({ name: 'Alice', role: 'admin' });
+    $inspect(user).with((type, val) => {
+      console.debug(`[reactive-${type}]`, val);
+      debugger; // Step directly into reactive dependency trigger
+    });
+    </script>
+    ```
+
 

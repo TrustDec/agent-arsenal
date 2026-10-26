@@ -1405,4 +1405,42 @@ alwaysApply: false
       }
     });
     ```
+- **Vue 3.5+ `useTemplateRef` Type-Safe Element & Component Binding**:
+  - ❌ **Legacy String Template Refs with Mismatched Types**: Using `ref<HTMLInputElement | null>(null)` with matching variable names that silently break or fall back to `any` when refactored across template and script blocks.
+  - ✅ **Production Invariant**: Use Vue 3.5+ `useTemplateRef<T>()` with explicit generic typing for deterministic, type-checked DOM and component references:
+    ```vue
+    <script setup lang="ts">
+    import { useTemplateRef, onMounted } from 'vue';
+
+    const inputRef = useTemplateRef<HTMLInputElement>('searchInput');
+
+    onMounted(() => {
+      inputRef.value?.focus();
+    });
+    </script>
+
+    <template>
+      <input ref="searchInput" type="text" placeholder="Search..." />
+    </template>
+    ```
+- **Vue 3.5+ Reactive Props Destructuring with Default Values**:
+  - ❌ **Legacy `withDefaults(defineProps<Props>(), ...)` Boilerplate**: Writing verbose `withDefaults` wrappers or using `toRefs(props)` to prevent reactivity loss during destructuring.
+  - ✅ **Production Invariant**: In Vue 3.5+, destructure `defineProps` directly in `<script setup>`. Vue's compiler automatically maintains reactivity for destructured prop identifiers and default values:
+    ```vue
+    <script setup lang="ts">
+    interface Props {
+      title?: string;
+      threshold?: number;
+    }
+
+    // Direct destructuring with native reactivity retention:
+    const { title = 'Default Dashboard', threshold = 100 } = defineProps<Props>();
+
+    // Watching destructured prop maintains reactive tracking:
+    watch(() => threshold, (newVal) => {
+      console.log('Threshold updated:', newVal);
+    });
+    </script>
+    ```
+
 
