@@ -1601,17 +1601,30 @@ alwaysApply: false
     }
     ```
     `b.Loop()` guarantees that per-benchmark setup code executed before the loop is automatically excluded from the timing measurements without requiring manual `b.ResetTimer()` invocations.
+- **Go 1.20+ / 1.24+ Zero-Copy Byte/String Conversions (`unsafe.StringData` & `unsafe.SliceData`)**:
+  - ❌ **The Legacy `reflect.SliceHeader` / `reflect.StringHeader` Deprecation Trap**: Manipulating slice/string headers via `reflect.SliceHeader` or `*(*string)(unsafe.Pointer(&b))` which causes GC pointer misclassification, undefined behavior in future Go runtime releases, and memory races.
+  - ✅ **Production Invariant**: Use `unsafe.StringData(s)` and `unsafe.SliceData(slice)` standardized in Go 1.20+:
+    ```go
+    // Zero-copy conversion from []byte to string (read-only invariant!)
+    func BytesToStringReadOnly(b []byte) string {
+        if len(b) == 0 {
+            return ""
+        }
+        return unsafe.String(unsafe.SliceData(b), len(b))
+    }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
+    // Zero-copy conversion from string to []byte (strictly read-only invariant!)
+    func StringToBytesReadOnly(s string) []byte {
+        if len(s) == 0 {
+            return nil
+        }
+        return unsafe.Slice(unsafe.StringData(s), len(s))
+    }
+    ```
+    Mandatory invariant: the resulting byte slice MUST never be mutated, as strings in Go are immutable and backed by read-only memory segments; mutating it triggers an immediate OS-level SIGSEGV.
+- **Go `select` Starvation Defense via Pseudo-Random Channel Shuffling**:
+  - ❌ **The High-Throughput Background Starvation Trap**: When multiple cases in a `select` statement are ready, Go selects pseudo-randomly among them. However, when code nests priority cases or repeatedly polls busy channels, lower-priority background channels (e.g. audit logging or telemetry) can be starved for seconds under heavy burst traffic.
+  - ✅ **Production Invariant**: Interleave work fairly by running a non-blocking check on the background channel before entering the blocking loop, or use explicit round-robin state indexing across worker queues.
+- **Go 1.24+ `sync.Map.Clear()` Atomic Flush**:
+  - ❌ **Iterating and Deleting Keys Individually from `sync.Map`**: In high-throughput servers, clearing a `sync.Map` by calling `m.Range(func(key, _ any) bool { m.Delete(key); return true })` acquires internal lock segments repeatedly, incurs $O(N)$ dirty-to-read promotions, and causes severe lock contention.
+  - ✅ **Production Invariant**: In Go 1.24+, call `m.Clear()` which atomically flushes both read and dirty maps in $O(1)$ amortized time, resetting internal allocation counters without lock thrashing.

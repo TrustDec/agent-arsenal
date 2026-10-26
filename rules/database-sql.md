@@ -997,17 +997,23 @@ alwaysApply: false
     hot_standby_feedback = on
     ```
     Standby instances continuously synchronize logical slot confirmation points from the primary, enabling zero-downtime subscriber reconnection after primary failover without replay gap data loss.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+- **PostgreSQL 16/17+ `pg_stat_io` Multi-Dimensional I/O Bottleneck Profiling**:
+  - ❌ **Guessing Disk vs OS Page Cache I/O Bottlenecks**: Relying solely on `pg_stat_database` or cloud host metrics to diagnose slow queries, unable to distinguish whether reads were satisfied from PostgreSQL `shared_buffers`, the OS page cache, or physical NVMe disk blocks.
+  - ✅ **Production Invariant**: Query `pg_stat_io` to observe granular breakdown of reads, writes, extends, hits, and evictions partitioned by backend type (`client backend`, `checkpointer`, `autovacuum`, `background writer`) and target context (`normal`, `vacuum`, `bulkread`, `bulkwrite`):
+    ```sql
+    SELECT
+        backend_type,
+        context,
+        io_object,
+        reads,
+        writes,
+        hits,
+        round(100.0 * hits / nullif(hits + reads, 0), 2) AS buffer_hit_pct
+    FROM pg_stat_io
+    WHERE reads + writes + hits > 0
+    ORDER BY reads DESC;
+    ```
+    If `evictions` spike in `client backend` under `normal` context, increase `shared_buffers` to eliminate disk read thrashing.
+- **GIN `fastupdate` Bloat Defense & Background List Vacuuming**:
+  - ❌ **Uncontrolled GIN Pending List Bloat**: Leaving `fastupdate = on` on high-ingestion JSONB or full-text GIN indexes without tuning `gin_pending_list_limit`. The pending list grows to tens of megabytes, causing random reader queries to stall for hundreds of milliseconds while performing inline list in-place reorganization (`gin_clean_pending_list`).
+  - ✅ **Production Invariant**: Bound `gin_pending_list_limit` (e.g. `ALTER INDEX idx_events_payload SET (gin_pending_list_limit = '4MB')`) and schedule periodic off-peak invocations of `SELECT gin_clean_pending_list('idx_events_payload');` or disable `fastupdate` on read-critical search tables.

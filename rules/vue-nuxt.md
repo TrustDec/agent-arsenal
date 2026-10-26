@@ -1322,17 +1322,25 @@ alwaysApply: false
       }
     });
     ```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+- **Vue 3.5+ Custom Directive Lifecycle Cleanup (`mounted` & `unmounted`)**:
+  - ❌ **The Directive DOM Listener & Observer Memory Leak**: Attaching `addEventListener`, `ResizeObserver`, or `IntersectionObserver` inside directive `mounted(el, binding)` hook without unbinding in `unmounted`. When components mount and unmount dynamically in SPAs, detached DOM trees remain retained in V8 heap memory.
+  - ✅ **Production Invariant**: Always store cleanup callbacks or observer references on the element (`el._cleanup`) and tear them down in `unmounted`:
+    ```ts
+    export const vClickOutside = {
+      mounted(el: HTMLElement, binding: DirectiveBinding<(e: MouseEvent) => void>) {
+        const handler = (event: MouseEvent) => {
+          if (!el.contains(event.target as Node)) {
+            binding.value(event);
+          }
+        };
+        document.addEventListener('pointerdown', handler);
+        (el as any)._cleanup = () => document.removeEventListener('pointerdown', handler);
+      },
+      unmounted(el: HTMLElement) {
+        (el as any)._cleanup?.();
+      }
+    };
+    ```
+- **Nuxt Nitro Streaming Payloads (`sendStream`) vs Large Array Buffering**:
+  - ❌ **Buffering Multi-Megabyte JSON Payloads in V8 Heap**: Returning massive arrays (`event.node.res.end(JSON.stringify(hugeDataset))`) in server API routes, triggering aggressive V8 GC pauses and driving container memory spikes under concurrent client traffic.
+  - ✅ **Production Invariant**: Stream large tabular exports, NDJSON, or logs directly to the HTTP response using Nitro's `sendStream(event, readableStream)` with backpressure preservation.

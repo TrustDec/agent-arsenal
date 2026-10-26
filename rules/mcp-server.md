@@ -421,8 +421,35 @@ alwaysApply: false
   - ❌ **The Silent Stream Abandonment Failure**: Dropping client connections on TCP resets and discarding session state, causing the host agent to fail catastrophically midway through an autonomous workflow.
   - ✅ **Production Invariant**: Implement `Last-Event-ID` tracking on SSE streams. The MCP server assigns monotonically incrementing event IDs to all notifications and tool results, buffering the last $K$ events ($K \approx 100$) in memory or Redis. When the client reconnects with `Last-Event-ID`, replay missing messages to seamlessly resume the session without re-running side-effecting operations.
 
+## 21. MCP Tool Cancellation Protocol (`notifications/cancelled`)
+- **Handling User Interruption & Agent Timeout Signals**:
+  - In autonomous agent harnesses, users frequently click "Stop" or the host's timeout budget fires while a long-running tool (e.g. database migration, test suite execution) is running on the MCP server.
+  - ❌ **The Orphaned Heavy Task Disaster**: Ignoring cancellation notifications from the host agent and letting background processes run to completion, tying up system memory, CPU, and holding database locks.
+  - ✅ **Production Invariant**: Register a cancellation handler for `notifications/cancelled`. Associate an `AbortController` with each incoming `requestId`. When the host sends a cancellation notification, trigger `abortController.abort()` to immediately terminate child processes and abort database queries:
+    ```ts
+    const inFlightRequests = new Map<string | number, AbortController>();
 
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      const abortController = new AbortController();
+      const reqId = request.params._meta?.progressToken ?? 'default';
+      inFlightRequests.set(reqId, abortController);
 
+      try {
+        return await executeToolWithAbort(request.params.name, request.params.arguments, abortController.signal);
+      } finally {
+        inFlightRequests.delete(reqId);
+      }
+    });
 
+    server.setNotificationHandler(CancelledNotificationSchema, (notification) => {
+      const controller = inFlightRequests.get(notification.params.requestId);
+      if (controller) {
+        controller.abort();
+      }
+    });
+    ```
 
-
+## 22. Stdio Stream Multi-Byte UTF-8 Boundary Reassembly
+- **The Split Multi-Byte Character Parsing Crash**:
+  - In stdio transports, OS pipe buffer chunks (typically 4096 or 8192 bytes) can slice right through the middle of a 3-byte or 4-byte UTF-8 character (e.g. emojis or CJK glyphs). Converting raw buffer chunks directly to strings with `chunk.toString('utf-8')` produces replacement characters (`\uFFFD`) and corrupts JSON-RPC payloads.
+  - ✅ **Production Invariant**: Always pipe raw stream buffers through `string_decoder.StringDecoder('utf-8')` in Node.js or maintain a byte buffer prior to UTF-8 decoding to preserve character boundary integrity across chunk boundaries.

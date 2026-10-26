@@ -1589,17 +1589,20 @@ alwaysApply: false
       </button>
     </form>
     ```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+- **Svelte 5 `$host()` Rune for Web Components & Custom Elements**:
+  - ❌ **Direct DOM Traversal to Discover Shadow Host**: In custom element mode (`<svelte:options customElement="x-widget" />`), attempting to discover the host element using parent element searches (`$el.parentElement`) or global query selectors, which breaks across nested shadow DOM boundaries.
+  - ✅ **Production Invariant**: In Svelte 5, use the `$host()` rune to retrieve a direct, reactive reference to the custom element's enclosing DOM host instance, facilitating custom event dispatches (`host.dispatchEvent(...)`) and host attribute reflection.
+- **Svelte 5 `<svelte:boundary>` Component Crash Isolation**:
+  - ❌ **Uncaught Child Component Errors Crashing the Entire Page**: Allowing a runtime error in a complex interactive subtree (e.g. chart rendering, rich text editor) to bubble uncaught, unmounting the entire application root and leaving users with a blank white screen.
+  - ✅ **Production Invariant**: Wrap risky client-rendered subtrees in `<svelte:boundary>` with typed fallback snippets, isolating component failures and displaying graceful error recovery UI without tearing down the surrounding page layout:
+    ```svelte
+    <svelte:boundary>
+      <ComplexDataVisualization data={activeSeries} />
+      {#snippet failed(error, reset)}
+        <div class="rounded border border-red-500/20 bg-red-950/20 p-4 text-xs text-red-300">
+          <p>Failed to render visualization: {error.message}</p>
+          <button onclick={reset} class="btn-secondary mt-2">Retry</button>
+        </div>
+      {/snippet}
+    </svelte:boundary>
+    ```
