@@ -2225,6 +2225,65 @@ alwaysApply: false
         slog.Info("authenticating key", "key", key)
     }
     ```
+- **Go 1.23+ Range-Over-Func Iterators (`iter.Seq`, `iter.Seq2`) Production Safety**:
+  - ❌ **Anti-Pattern: Unchecked Iterator Closures & Goroutine Leaks in Pull Iterators**: Constructing iterators that ignore yield return booleans (continuing to process after `yield(...) == false`) or failing to invoke the `stop()` cleanup function returned by `iter.Pull`. In push iterators, ignoring `!yield()` causes wasted computation; in pull iterators, failing to call `stop()` leaves the underlying coroutine/goroutine permanently leaked.
+  - ✅ **Production Invariant**: In Go 1.23+, every push iterator must immediately check the boolean returned by `yield()` and terminate iteration on `false`. When converting push iterators to pull iterators via `iter.Pull()`, always call `defer stop()` immediately:
+    ```go
+    import (
+        "iter"
+    )
+
+    // Push iterator adhering to early termination contract:
+    func FilterPositive(numbers []int) iter.Seq[int] {
+        return func(yield func(int) bool) {
+            for _, n := range numbers {
+                if n > 0 {
+                    // Must abort immediately if consumer loop breaks:
+                    if !yield(n) {
+                        return
+                    }
+                }
+            }
+        }
+    }
+
+    // Pull iterator usage with mandatory defer stop():
+    func ProcessFirstTwo(numbers []int) []int {
+        next, stop := iter.Pull(FilterPositive(numbers))
+        defer stop() // Mandatory: terminates internal coroutine
+
+        var result []int
+        for range 2 {
+            val, ok := next()
+            if !ok {
+                break
+            }
+            result = append(result, val)
+        }
+        return result
+    }
+    ```
+- **Go 1.21+ `context.AfterFunc` for Non-Blocking Cleanup**:
+  - ❌ **Anti-Pattern: Spawning Dedicated Goroutines Waiting on `<-ctx.Done()`**: Starting a separate `go func() { <-ctx.Done(); cleanup() }()` for every outgoing request or worker. Under high concurrency (100,000 active requests), this wastes stack allocations (2KB–8KB per goroutine) and adds scheduler overhead.
+  - ✅ **Production Invariant**: Register cancellation hooks using `context.AfterFunc(ctx, fn)`. It schedules the callback without dedicating an entire goroutine to waiting, and returns a cancellation handle `stop()` to unregister the hook when the operation completes successfully:
+    ```go
+    import (
+        "context"
+        "net"
+    )
+
+    func SafeExecuteWithConn(ctx context.Context, conn net.Conn) error {
+        // Register non-blocking cancellation hook without spinning a goroutine:
+        stop := context.AfterFunc(ctx, func() {
+            _ = conn.Close() // Forcefully interrupt blocking read/write
+        })
+        defer stop() // Unregisters hook if normal operation finishes before context cancel
+
+        // Perform socket operations...
+        return nil
+    }
+    ```
+
 
 
 

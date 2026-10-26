@@ -976,6 +976,38 @@ alwaysApply: false
       }
     }
     ```
+- **MCP Client Cancellation Propagation (`notifications/cancelled`)**:
+  - ❌ **Anti-Pattern: Abandoned Background Operations on Client Abort**: When an autonomous agent user hits "Cancel" (or the agent orchestrator aborts a tool call due to timeout), the client sends a `notifications/cancelled` notification. If the MCP server ignores this, long-running database queries, heavy AI generations, or subprocesses continue consuming CPU and memory to completion in the background.
+  - ✅ **Production Invariant**: In MCP servers executing asynchronous work, track active request IDs and attach `AbortController` signals. When a `notifications/cancelled` notification is received for a `requestId`, trigger `.abort()` immediately to terminate child network connections and queries:
+    ```typescript
+    import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+    import { CancelledNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
+
+    const activeControllers = new Map<string | number, AbortController>();
+
+    server.setNotificationHandler(CancelledNotificationSchema, async (notification) => {
+      const { requestId } = notification.params;
+      const controller = activeControllers.get(requestId);
+      if (controller) {
+        // Immediately abort underlying fetch, query, or process:
+        controller.abort();
+        activeControllers.delete(requestId);
+      }
+    });
+
+    // Inside tool handler:
+    export async function handleHeavyToolExecution(requestId: string | number, url: string): Promise<string> {
+      const controller = new AbortController();
+      activeControllers.set(requestId, controller);
+      try {
+        const response = await fetch(url, { signal: controller.signal });
+        return await response.text();
+      } finally {
+        activeControllers.delete(requestId);
+      }
+    }
+    ```
+
 
 
 

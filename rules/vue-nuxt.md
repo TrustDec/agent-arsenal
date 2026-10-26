@@ -1961,6 +1961,38 @@ alwaysApply: false
     });
     </script>
     ```
+- **Nuxt 3 `callOnce` for Universal Initialization Deduplication**:
+  - ❌ **Anti-Pattern: Executing Expensive Initialization Logic in Component Setup**: Running heavy bootstrap routines (e.g. logging user telemetry, initializing analytics scripts, prefetching global site configuration) directly inside `<script setup>`. In SSR mode, the code executes once on the server and again during client hydration, creating duplicate API calls and double events.
+  - ✅ **Production Invariant**: In Nuxt 3.9+, wrap initialization logic in `callOnce(key, fn)`. Nuxt guarantees the callback executes strictly once across SSR and client navigation:
+    ```vue
+    <script setup lang="ts">
+    // Guaranteed to execute only once: on the server during SSR, or on client if navigated client-side
+    await callOnce('init-app-analytics', async () => {
+      const config = await $fetch('/api/bootstrap-config');
+      console.info('Global telemetry initialized with tenant:', config.tenantId);
+    });
+    </script>
+    ```
+- **Vue 3 SSR Custom Directive Hydration Safety (`getSSRProps`)**:
+  - ❌ **Anti-Pattern: Mutating DOM Attributes in Directive `mounted` Hooks Without SSR Support**: Creating custom directives (e.g., `v-tooltip`, `v-focus`, `v-highlight`) that inject attributes or classes into the DOM inside `mounted()`. Because the server rendered HTML without those attributes, the browser encounters severe Hydration Mismatch warnings and may reconstruct the DOM tree.
+  - ✅ **Production Invariant**: When building custom directives used in SSR/Nuxt environments, define the `getSSRProps` hook to emit server-rendered attributes alongside client hooks:
+    ```typescript
+    import type { Directive } from 'vue';
+
+    export const vTooltip: Directive = {
+      // Server-side rendering hook: pre-renders attributes to prevent hydration mismatch
+      getSSRProps(binding) {
+        return {
+          'data-tooltip': binding.value,
+          'aria-label': binding.value,
+        };
+      },
+      mounted(el, binding) {
+        el.setAttribute('data-tooltip-active', 'true');
+      },
+    };
+    ```
+
 
 
 

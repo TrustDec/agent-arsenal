@@ -2279,6 +2279,57 @@ alwaysApply: false
       <button onclick={increment} disabled={value >= max}>+</button>
     </div>
     ```
+- **Svelte 5 `$inspect.trace()` for Reactive Dependency Diagnostics**:
+  - ❌ **Anti-Pattern: Littering Code with `console.log` Inside Effects**: Inserting arbitrary log prints into `$effect()` or template blocks to track why a component is re-rendering. This pollutes terminal and browser consoles with hundreds of duplicate lines and creates observer bias.
+  - ✅ **Production Invariant**: In Svelte 5, use the `$inspect(...)` rune with `.trace()` in development mode. It logs deep stack traces and pinpoints exactly which state rune mutation triggered the reactive calculation:
+    ```svelte
+    <script lang="ts">
+    let count = $state(0);
+    let multiplier = $state(2);
+    let total = $derived(count * multiplier);
+
+    // Development diagnostic: prints whenever count or multiplier causes total to recalculate
+    $inspect(total).with((type, val) => {
+      console.debug(`[reactive-trace] ${type}:`, val);
+    });
+
+    // Or use $inspect.trace() inside derived calculations to log the exact dependency path:
+    let loggedCalculation = $derived.by(() => {
+      $inspect.trace();
+      return count * multiplier;
+    });
+    </script>
+    ```
+- **SvelteKit `preloadData` for Intent-Driven Predictive Navigation**:
+  - ❌ **Anti-Pattern: Relying Solely on Native `<a>` Clicks or Monolithic `data-sveltekit-preload-data="hover"` on Everything**: Enabling blanket hover prefetching across hundreds of heavy links on a page (e.g. data tables with 50 links per view). Hovering across items floods the server with unneeded prefetch requests.
+  - ✅ **Production Invariant**: Programmatically trigger `preloadData(url)` with intent thresholds (e.g., focus or intentional mouse hover $>65\text{ms}$), and prefetch critical modal or route assets dynamically before user navigation:
+    ```svelte
+    <script lang="ts">
+    import { preloadData, goto } from '$app/navigation';
+
+    let hoverTimer: ReturnType<typeof setTimeout> | null = null;
+
+    function handleMouseEnter(targetUrl: string) {
+      // Intent gate: avoid prefetching on rapid casual pointer sweeps
+      hoverTimer = setTimeout(() => {
+        preloadData(targetUrl);
+      }, 65);
+    }
+
+    function handleMouseLeave() {
+      if (hoverTimer) clearTimeout(hoverTimer);
+    }
+    </script>
+
+    <a 
+      href="/analytics/dashboard" 
+      onmouseenter={() => handleMouseEnter('/analytics/dashboard')}
+      onmouseleave={handleMouseLeave}
+    >
+      Dashboard
+    </a>
+    ```
+
 
 
 

@@ -1392,6 +1392,33 @@ alwaysApply: false
     -- Clean, high-performance B-Tree index on generated column:
     CREATE INDEX idx_customer_orders_tier_amount ON customer_orders (customer_tier, order_amount_cents);
     ```
+- **PostgreSQL Heap-Only Tuples (HOT) Optimization & `FILLFACTOR` Tuning**:
+  - ❌ **Anti-Pattern: Default 100% `FILLFACTOR` on High-Frequency Update Tables**: Leaving default `fillfactor = 100` on tables with hundreds of updates per second (e.g. `heartbeats`, `session_tokens`, `order_status`). Every update forces Postgres to allocate space on a new disk page and insert new entries into EVERY index on the table, causing massive index bloat, write amplification, and autovacuum thrashing.
+  - ✅ **Production Invariant**: When an update modifies only non-indexed columns, Postgres can perform a Heap-Only Tuple (HOT) update on the same disk page if spare space exists—updating the tuple in-place with ZERO index modifications. Set `WITH (fillfactor = 70–85)` on write-heavy tables so 15–30% of each 8KB page is reserved for in-place updates:
+    ```sql
+    -- Tune fillfactor to allow in-place HOT updates on high-frequency tables:
+    ALTER TABLE user_sessions SET (fillfactor = 80);
+
+    -- Ensure frequently updated columns (e.g. last_activity_at) are NOT indexed:
+    -- Query HOT update ratio to verify optimization efficacy (aim for > 85% HOT updates):
+    SELECT relname, n_tup_upd, n_tup_hot_upd,
+           ROUND(100.0 * n_tup_hot_upd / NULLIF(n_tup_upd, 0), 2) AS hot_ratio
+    FROM pg_stat_user_tables
+    WHERE relname = 'user_sessions';
+    ```
+- **PostgreSQL Transactional Advisory Locks (`pg_try_advisory_xact_lock`) for Distributed Singletons**:
+  - ❌ **Anti-Pattern: Creating Dummy Lock Tables or Long-Running `FOR UPDATE` Rows**: Managing distributed locks or cron jobs by writing to a `locks` table with `SELECT ... FOR UPDATE`. If a worker crashes or encounters network partition, rows remain locked until TCP keepalive timeouts expire, or transaction rollbacks stall other concurrent jobs.
+  - ✅ **Production Invariant**: Use 64-bit transactional advisory locks (`pg_try_advisory_xact_lock(bigint)`). They execute in-memory inside the Postgres lock manager, acquire instantly without table I/O, return a non-blocking boolean immediately (`false` if already held), and automatically release the moment the transaction commits or aborts:
+    ```sql
+    BEGIN;
+    -- Try to acquire unique lock for background payout worker (hash of "payout_scheduler"):
+    SELECT pg_try_advisory_xact_lock(hashtext('payout_scheduler')) AS acquired;
+
+    -- If acquired is TRUE: execute batch payout logic.
+    -- If acquired is FALSE: another worker is currently running; exit cleanly immediately without waiting.
+    COMMIT; -- Lock automatically released upon COMMIT or ROLLBACK.
+    ```
+
 
 
 
