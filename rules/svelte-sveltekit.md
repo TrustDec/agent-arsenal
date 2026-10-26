@@ -2167,6 +2167,59 @@ alwaysApply: false
       </button>
     </form>
     ```
+- **Svelte 5 `$derived.by` for Complex Multi-Statement Computed Reductions**:
+  - ❌ **Anti-Pattern: Mutating Intermediate `$state` Inside `$effect` for Computed Values**: Using an `$effect` to listen to multiple reactive signals and update another `$state` variable. This introduces unnecessary re-render cycles, race conditions, and infinite loop bugs.
+  - ✅ **Production Invariant**: Use `$derived.by(() => { ... })` for multi-line reactive calculations, filtering, or aggregations. Svelte 5 automatically tracks fine-grained dependencies inside the function and recalculates only when consumed dependencies change:
+    ```svelte
+    <script lang="ts">
+    interface OrderItem {
+      id: string;
+      price: number;
+      quantity: number;
+      taxable: boolean;
+    }
+
+    let items = $state<OrderItem[]>([]);
+    let taxRate = $state(0.08);
+
+    // Pure, dependency-tracked derived calculation without $effect mutations:
+    const orderSummary = $derived.by(() => {
+      let subtotal = 0;
+      let taxableAmount = 0;
+
+      for (const item of items) {
+        const itemTotal = item.price * item.quantity;
+        subtotal += itemTotal;
+        if (item.taxable) {
+          taxableAmount += itemTotal;
+        }
+      }
+
+      const tax = taxableAmount * taxRate;
+      return {
+        subtotal,
+        tax,
+        total: subtotal + tax,
+      };
+    });
+    </script>
+    ```
+- **Svelte 5 `$inspect` Telemetry & Production Stripping Invariant**:
+  - ❌ **Anti-Pattern: Scattering `console.log` in Templates or Shipping `$inspect` to Production**: Sprinkling temporary `console.log` statements in component templates that trigger extra DOM renders and leak sensitive client data in production browser devtools.
+  - ✅ **Production Invariant**: Use `$inspect(state)` exclusively during development. `$inspect` automatically logs the previous and current values when the signal mutates. Attach `.with()` for targeted conditional logging and ensure Vite/Rollup tree-shakes `$inspect` in production:
+    ```svelte
+    <script lang="ts">
+    let userQuery = $state('');
+
+    // Svelte 5 built-in reactive inspection (auto-stripped in production builds):
+    $inspect(userQuery).with((type, value) => {
+      if (import.meta.env.DEV) {
+        console.debug(`[State Inspection: ${type}] query updated to:`, value);
+      }
+    });
+    </script>
+    ```
+
 
 
 

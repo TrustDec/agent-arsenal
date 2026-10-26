@@ -1855,6 +1855,61 @@ alwaysApply: false
       </div>
     </template>
     ```
+- **Vue 3.5+ `watchEffect` with `onCleanup` & `AbortController` Race Condition Defense**:
+  - ❌ **Anti-Pattern: Uncancelled Async Requests in Reactive Watchers**: Launching asynchronous network calls inside `watch` or `watchEffect` without aborting previous in-flight requests when dependencies change. If request A takes 800ms and request B takes 150ms, response A resolves last and overwrites response B with stale data.
+  - ✅ **Production Invariant**: Use `onCleanup` to abort prior in-flight fetch requests via `AbortController`, preventing out-of-order state corruption:
+    ```vue
+    <script setup lang="ts">
+    import { ref, watchEffect } from 'vue';
+
+    const searchQuery = ref('');
+    const searchResults = ref<string[]>([]);
+
+    watchEffect(async (onCleanup) => {
+      const query = searchQuery.value.trim();
+      if (!query) {
+        searchResults.value = [];
+        return;
+      }
+
+      const controller = new AbortController();
+      onCleanup(() => controller.abort());
+
+      try {
+        const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`, {
+          signal: controller.signal,
+        });
+        searchResults.value = await res.json();
+      } catch (err: any) {
+        if (err.name !== 'AbortError') {
+          console.error('Search request failed:', err);
+        }
+      }
+    });
+    </script>
+    ```
+- **Vue 3.5+ Reactive Props Destructuring & Default Values**:
+  - ❌ **Anti-Pattern: Verbose `toRefs` Boilerplate or Avoiding Props Destructuring**: Relying on legacy `toRefs(props)` or avoiding destructuring due to outdated Vue 3.2 fears of losing reactivity.
+  - ✅ **Production Invariant**: In Vue 3.5+, destructuring `defineProps` directly in `<script setup>` is fully reactive by default; default values are also assigned natively without `withDefaults`:
+    ```vue
+    <script setup lang="ts">
+    interface Props {
+      title: string;
+      maxItems?: number;
+      isActive?: boolean;
+    }
+
+    // Vue 3.5+ natively compiles destructured props into reactive getters:
+    const { title, maxItems = 10, isActive = false } = defineProps<Props>();
+    </script>
+
+    <template>
+      <div :class="{ active: isActive }">
+        <h3>{{ title }} (Max: {{ maxItems }})</h3>
+      </div>
+    </template>
+    ```
+
 
 
 

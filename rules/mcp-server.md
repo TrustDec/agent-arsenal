@@ -907,6 +907,42 @@ alwaysApply: false
     process.on('SIGTERM', cleanupAndExit);
     process.on('SIGINT', cleanupAndExit);
     ```
+- **MCP JSON-RPC 2.0 Error Code Hierarchy & Actionable Diagnostic Returns**:
+  - ❌ **Anti-Pattern: Unhandled Raw Exceptions or Generic String Errors**: Throwing unhandled Node errors (`throw new Error("failed")`) inside tool execution handlers. The host receives an opaque JSON-RPC Internal Error (`-32603`) without parameter hints, triggering endless retry loops or crashing the agent session.
+  - ✅ **Production Invariant**: Differentiate between protocol-level invalid arguments (`ErrorCode.InvalidParams = -32602`) and tool-level domain errors. For tool-level failures, return an informative error content payload with `isError: true` so the calling LLM understands why the tool failed and how to self-correct:
+    ```typescript
+    import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
+
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      const { name, arguments: args } = request.params;
+
+      if (name === 'execute_query') {
+        const query = args?.query;
+        if (typeof query !== 'string' || query.trim() === '') {
+          // Protocol-level schema violation:
+          throw new McpError(ErrorCode.InvalidParams, 'Parameter "query" must be a non-empty string.');
+        }
+
+        try {
+          const results = await runQuery(query);
+          return { content: [{ type: 'text', text: JSON.stringify(results) }] };
+        } catch (dbErr: any) {
+          // Tool-level domain failure: Provide actionable error feedback for the LLM
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Database execution error: ${dbErr.message}. Verify table names and column types.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+      throw new McpError(ErrorCode.MethodNotFound, `Tool '${name}' is not recognized.`);
+    });
+    ```
+
 
 
 

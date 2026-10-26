@@ -1329,6 +1329,34 @@ alwaysApply: false
     FROM pg_catalog.pg_statio_user_tables
     WHERE relname = 'user_profiles';
     ```
+- **PostgreSQL 16+ `pg_stat_io` Real-Time Storage & Cache Diagnostic Invariants**:
+  - ❌ **Anti-Pattern: Blindly Guessing Disk Bottlenecks via OS `iostat`**: Attempting to troubleshoot database slowdowns using host-level metrics without knowing whether the I/O bottleneck originates from client reads, autovacuum sweeps, WAL fsyncs, or background checkpointer flushing.
+  - ✅ **Production Invariant**: In PostgreSQL 16+, inspect `pg_stat_io` to observe granular read/write/extend/fsync activity categorized by backend type and I/O context. Immediately identify whether normal client queries are hitting physical disk or burning memory bandwidth:
+    ```sql
+    -- Diagnostic query to isolate physical I/O read spikes and cache misses by backend type:
+    SELECT
+        backend_type,
+        context,
+        io_object,
+        reads,
+        writes,
+        writebacks,
+        extends,
+        op_bytes
+    FROM pg_stat_io
+    WHERE reads > 0 OR writes > 0
+    ORDER BY reads DESC;
+    ```
+- **Partial Indexing for Soft-Deleted Tables (`deleted_at IS NULL`)**:
+  - ❌ **Anti-Pattern: Full B-Tree Indexes on Tables with Soft Deletions**: Creating global indexes on `(tenant_id, email)` without filtering `deleted_at`. As archived and soft-deleted rows accumulate over time, the index bloats with dead entries that live application queries never request, evicting active data pages from `shared_buffers`.
+  - ✅ **Production Invariant**: Always attach a `WHERE deleted_at IS NULL` predicate to unique and lookup indexes on soft-deleted entities. The index size shrinks by 80–90%, write throughput improves, and unique constraints correctly allow re-registration of previously deleted emails:
+    ```sql
+    -- Partial unique index ensuring uniqueness only among active accounts:
+    CREATE UNIQUE INDEX CONCURRENTLY idx_users_active_tenant_email
+    ON users (tenant_id, email)
+    WHERE deleted_at IS NULL;
+    ```
+
 
 
 

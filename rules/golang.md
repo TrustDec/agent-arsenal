@@ -2084,6 +2084,88 @@ alwaysApply: false
         bufferPool.Put(buf)
     }
     ```
+- **Go 1.24+ `weak.Pointer` for Non-Owning Caches & Object Interning**:
+  - ❌ **Anti-Pattern: Memory Leaks via Strong-Referenced In-Memory Caches**: Storing strong pointers (`*T`) in long-lived in-memory caches or interning registries. Objects can never be collected by the Go runtime garbage collector even when no active goroutine or request holds them, forcing manual eviction heuristics and memory bloat.
+  - ✅ **Production Invariant**: In Go 1.24+, utilize the `weak` package (`weak.Make` and `weak.Pointer.Value`) for non-owning reference caches (such as interned strings, symbol tables, or parsed AST nodes). The runtime GC collects the target when all strong references vanish:
+    ```go
+    import (
+        "sync"
+        "weak"
+    )
+
+    type Interner[T comparable] struct {
+        mu    sync.RWMutex
+        store map[T]weak.Pointer[T]
+    }
+
+    func NewInterner[T comparable]() *Interner[T] {
+        return &Interner[T]{store: make(map[T]weak.Pointer[T])}
+    }
+
+    func (in *Interner[T]) Intern(val T) *T {
+        in.mu.RLock()
+        if wp, exists := in.store[val]; exists {
+            if ptr := wp.Value(); ptr != nil {
+                in.mu.RUnlock()
+                return ptr
+            }
+        }
+        in.mu.RUnlock()
+
+        in.mu.Lock()
+        defer in.mu.Unlock()
+
+        // Double-check under write lock
+        if wp, exists := in.store[val]; exists {
+            if ptr := wp.Value(); ptr != nil {
+                return ptr
+            }
+        }
+
+        v := val
+        in.store[val] = weak.Make(&v)
+        return &v
+    }
+    ```
+- **Structured Error Tree Wrapping & `errors.Is` / `errors.As` Invariants**:
+  - ❌ **Anti-Pattern: Direct Equality (`==`) or String-Substring Matching on Errors**: Checking errors with `if err == ErrNotFound` or `strings.Contains(err.Error(), "not found")`. Wrapping errors with `%w` breaks direct pointer equality, while string matching is fragile, untyped, and masked by upstream changes.
+  - ✅ **Production Invariant**: Always wrap errors with `%w` for causal context, inspect sentinels with `errors.Is`, and extract structured error fields with `errors.As`. When aggregating independent concurrent subtasks, combine errors using Go 1.20+ `errors.Join`:
+    ```go
+    import (
+        "errors"
+        "fmt"
+    )
+
+    var ErrResourceNotFound = errors.New("resource not found")
+
+    type DomainError struct {
+        ResourceID string
+        Code       int
+        Err        error
+    }
+
+    func (e *DomainError) Error() string {
+        return fmt.Sprintf("domain error [code=%d, id=%s]: %v", e.Code, e.ResourceID, e.Err)
+    }
+
+    func (e *DomainError) Unwrap() error {
+        return e.Err
+    }
+
+    func HandleError(err error) {
+        // Correct inspection of wrapped sentinel errors
+        if errors.Is(err, ErrResourceNotFound) {
+            // Handle 404 cleanly
+        }
+
+        // Correct structured unwrapping of custom error types
+        var domErr *DomainError
+        if errors.As(err, &domErr) {
+            fmt.Printf("Failed resource: %s, code: %d\n", domErr.ResourceID, domErr.Code)
+        }
+    }
+    ```
+
 
 
 
