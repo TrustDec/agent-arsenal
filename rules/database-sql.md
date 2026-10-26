@@ -1070,5 +1070,25 @@ alwaysApply: false
 - **JSONB Path Subscripting vs Legacy `->>` Operator Index Selectivity**:
   - ❌ **Mixing Extraction Operators Breaking B-Tree Index Matching**: Creating a functional B-tree index using `(payload->>'user_id')` but querying with `payload['user_id']` or `payload->'user_id'`. PostgreSQL does not treat different extraction operators as interchangeable, resulting in silent index misses and full sequential scans.
   - ✅ **Production Invariant**: Standardize on PostgreSQL modern JSONB path subscripting (`payload['user_id']`) consistently across both index DDL and query DML, or define typed generated columns (`GENERATED ALWAYS AS (payload->>'user_id') STORED`) to decouple application queries from JSON extraction mechanics.
+- **PostgreSQL 16/17 `EXPLAIN (GENERIC_PLAN)` for Prepared Statement Plan Regression Diagnostics**:
+  - ❌ **The Literal Parameter Estimation Trap**: Profiling slow queries by manually running `EXPLAIN ANALYZE` with a single literal value (e.g. `WHERE tenant_id = 42`). PostgreSQL computes a customized plan for that literal. However, in production microservices using connection pooling or ORMs, the server switches to a generic plan after 5 executions (`plan_cache_mode = auto`), which may pick a sequential scan or degraded nested loop, masking the true bottleneck.
+  - ✅ **Production Invariant**: Inspect parameter-agnostic query plans using `EXPLAIN (GENERIC_PLAN)` to verify index usage and join strategies under generalized parameter distributions:
+    ```sql
+    EXPLAIN (GENERIC_PLAN, BUFFERS)
+    SELECT id, status, amount
+    FROM orders
+    WHERE tenant_id = $1 AND status = $2
+    ORDER BY created_at DESC
+    LIMIT 20;
+    ```
+- **Composite Index Column Ordering: ESR Rule (Equality, Sort, Range)**:
+  - ❌ **Placing Range Conditions Before Equality in Multi-Column Indexes**: Creating an index on `(created_at, tenant_id, status)` for a query filtering `WHERE tenant_id = 't_100' AND status = 'paid' AND created_at >= '2025-01-01'`. The B-Tree index scan traverses `created_at`, but because it is a range scan, the index cannot efficiently seek subsequent equality columns `tenant_id` and `status`, resulting in scanning thousands of irrelevant index pages.
+  - ✅ **Production Invariant**: Strictly apply the ESR (Equality, Sort, Range) ordering rule: define exact equality columns first, sort columns second, and range bounds last:
+    ```sql
+    -- Correct: Equality columns first, then range/sort
+    CREATE INDEX idx_orders_tenant_status_created 
+    ON orders (tenant_id, status, created_at DESC);
+    ```
+
 
 

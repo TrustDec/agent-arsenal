@@ -1691,5 +1691,62 @@ alwaysApply: false
     });
     </script>
     ```
+- **Svelte 5 Snippet Prop Typing & Fallback Invocation with `Snippet<[T]>`**:
+  - ❌ **Untyped Function Callbacks for Template Injection**: Using raw `() => void` or `any` props to inject custom templates into components, which bypasses Svelte 5 compiler snippet optimizations and causes runtime crashes when optional slots are omitted without check.
+  - ✅ **Production Invariant**: Explicitly type snippet props with `import type { Snippet } from 'svelte'`, and use optional invocation `{@render optionalSnippet?.(item)}` or default fallback snippets to ensure fail-safe rendering:
+    ```svelte
+    <script lang="ts">
+    import type { Snippet } from 'svelte';
+
+    interface Props {
+      items: string[];
+      itemTemplate?: Snippet<[item: string, index: number]>;
+    }
+
+    let { items, itemTemplate }: Props = $props();
+    </script>
+
+    <ul>
+      {#each items as item, index}
+        <li>
+          {#if itemTemplate}
+            {@render itemTemplate(item, index)}
+          {:else}
+            <span>{item}</span>
+          {/if}
+        </li>
+      {/each}
+    </ul>
+    ```
+- **SvelteKit Server Form Actions & Schema Validation with Safe Extraction**:
+  - ❌ **Manual Unvalidated `request.formData()` Parsing**: Reading form values directly via `const email = data.get('email') as string` in `+page.server.ts` actions without validating types or string boundaries, inviting runtime crashes on empty or array-like malicious input.
+  - ✅ **Production Invariant**: Always validate `event.request.formData()` through a strict schema validator (Zod / Valibot / Standard Schema) and return structured `fail(400, { errors, values })` responses with automatic CSRF protection:
+    ```typescript
+    import { fail } from '@sveltejs/kit';
+    import { z } from 'zod';
+    import type { Actions } from './$types';
+
+    const loginSchema = z.object({
+      email: z.string().email(),
+      password: z.string().min(8),
+    });
+
+    export const actions: Actions = {
+      default: async ({ request }) => {
+        const formData = await request.formData();
+        const parsed = loginSchema.safeParse(Object.fromEntries(formData));
+
+        if (!parsed.success) {
+          return fail(400, {
+            errors: parsed.error.flatten().fieldErrors,
+            values: { email: formData.get('email')?.toString() ?? '' },
+          });
+        }
+
+        // Proceed with authenticated session creation
+      },
+    };
+    ```
+
 
 

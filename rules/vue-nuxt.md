@@ -1442,5 +1442,48 @@ alwaysApply: false
     });
     </script>
     ```
+- **Vue 3.5+ Built-in Lazy Hydration Strategies with `defineAsyncComponent`**:
+  - ❌ **Client Hydration Blocking on Heavy Below-the-Fold Widgets**: Eagerly hydrating below-the-fold UI components (e.g. interactive comment sections, analytics charts, heavy rich-text editors) during initial page load, blocking the main thread and degrading First Contentful Paint (FCP) and Interaction to Next Paint (INP).
+  - ✅ **Production Invariant**: In Vue 3.5+, use built-in lazy hydration strategies (`hydrateOnVisible`, `hydrateOnIdle`, `hydrateOnInteraction`, `hydrateOnMediaQuery`) to defer component hydration until necessary:
+    ```vue
+    <script setup lang="ts">
+    import { defineAsyncComponent, hydrateOnVisible, hydrateOnIdle } from 'vue';
+
+    // Hydrates strictly when the component scrolls into the browser viewport:
+    const LazyAuditChart = defineAsyncComponent({
+      loader: () => import('./components/AuditChart.vue'),
+      hydrate: hydrateOnVisible(),
+    });
+
+    // Hydrates when the main thread browser CPU reaches idle:
+    const LazyCommentFeed = defineAsyncComponent({
+      loader: () => import('./components/CommentFeed.vue'),
+      hydrate: hydrateOnIdle(),
+    });
+    </script>
+
+    <template>
+      <main>
+        <section class="above-fold">Essential Dashboard View</section>
+        <LazyAuditChart />
+        <LazyCommentFeed />
+      </main>
+    </template>
+    ```
+- **Nuxt 4 Forward Compatibility & `app/` Directory Standard**:
+  - ❌ **Scattering Top-Level Directories Without Compatibility Flags**: Mixing root-level `components/`, `composables/`, and `pages/` folders in Nuxt 3 projects without enabling future compatibility, leading to breaking file-system collisions and configuration migration churn during Nuxt 4 upgrades.
+  - ✅ **Production Invariant**: Structure modern Nuxt projects inside the `app/` directory (`app/components/`, `app/composables/`, `app/pages/`, `app/router.options.ts`) and declare `future: { compatibilityVersion: 4 }` in `nuxt.config.ts`:
+    ```typescript
+    // nuxt.config.ts
+    export default defineNuxtConfig({
+      future: {
+        compatibilityVersion: 4,
+      },
+      experimental: {
+        typedPages: true,
+      },
+    });
+    ```
+
 
 

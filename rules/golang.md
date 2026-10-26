@@ -1717,5 +1717,28 @@ alwaysApply: false
         // Fast-path matched
     }
     ```
+- **Go 1.24+ JSON `omitzero` vs Legacy `omitempty` Struct Tag Invariant**:
+  - ❌ **`omitempty` Inaccuracies on Non-Pointer Structs & Booleans**: Traditional `encoding/json` `omitempty` ignores the `IsZero()` method on non-pointer struct values (such as `time.Time{}`), causing zero-valued timestamps to serialize as `"0001-01-01T00:00:00Z"`. Furthermore, setting `omitempty` on a boolean field silently drops `false` values even when `false` is an intentional semantic update.
+  - ✅ **Production Invariant**: In Go 1.24+ `encoding/json/v2` (and production v1 workflows), use `omitzero` to evaluate `IsZero() bool` implementations cleanly, or wrap optional scalar and struct fields in pointers (`*bool`, `*time.Time`) to eliminate serialization ambiguity:
+    ```go
+    type AuditEvent struct {
+        EventID   string     `json:"event_id"`
+        // Pointer allows distinguishing between unassigned (nil) and explicit zero/false:
+        IsRevoked *bool      `json:"is_revoked,omitempty"`
+        // Go 1.24+ omitzero evaluates time.Time.IsZero() correctly:
+        ExpiresAt *time.Time `json:"expires_at,omitzero"`
+    }
+    ```
+- **Go `errors.As` Concrete Pointer-to-Pointer Type Safety**:
+  - ❌ **Passing Single Pointer to Struct Pointer in `errors.As` Triggering Runtime Panic**: Writing `var target *CustomError; errors.As(err, target)` instead of passing the address `&target`. In Go, `errors.As(err, target)` requires `target` to be a non-nil pointer to either an interface type or a type implementing `error`. Passing `target` directly panics at runtime with: `errors: *target must be interface or implement error`.
+  - ✅ **Production Invariant**: Always declare a typed pointer variable and pass its memory address (`&target`) into `errors.As`:
+    ```go
+    var validationErr *ValidationError
+    // Correct: &validationErr passes a pointer-to-pointer (**ValidationError)
+    if errors.As(err, &validationErr) {
+        log.Printf("validation failed on field: %s", validationErr.Field)
+    }
+    ```
+
 
 

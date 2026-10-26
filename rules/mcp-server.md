@@ -522,5 +522,49 @@ alwaysApply: false
     };
     ```
 
+## 30. Multi-Modal Tool Responses & Typed Image Content
+- **Raw File Paths or Naked URLs in Tool Responses**:
+  - Returning local disk file paths (`/tmp/chart.png`) or internal localhost URLs for generated diagrams, UI screenshots, or telemetry plots. The host agent LLM cannot read local filesystem paths directly or crashes when encountering unencoded binary buffers in text fields.
+  - ✅ **Production Invariant**: In MCP 2024/2025+, return binary visual artifacts formatted as typed `image` content blocks with explicit MIME types and base64 encoding:
+    ```typescript
+    return {
+      content: [
+        {
+          type: 'image',
+          data: chartBuffer.toString('base64'),
+          mimeType: 'image/png',
+        },
+        {
+          type: 'text',
+          text: 'Rendered memory consumption profile across 50 nodes.',
+        },
+      ],
+    };
+    ```
+
+## 31. Server Process Group Termination & Daemon Leaks
+- **Zombie Subprocess Daemons on Host Agent Abort**:
+  - MCP servers spawning background child workers (e.g. headless Playwright/Puppeteer browsers, database connection pools, local dev servers) that ignore `SIGTERM`/`SIGINT`. When the host agent (Claude Code, Cursor) terminates the parent server process, detached child workers continue running in the background, leaking memory and exhausting CPU.
+  - ✅ **Production Invariant**: Register process signal handlers for `SIGINT` and `SIGTERM`. Initiate graceful drain with a 5-second deadline and forcefully terminate all spawned child process groups using `process.kill(-child.pid, 'SIGKILL')`:
+    ```typescript
+    const cleanTeardown = async (signal: string) => {
+      console.error(`Received ${signal}, terminating MCP worker pools...`);
+      for (const worker of activeWorkerPools) {
+        if (worker.pid) {
+          try {
+            process.kill(-worker.pid, 'SIGKILL');
+          } catch {
+            // Already exited
+          }
+        }
+      }
+      process.exit(0);
+    };
+
+    process.on('SIGINT', () => cleanTeardown('SIGINT'));
+    process.on('SIGTERM', () => cleanTeardown('SIGTERM'));
+    ```
+
+
 
 
