@@ -1992,6 +1992,46 @@ alwaysApply: false
       },
     };
     ```
+- **Vue 3.5+ Reactive Props Destructuring Invariant**:
+  - ❌ **Anti-Pattern: Manual `toRef` / `toRefs` Ceremony or Losing Reactivity with Plain Destructure**: Writing verbose `const { title } = toRefs(props)` or mistakenly using naive object destructuring `const { title } = defineProps<Props>()` in older Vue versions, which breaks reactivity when props update.
+  - ✅ **Production Invariant**: In Vue 3.5+, reactive props destructure is natively supported and compiled into reactive getter accessors under the hood. You can destructure directly and define default values with native JavaScript default syntax:
+    ```vue
+    <script setup lang="ts">
+    interface Props {
+      title: string;
+      threshold?: number;
+      tags?: string[];
+    }
+
+    // Vue 3.5+ native reactive destructuring with default values:
+    // Reactivity is 100% preserved; no toRef/toRefs boilerplate needed
+    const { title, threshold = 10, tags = () => [] } = defineProps<Props>();
+
+    // Watching destructured prop requires a getter function:
+    watch(() => title, (newTitle) => {
+      console.log('Title updated to:', newTitle);
+    });
+    </script>
+    ```
+- **Vue 3.5+ `shallowRef` & `triggerRef` for High-Frequency Canvas / Data Grid State**:
+  - ❌ **Anti-Pattern: Deep Proxy Overhead on Large Arrays / High-Frequency Streaming Data**: Storing 50,000-row tabular datasets or 60fps animation state in standard `ref([])`. Vue wraps every nested object in a `Proxy`, consuming significant memory and triggering cascading microtask reactivity flushes.
+  - ✅ **Production Invariant**: Use `shallowRef` for large or frequently mutated datasets. Only the `.value` access itself is reactive. Mutate properties in-place and call `triggerRef` to notify subscribers in a single coordinated flush:
+    ```typescript
+    import { shallowRef, triggerRef } from 'vue';
+
+    const largeDataset = shallowRef<DataRecord[]>([]);
+
+    function updateRecordsInPlace(updates: Partial<DataRecord>[]) {
+      // Direct in-place mutation without deep Proxy wrapping overhead:
+      for (const update of updates) {
+        const item = largeDataset.value.find((r) => r.id === update.id);
+        if (item) Object.assign(item, update);
+      }
+      // Single atomic flush notification:
+      triggerRef(largeDataset);
+    }
+    ```
+
 
 
 

@@ -1007,6 +1007,67 @@ alwaysApply: false
       }
     }
     ```
+- **MCP Client Capability Negotiation & Version Handshake Protocol**:
+  - ❌ **Anti-Pattern: Assuming Client Capabilities Without Handshake Inspection**: Emitting advanced prompts, roots list changes, or reverse sampling requests (`sampling/createMessage`) to clients that haven't declared support in their initialize request. If the client (e.g. Claude Code or an IDE plugin) does not implement the capability, it throws uncaught JSON-RPC method errors, tearing down the session.
+  - ✅ **Production Invariant**: Inspect `clientCapabilities` stored during the `initialize` handshake before executing optional protocol extensions. Gracefully fall back to standard tool outputs when capabilities are absent:
+    ```typescript
+    import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+    import type { ClientCapabilities } from '@modelcontextprotocol/sdk/types.js';
+
+    let negotiatedCapabilities: ClientCapabilities | null = null;
+
+    server.setRequestHandler(InitializeRequestSchema, async (request) => {
+      // Store client capabilities negotiated during handshake:
+      negotiatedCapabilities = request.params.capabilities;
+
+      return {
+        protocolVersion: '2024-11-05',
+        capabilities: {
+          tools: {},
+          resources: { subscribe: true },
+          prompts: {},
+        },
+        serverInfo: { name: 'secure-data-server', version: '1.0.0' },
+      };
+    });
+
+    // Guard capability-dependent operations:
+    export function canSampleLLM(): boolean {
+      return Boolean(negotiatedCapabilities?.sampling);
+    }
+    ```
+- **MCP Streamable Resource Template Parameter Validation**:
+  - ❌ **Anti-Pattern: Unsanitized URI Path Injection in Resource Templates**: Exposing URI templates like `file:///{path}` or `db://table/{id}` and directly passing parsed template variables into filesystem or SQL queries without regex boundary validation, inviting directory traversal (`../../etc/passwd`) or SQL injection.
+  - ✅ **Production Invariant**: Validate resource template parameters against strict alphanumeric / slug schemas and reject any parameter containing directory separators (`/`, `\`, `..`):
+    ```typescript
+    import { ResourceTemplate } from '@modelcontextprotocol/sdk/server/index.js';
+    import { z } from 'zod';
+
+    const safeResourceIdSchema = z.string().regex(/^[a-zA-Z0-9_-]{1,64}$/);
+
+    const documentResourceTemplate = new ResourceTemplate(
+      'docs://{docId}',
+      { list: undefined }
+    );
+
+    server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+      const match = documentResourceTemplate.match(request.params.uri);
+      if (!match) throw new Error('Unknown resource URI');
+
+      // Enforce strict character boundaries against path traversal:
+      const safeId = safeResourceIdSchema.parse(match.docId);
+      const content = await fetchDocumentById(safeId);
+
+      return {
+        contents: [{
+          uri: request.params.uri,
+          mimeType: 'text/plain',
+          text: content,
+        }],
+      };
+    });
+    ```
+
 
 
 

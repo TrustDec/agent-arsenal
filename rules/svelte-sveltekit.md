@@ -2329,6 +2329,47 @@ alwaysApply: false
       Dashboard
     </a>
     ```
+- **Svelte 5 Runes `$state.raw` for Performance-Critical Unproxied State**:
+  - ❌ **Anti-Pattern: Deep Proxy Overhead on Immutable / Third-Party Data Structures**: Wrapping large immutable collections, Three.js scene graphs, or Monaco Editor instances with standard `$state(...)`. Svelte deeply proxies all properties, introducing unnecessary CPU cycles and memory bloat.
+  - ✅ **Production Invariant**: In Svelte 5, use `$state.raw(...)` for large, complex, or third-party objects that should only trigger reactivity upon reassignment:
+    ```svelte
+    <script lang="ts">
+    interface HeavyMetric {
+      timestamp: number;
+      series: Float64Array;
+    }
+
+    // $state.raw avoids deep proxying; reactivity is triggered only when reassigning `metrics`:
+    let metrics = $state.raw<HeavyMetric[]>([]);
+
+    function appendMetrics(newBatch: HeavyMetric[]) {
+      // Reassign root reference to notify subscribers cleanly:
+      metrics = [...metrics, ...newBatch];
+    }
+    </script>
+    ```
+- **Svelte 5 `$effect.tracking()` vs Clean Untracked Execution with `untrack`**:
+  - ❌ **Anti-Pattern: Accidental Infinite Effect Loops via Implicit Dependency Tracking**: Reading telemetry, logging state, or secondary reactive signals inside an `$effect(...)` without isolating them, causing unwanted dependency subscriptions and infinite re-triggering loops.
+  - ✅ **Production Invariant**: Wrap side-effect reads or secondary non-triggering dependencies in `untrack(() => ...)`:
+    ```svelte
+    <script lang="ts">
+    import { untrack } from 'svelte';
+
+    let count = $state(0);
+    let auditLog = $state<string[]>([]);
+
+    $effect(() => {
+      // Triggers ONLY when `count` changes:
+      const current = count;
+
+      // Reading auditLog is explicitly untracked to avoid cyclic effect loops:
+      untrack(() => {
+        auditLog = [...auditLog, `Count reached: ${current}`];
+      });
+    });
+    </script>
+    ```
+
 
 
 

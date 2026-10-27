@@ -2283,6 +2283,55 @@ alwaysApply: false
         return nil
     }
     ```
+- **Go 1.24+ Allocation-Free Benchmark Iteration (`b.Loop()`)**:
+  - ❌ **Anti-Pattern: Legacy `for i := 0; i < b.N; i++` Loops with Compiler Dead-Code Elimination**: Using the classic `for i := 0; i < b.N; i++` loop. If the compiler determines the computed value is unused, it optimizes away the entire loop body, producing synthetic 0.2ns benchmarks. Developers often work around this with global `var sink any`, introducing pointer heap allocations that skew benchmarks.
+  - ✅ **Production Invariant**: In Go 1.24+, use `for b.Loop()`. It manages iteration count dynamically, resets the timer before the first iteration automatically, and inserts compiler barriers preventing loop-body dead-code optimization without heap allocation overhead:
+    ```go
+    func BenchmarkPayloadSerialization(b *testing.B) {
+        payload := GenerateTestPayload(1024)
+        var buf bytes.Buffer
+        buf.Grow(4096)
+
+        // Go 1.24+ idiomatic benchmark loop:
+        // Automatically resets timer, warms up, and prevents compiler dead-code stripping:
+        for b.Loop() {
+            buf.Reset()
+            _ = json.NewEncoder(&buf).Encode(&payload)
+        }
+    }
+    ```
+- **Go 1.24+ Weak Pointers (`weak.Pointer`, `weak.Make`) for High-Throughput Memory Caches**:
+  - ❌ **Anti-Pattern: Leaking Memory via Strong-Reference Global Caches or Fragile Finalizers**: Implementing in-memory caches or interning maps with standard pointers or `runtime.SetFinalizer`. In high-throughput servers, keys remain retained indefinitely until explicitly purged, leading to OOM spikes, or finalizers delay reclamation across multiple GC generations.
+  - ✅ **Production Invariant**: In Go 1.24+, use the `weak` standard library package (`weak.Make[T](&val)`). A weak pointer does not prevent the garbage collector from reclaiming the referenced value. When dereferencing via `wp.Value()`, if the object was collected, it cleanly returns `nil`:
+    ```go
+    import (
+        "sync"
+        "weak"
+    )
+
+    type CanonicalCache[T any] struct {
+        mu    sync.RWMutex
+        store map[string]weak.Pointer[T]
+    }
+
+    func (c *CanonicalCache[T]) Get(key string) *T {
+        c.mu.RLock()
+        wp, exists := c.store[key]
+        c.mu.RUnlock()
+        if !exists {
+            return nil
+        }
+        // Returns nil if GC has reclaimed the underlying object:
+        return wp.Value()
+    }
+
+    func (c *CanonicalCache[T]) Put(key string, val *T) {
+        c.mu.Lock()
+        defer c.mu.Unlock()
+        c.store[key] = weak.Make(val)
+    }
+    ```
+
 
 
 

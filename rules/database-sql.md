@@ -1418,6 +1418,26 @@ alwaysApply: false
     -- If acquired is FALSE: another worker is currently running; exit cleanly immediately without waiting.
     COMMIT; -- Lock automatically released upon COMMIT or ROLLBACK.
     ```
+- **PostgreSQL 16+ `pg_stat_io` for Disk vs Buffer Cache I/O Bottleneck Diagnostics**:
+  - ❌ **Anti-Pattern: Guessing Storage Bottlenecks via Generic CPU or Load Averages**: Troubleshooting slow queries by looking only at overall server I/O or `EXPLAIN ANALYZE` without visibility into whether disk waits stem from client reads, WAL writes, background workers, or vacuum thrashing.
+  - ✅ **Production Invariant**: In PostgreSQL 16+, inspect `pg_stat_io`. It decomposes disk read/write/extend operations by backend type (client backend, autovacuum, checkpointer) and context (normal, vacuum, bulkread), identifying exact I/O bottlenecks without guessing:
+    ```sql
+    -- Pinpoint backend read vs write I/O operations and buffer cache hit rates:
+    SELECT backend_type, io_object, io_context,
+           reads, writes, extends, hits,
+           ROUND(100.0 * hits / NULLIF(hits + reads, 0), 2) AS cache_hit_pct
+    FROM pg_stat_io
+    WHERE io_object = 'relation'
+    ORDER BY reads DESC;
+    ```
+- **Prepared Statement Memory Deallocation & Plan Cache Invalidation (`DISCARD PLANS`)**:
+  - ❌ **Anti-Pattern: Connection Pooler Prepared Statement Leakage & Generic Plan Drift**: Using session-level pooling (`PgBouncer` in transaction mode or long-lived server connections) with unnamed or dynamically named prepared statements. Over time, cached generic plans degrade due to parameter sniffing, and backend connection memory balloons from unpurged statement handles.
+  - ✅ **Production Invariant**: Whenever recycling pooled database connections or concluding long-running batch workers, issue `DISCARD PLANS` (or `DEALLOCATE ALL`) to free cached query plans and force PostgreSQL to re-evaluate statistics and partition pruning:
+    ```sql
+    -- Free memory and force clean parameter-specific plans upon transaction pool recycling:
+    DISCARD PLANS;
+    ```
+
 
 
 
