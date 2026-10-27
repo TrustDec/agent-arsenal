@@ -1783,6 +1783,38 @@ alwaysApply: false
     WHERE order_id = ANY($1::UUID[]);
     ```
 
+- **Concurrency Control: Optimistic Locking (OCC), Canonical Lock Ordering & SKIP LOCKED Queues**:
+  - ❌ **Anti-Pattern: In-Memory Lost Updates & Blocking Queue Locks**: Fetching stock/balance into application memory, updating blindly (`UPDATE accounts SET balance = :val`), or consuming task queues with `LIMIT 1 FOR UPDATE` which serializes all worker threads on row 1.
+  - ✅ **Production Invariant**: Enforce single-statement atomic updates with predicate checks, monotonic version epochs (`version = version + 1 WHERE version = :v`), canonical primary key ordering before batch row locks, and non-blocking `FOR UPDATE SKIP LOCKED` for worker queues:
+    ```sql
+    -- Atomic Single-Statement Mutation (0ms lock wait, zero lost update race)
+    UPDATE inventory 
+    SET stock = stock - 2, version = version + 1, updated_at = NOW() 
+    WHERE id = 'b2c3d4e5-f6a7-8b9c-0d1e-2f3a4b5c6d7e'::UUID AND stock >= 2
+    RETURNING id, stock, version;
+
+    -- Deadlock-Free Lexicographical Multi-Row Lock Ordering (Sort IDs in application first)
+    SELECT id, balance 
+    FROM accounts 
+    WHERE id IN ('00000000-0000-0000-0000-000000000001'::UUID, '00000000-0000-0000-0000-000000000002'::UUID) 
+    ORDER BY id ASC 
+    FOR UPDATE;
+
+    -- High-Throughput Non-Blocking Queue Worker Claim (Linear Theta(W) scalability)
+    WITH claimable AS (
+        SELECT id FROM background_jobs 
+        WHERE status = 'pending' 
+        ORDER BY priority DESC, created_at ASC 
+        LIMIT 10 
+        FOR UPDATE SKIP LOCKED
+    )
+    UPDATE background_jobs 
+    SET status = 'processing', locked_at = NOW(), attempts = attempts + 1 
+    WHERE id IN (SELECT id FROM claimable) 
+    RETURNING id, payload, attempts;
+    ```
+
+
 
 
 

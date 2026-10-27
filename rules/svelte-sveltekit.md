@@ -2863,6 +2863,50 @@ alwaysApply: false
     };
     ```
 
+- **Optimistic Form Actions with Version Epochs & 409 Conflict Handling in SvelteKit**:
+  - ❌ **Anti-Pattern: Unchecked Form Post Without Version Token**: Executing updates in SvelteKit `actions` without verifying entity version, silently overwriting intervening writes from concurrent browser tabs.
+  - ✅ **Production Invariant**: Include hidden `<input name="version" />` in forms, assert `version = expected` in form actions, and return `fail(409, { conflict: true, currentData })` to render reactive conflict resolution modals:
+    ```typescript
+    // src/routes/items/[id]/+page.server.ts
+    import { fail } from '@sveltejs/kit';
+    import type { Actions } from './$types';
+    import { dbPool } from '$lib/server/db';
+
+    export const actions: Actions = {
+      update: async ({ request, params }) => {
+        const data = await request.formData();
+        const title = data.get('title') as string;
+        const version = parseInt(data.get('version') as string, 10);
+        const itemId = params.id;
+
+        const client = await dbPool.connect();
+        try {
+          const res = await client.query(
+            `UPDATE items 
+             SET title = $1, version = version + 1, updated_at = NOW() 
+             WHERE id = $2 AND version = $3 
+             RETURNING id, title, version`,
+            [title, itemId, version]
+          );
+
+          if (res.rows.length === 0) {
+            const current = await client.query('SELECT id, title, version FROM items WHERE id = $1', [itemId]);
+            return fail(409, {
+              conflict: true,
+              message: 'This record was modified by another user.',
+              currentRecord: current.rows[0],
+            });
+          }
+
+          return { success: true, item: res.rows[0] };
+        } finally {
+          client.release();
+        }
+      },
+    };
+    ```
+
+
 
 
 

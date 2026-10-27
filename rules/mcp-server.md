@@ -1581,6 +1581,76 @@ alwaysApply: false
     });
     ```
 
+- **MCP Mutation Tools OCC Version Epochs & Deadlock Prevention**:
+  - ❌ **Anti-Pattern: Blind Overwrite In Tools & Unsorted Multi-Resource Locks**: Exposing MCP mutation tools (e.g. `update_document`, `transfer_balance`) without requiring expected version tokens, allowing agent loops to overwrite concurrent human edits or cause database deadlocks.
+  - ✅ **Production Invariant**: Mandate `expectedVersion: number` in tool input schemas, execute optimistic concurrency updates returning `409 Conflict` on mismatch, and sort resource IDs lexicographically before acquiring locks:
+    ```typescript
+    // Industrial MCP Resource Mutation Tool with Optimistic Concurrency Control (OCC)
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      if (request.params.name !== 'update_inventory_stock') return;
+
+      const { productId, deductAmount, expectedVersion } = request.params.arguments as {
+        productId: string;
+        deductAmount: number;
+        expectedVersion: number;
+      };
+
+      if (!productId || deductAmount <= 0 || expectedVersion == null) {
+        throw new McpError(ErrorCode.InvalidParams, 'Invalid input parameters');
+      }
+
+      const client = await dbPool.connect();
+      try {
+        const res = await client.query(
+          `UPDATE products 
+           SET stock = stock - $1, version = version + 1, updated_at = NOW() 
+           WHERE id = $2 AND version = $3 AND stock >= $1 
+           RETURNING id, stock, version`,
+          [deductAmount, productId, expectedVersion]
+        );
+
+        if (res.rows.length === 0) {
+          // Check if failure was caused by version drift vs stock exhaustion
+          const current = await client.query('SELECT stock, version FROM products WHERE id = $1', [productId]);
+          if (current.rows.length === 0) {
+            throw new McpError(ErrorCode.InvalidRequest, `Product ${productId} not found`);
+          }
+          const row = current.rows[0];
+          if (row.version !== expectedVersion) {
+            return {
+              isError: true,
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  error: 'CONCURRENCY_CONFLICT',
+                  message: `Stale version ${expectedVersion}. Current version is ${row.version}. Refresh and retry.`,
+                  currentVersion: row.version,
+                }),
+              }],
+            };
+          }
+          return {
+            isError: true,
+            content: [{
+              type: 'text',
+              text: JSON.stringify({ error: 'INSUFFICIENT_STOCK', currentStock: row.stock }),
+            }],
+          };
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ success: true, updatedProduct: res.rows[0] }),
+          }],
+        };
+      } finally {
+        client.release();
+      }
+    });
+    ```
+
+
 
 
 

@@ -2892,6 +2892,92 @@ alwaysApply: false
     }
     ```
 
+- **PostgreSQL Concurrency Control: Lexicographical Locking, OCC & SKIP LOCKED in Go (`pgxpool`)**:
+  - ❌ **Anti-Pattern: Arbitrary Row Lock Orders & In-Memory Read-Modify-Write**: Locking multiple accounts in arbitrary order (triggering PostgreSQL `40P01 deadlock_detected`), reading balances into Go structs to decrement before updating, or running workers on `LIMIT 1 FOR UPDATE` without `SKIP LOCKED`.
+  - ✅ **Production Invariant**: Sort UUID slices lexicographically before locking, execute atomic conditional deductions with `RETURNING`, implement OCC version loops with jittered retries, and dispatch worker pools via `FOR UPDATE SKIP LOCKED`:
+    ```go
+    // Deadlock-Free Balance Transfer via Lexicographical Key Sorting in Go (pgxpool)
+    func (s *LedgerService) TransferBalance(ctx context.Context, fromID, toID uuid.UUID, amount int64) error {
+        if fromID == toID {
+            return errors.New("cannot transfer to same account")
+        }
+        // Step 1: Guarantee acyclic Wait-For Graph via total canonical ID order
+        ordered := []uuid.UUID{fromID, toID}
+        sort.Slice(ordered, func(i, j int) bool {
+            return ordered[i].String() < ordered[j].String()
+        })
+
+        tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+        if err != nil {
+            return fmt.Errorf("begin tx: %w", err)
+        }
+        defer tx.Rollback(ctx)
+
+        // Step 2: Lock rows in canonical order
+        for _, id := range ordered {
+            var dummy int64
+            if err := tx.QueryRow(ctx, "SELECT balance FROM accounts WHERE id = $1 FOR UPDATE", id).Scan(&dummy); err != nil {
+                return fmt.Errorf("lock account %s: %w", id, err)
+            }
+        }
+
+        // Step 3: Single-statement atomic conditional debit
+        cmdTag, err := tx.Exec(ctx, `
+            UPDATE accounts 
+            SET balance = balance - $1, updated_at = NOW() 
+            WHERE id = $2 AND balance >= $1`, amount, fromID)
+        if err != nil {
+            return fmt.Errorf("debit: %w", err)
+        }
+        if cmdTag.RowsAffected() == 0 {
+            return errors.New("insufficient balance or concurrent debit conflict")
+        }
+
+        // Step 4: Credit target account
+        if _, err := tx.Exec(ctx, "UPDATE accounts SET balance = balance + $1, updated_at = NOW() WHERE id = $2", amount, toID); err != nil {
+            return fmt.Errorf("credit: %w", err)
+        }
+
+        return tx.Commit(ctx)
+    }
+
+    // High-Throughput Worker Queue Claim with FOR UPDATE SKIP LOCKED
+    func (w *QueueWorker) ClaimBatch(ctx context.Context, batchSize int) ([]uuid.UUID, error) {
+        queryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+        defer cancel()
+
+        query := `
+            WITH claimable AS (
+                SELECT id FROM tasks 
+                WHERE status = 'pending' 
+                ORDER BY priority DESC, created_at ASC 
+                LIMIT $1 
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE tasks 
+            SET status = 'processing', locked_at = NOW(), attempts = attempts + 1 
+            WHERE id IN (SELECT id FROM claimable) 
+            RETURNING id`
+
+        rows, err := w.pool.Query(queryCtx, query, batchSize)
+        if err != nil {
+            return nil, fmt.Errorf("claim batch: %w", err)
+        }
+        defer rows.Close()
+
+        var ids []uuid.UUID
+        for rows.Next() {
+            var id uuid.UUID
+            if err := rows.Scan(&id); err != nil {
+                return nil, err
+            }
+            ids = append(ids, id)
+        }
+        return ids, rows.Err()
+    }
+    ```
+
+
 
 
 

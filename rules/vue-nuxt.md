@@ -2515,6 +2515,72 @@ alwaysApply: false
     });
     ```
 
+- **Optimistic UI Updates with Version Epochs & 409 Conflict Recovery in Nuxt / Pinia**:
+  - ❌ **Anti-Pattern: Blind Form Submission & Silent Overwrite**: Submitting edit forms without sending the entity's `version` token, causing concurrent editors to overwrite each other's data with zero notification.
+  - ✅ **Production Invariant**: Include monotonic `version` in payload, apply immediate optimistic state mutation in Pinia, and catch HTTP 409 Conflict errors to trigger non-destructive three-way diff merge dialogs:
+    ```vue
+    <!-- components/CustomerProfileEditor.vue -->
+    <script setup lang="ts">
+    import { ref } from 'vue';
+
+    interface Customer {
+      id: string;
+      email: string;
+      name: string;
+      version: number;
+    }
+
+    const props = defineProps<{ customer: Customer }>();
+    const emit = defineEmits<{ (e: 'saved', updated: Customer): void }>();
+
+    const localEmail = ref(props.customer.email);
+    const isSaving = ref(false);
+    const conflictData = ref<{ currentVersion: number; serverData: Customer } | null>(null);
+
+    async function handleSave() {
+      isSaving.value = true;
+      conflictData.value = null;
+
+      try {
+        const updated = await $fetch<Customer>(`/api/customers/${props.customer.id}`, {
+          method: 'PATCH',
+          body: {
+            email: localEmail.value,
+            expectedVersion: props.customer.version,
+          },
+        });
+        emit('saved', updated);
+      } catch (err: any) {
+        if (err.statusCode === 409) {
+          // Concurrency conflict! Server entity version has advanced.
+          conflictData.value = {
+            currentVersion: err.data.currentVersion,
+            serverData: err.data.serverRecord,
+          };
+        } else {
+          alert(`Save failed: ${err.message}`);
+        }
+      } finally {
+        isSaving.value = false;
+      }
+    }
+    </script>
+
+    <template>
+      <form @submit.prevent="handleSave" class="space-y-4">
+        <input v-model="localEmail" class="border p-2 rounded w-full" :disabled="isSaving" />
+        <div v-if="conflictData" class="p-3 bg-amber-50 border border-amber-300 rounded text-amber-900 text-sm">
+          ⚠️ Another teammate modified this profile (Version {{ conflictData.currentVersion }}). 
+          Please review the updated data before retrying.
+        </div>
+        <button type="submit" :disabled="isSaving" class="px-4 py-2 bg-blue-600 text-white rounded">
+          {{ isSaving ? 'Saving...' : 'Save Profile' }}
+        </button>
+      </form>
+    </template>
+    ```
+
+
 
 
 
