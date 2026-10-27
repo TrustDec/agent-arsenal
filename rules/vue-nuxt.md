@@ -2734,5 +2734,27 @@ alwaysApply: false
         refresh,
       };
     }
+
+    // Nuxt 3 Database Change Data Capture (CDC) & Slot Health Sentinel Composable
+    export function useDatabaseCDCSentinel(slotName: string) {
+      const { data: cdcData, refresh } = useFetch(`/api/admin/cdc-slot/${slotName}`);
+      const isDiskAtRisk = computed(() => {
+        return (cdcData.value?.replicationLag?.lagMb ?? 0) > 10240 || cdcData.value?.walStatus === 'lost';
+      });
+      const isCatalogBloated = computed(() => {
+        return (cdcData.value?.catalogHealth?.catalogXminAge ?? 0) > 500000;
+      });
+      const isStreamHealthy = computed(() => {
+        return (cdcData.value?.active ?? false) && !isDiskAtRisk.value && !isCatalogBloated.value;
+      });
+
+      return {
+        cdcData,
+        isDiskAtRisk,
+        isCatalogBloated,
+        isStreamHealthy,
+        refresh,
+      };
+    }
     </script>
     ```

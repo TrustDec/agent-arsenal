@@ -3259,4 +3259,53 @@ alwaysApply: false
         </div>
       </div>
     </div>
+
+    <!-- Svelte 5 Reactive Change Data Capture (CDC) Slot Health & Lag Sentinel -->
+    <script lang="ts">
+      interface CDCSlotAuditData {
+        slotName: string;
+        active: boolean;
+        walStatus: string;
+        lagMb: number;
+        catalogXminAge: number;
+        isDiskAtRisk: boolean;
+        isCatalogBloated: boolean;
+      }
+
+      let { cdcSlot }: { cdcSlot: CDCSlotAuditData } = $props();
+      let isCriticalLag = $derived(cdcSlot.lagMb > 10240 || cdcSlot.walStatus === 'lost');
+      let statusTheme = $derived(cdcSlot.active && !isCriticalLag ? 'success' : 'danger');
+    </script>
+
+    <div class="cdc-slot-card" class:warning={cdcSlot.isCatalogBloated} class:critical={isCriticalLag}>
+      <header>
+        <h4>CDC Slot: {cdcSlot.slotName}</h4>
+        <span class={`badge ${statusTheme}`}>
+          {cdcSlot.walStatus.toUpperCase()} ({cdcSlot.active ? 'ACTIVE' : 'INACTIVE'})
+        </span>
+      </header>
+
+      {#if isCriticalLag}
+        <div class="alert danger">
+          <strong>Disk Exhaustion Warning:</strong> Replication lag ({cdcSlot.lagMb.toFixed(1)} MB) exceeds safety threshold!
+        </div>
+      {/if}
+
+      {#if cdcSlot.isCatalogBloated}
+        <div class="alert warning">
+          <strong>Catalog Bloat Warning:</strong> catalog_xmin age ({cdcSlot.catalogXminAge}) is pinning autovacuum horizons!
+        </div>
+      {/if}
+
+      <div class="metrics-grid">
+        <div class="metric">
+          <label>WAL Retained Lag</label>
+          <span class="value">{cdcSlot.lagMb.toFixed(1)} MB</span>
+        </div>
+        <div class="metric">
+          <label>Catalog xmin Age</label>
+          <span class="value">{cdcSlot.catalogXminAge.toLocaleString()} txns</span>
+        </div>
+      </div>
+    </div>
     ```

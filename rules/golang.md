@@ -3515,4 +3515,62 @@ func CheckArchivalHealth(ctx context.Context, pool *pgxpool.Pool) (*ArchivalStat
 
     return &status, nil
 }
+
+// ==============================================================================
+// 16. Change Data Capture (CDC), Logical Replication Slots & Monotonic LSN Fencing
+// ==============================================================================
+
+// CDCSlotHealth represents the operational status of a PostgreSQL logical replication slot
+type CDCSlotHealth struct {
+    SlotName       string  `json:"slot_name"`
+    Active         bool    `json:"active"`
+    WalStatus      string  `json:"wal_status"`
+    LagBytes       int64   `json:"lag_bytes"`
+    LagMB          float64 `json:"lag_mb"`
+    CatalogXminAge int64   `json:"catalog_xmin_age"`
+    IsDiskAtRisk   bool    `json:"is_disk_at_risk"`
+    IsCatalogOld   bool    `json:"is_catalog_old"`
+}
+
+// AuditCDCSlotHealth queries pg_replication_slots to enforce safety boundaries
+func AuditCDCSlotHealth(ctx context.Context, pool *pgxpool.Pool, slotName string) (*CDCSlotHealth, error) {
+    query := `
+        SELECT
+            slot_name,
+            active,
+            COALESCE(wal_status, 'unreserved'),
+            COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0),
+            ROUND(COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0) / (1024 * 1024), 2),
+            COALESCE(age(catalog_xmin), 0)
+        FROM pg_replication_slots
+        WHERE slot_name = $1 AND slot_type = 'logical';
+    `
+
+    var h CDCSlotHealth
+    err := pool.QueryRow(ctx, query, slotName).Scan(
+        &h.SlotName,
+        &h.Active,
+        &h.WalStatus,
+        &h.LagBytes,
+        &h.LagMB,
+        &h.CatalogXminAge,
+    )
+    if err != nil {
+        return nil, fmt.Errorf("audit cdc slot %s: %w", slotName, err)
+    }
+
+    // Invariant: Lag > 10GB or wal_status != normal flags disk risk
+    h.IsDiskAtRisk = h.LagMB > 10240 || h.WalStatus == "extended" || h.WalStatus == "lost"
+    // Invariant: Catalog xmin age > 500,000 flags autovacuum pinning risk
+    h.IsCatalogOld = h.CatalogXminAge > 500000
+
+    if h.WalStatus == "lost" {
+        return &h, fmt.Errorf("cdc slot %s is LOST: WAL was recycled, consumer must re-snapshot", slotName)
+    }
+    if h.IsDiskAtRisk {
+        return &h, fmt.Errorf("cdc slot %s lag critical: %.2f MB retained, risk of primary disk exhaustion", slotName, h.LagMB)
+    }
+
+    return &h, nil
+}
 ```

@@ -2192,3 +2192,51 @@ alwaysApply: false
       AND c.relpersistence = 'p'
     LIMIT 100;
     ```
+
+- **Change Data Capture (CDC), Logical Replication Slots & Replica Identity Invariants**:
+  - ❌ **Anti-Pattern: Unbounded Logical Slots, Unindexed REPLICA IDENTITY FULL & Catalog Bloat**:
+    - Creating logical replication slots (`pg_create_logical_replication_slot`) without setting `max_slot_wal_keep_size`, causing disconnected CDC consumers to hoard WAL segments until disk fills to 100% and crashes the cluster with postmaster `PANIC`.
+    - Blindly executing `ALTER TABLE t REPLICA IDENTITY FULL` on high-traffic tables without verified subscriber indexes, forcing subscribing nodes to execute sequential full-table scans for every single `UPDATE`/`DELETE`, locking CPU at 100%.
+    - Leaving orphaned development or testing logical slots active, permanently pinning `catalog_xmin` and preventing autovacuum from cleaning dead tuples in `pg_catalog`, degrading query planning latency cluster-wide by 50x.
+    - Consuming CDC streams downstream without monotonic LSN fencing, causing out-of-order state overwrites or duplicate side-effects on consumer restarts.
+  - ✅ **Production Invariant**:
+    - Bound replication slot WAL retention with `max_slot_wal_keep_size = '32768MB'` and tune `logical_decoding_work_mem = '131072kB'`.
+    - Mandatory `REPLICA IDENTITY DEFAULT` backed by an immutable primary key (`UUIDv7` or `BIGINT`), or explicit `REPLICA IDENTITY USING INDEX <unique_idx>`.
+    - Automated sentinel alerting when `age(catalog_xmin) > 500000` transactions or when slot lag exceeds 10GB.
+    - Monotonic LSN fencing on downstream projections: discard incoming events where `incoming_lsn <= last_applied_lsn`.
+    ```sql
+    -- 1. Logical Replication Slot Health, Lag & Catalog xmin Sentinel
+    SELECT
+      slot_name,
+      plugin,
+      slot_type,
+      active,
+      active_pid,
+      wal_status,
+      ROUND(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) / (1024 * 1024), 2) AS lag_restart_mb,
+      ROUND(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn) / (1024 * 1024), 2) AS lag_flush_mb,
+      catalog_xmin,
+      age(catalog_xmin) AS catalog_xmin_age
+    FROM pg_replication_slots
+    WHERE slot_type = 'logical';
+
+    -- 2. Publication Replica Identity & Primary Key Audit
+    SELECT
+      c.relname AS table_name,
+      c.relreplident AS replica_identity,
+      CASE c.relreplident
+        WHEN 'd' THEN 'default (PK)'
+        WHEN 'n' THEN 'nothing'
+        WHEN 'f' THEN 'full'
+        WHEN 'i' THEN 'index'
+      END AS identity_desc,
+      (SELECT count(*) FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary) > 0 AS has_primary_key
+    FROM pg_publication_tables pt
+    JOIN pg_class c ON c.relname = pt.tablename
+    JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = pt.schemaname;
+
+    -- 3. Disk Fencing Boundary Configuration
+    ALTER SYSTEM SET max_slot_wal_keep_size = '32768MB';
+    ALTER SYSTEM SET logical_decoding_work_mem = '131072kB';
+    SELECT pg_reload_conf();
+    ```

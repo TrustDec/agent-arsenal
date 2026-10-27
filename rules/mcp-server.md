@@ -2144,4 +2144,73 @@ alwaysApply: false
         }
       }
     );
+
+    // Database Change Data Capture (CDC) & Logical Replication Slot Sentinel Tool
+    server.tool(
+      'audit_database_cdc_and_logical_replication',
+      {
+        slotName: z.string().describe('PostgreSQL logical replication slot name to inspect'),
+        maxAllowedLagMb: z.number().default(10240).describe('Max allowed replication lag in MB before alerting on disk risk'),
+      },
+      async ({ slotName, maxAllowedLagMb }) => {
+        const client = await dbPool.connect();
+        try {
+          // 1. Query pg_replication_slots
+          const slotRes = await client.query(`
+            SELECT
+              slot_name,
+              plugin,
+              slot_type,
+              active,
+              wal_status,
+              COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0) AS lag_bytes,
+              ROUND(COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0) / (1024 * 1024), 2) AS lag_mb,
+              COALESCE(age(catalog_xmin), 0) AS catalog_xmin_age
+            FROM pg_replication_slots
+            WHERE slot_name = $1 AND slot_type = 'logical';
+          `, [slotName]);
+
+          if (slotRes.rows.length === 0) {
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({ error: `Slot '${slotName}' does not exist` }, null, 2),
+              }],
+            };
+          }
+
+          const slot = slotRes.rows[0];
+          const lagMb = Number(slot.lag_mb);
+          const catalogAge = Number(slot.catalog_xmin_age);
+          const isDiskAtRisk = lagMb > maxAllowedLagMb || slot.wal_status === 'extended' || slot.wal_status === 'lost';
+          const isCatalogBloated = catalogAge > 500000;
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                slotName: slot.slot_name,
+                active: slot.active,
+                walStatus: slot.wal_status,
+                replicationLag: {
+                  lagBytes: Number(slot.lag_bytes),
+                  lagMb,
+                  isDiskAtRisk,
+                },
+                catalogHealth: {
+                  catalogXminAge: catalogAge,
+                  isCatalogBloated,
+                },
+                statusSummary: {
+                  isHealthy: slot.active && !isDiskAtRisk && !isCatalogBloated,
+                  requiresIntervention: isDiskAtRisk || isCatalogBloated || slot.wal_status === 'lost',
+                },
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
     ```
