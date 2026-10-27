@@ -3986,4 +3986,80 @@ func SanitizeWebsearchQuery(raw string) string {
     }
     return clean
 }
+
+// ============================================================================
+// 12. PostgreSQL JSONB Document-Relational Discipline & Zero-Allocation TOAST Defense
+// ============================================================================
+
+// BoundedJSONBDecoder wraps an io.Reader with an explicit byte ceiling (e.g., 2MB)
+// to prevent malicious or unbounded TOAST JSONB payloads from causing OOM exhaustion.
+func DecodeBoundedJSON[T any](r io.Reader, maxBytes int64) (T, error) {
+    var dest T
+    limitReader := io.LimitReader(r, maxBytes+1)
+    decoder := json.NewDecoder(limitReader)
+    decoder.DisallowUnknownFields() // Reject polymorphic schema drift
+
+    if err := decoder.Decode(&dest); err != nil {
+        return dest, fmt.Errorf("decode json payload: %w", err)
+    }
+
+    // Verify reader did not exceed maxBytes
+    var dummy [1]byte
+    if n, _ := limitReader.Read(dummy[:]); n > 0 {
+        return dest, fmt.Errorf("json payload exceeds maximum allowed size of %d bytes", maxBytes)
+    }
+
+    return dest, nil
+}
+
+// SargableJSONBContainmentQuery executes a containment search using jsonb_path_ops index.
+// Never uses string formatting or non-sargable arrow operators.
+func QueryEventsByContainment[T any](
+    ctx context.Context,
+    pool *pgxpool.Pool,
+    tenantID uuid.UUID,
+    containmentFilter map[string]interface{},
+    limit int,
+) ([]T, error) {
+    if limit <= 0 || limit > 100 {
+        limit = 50
+    }
+
+    filterJSON, err := json.Marshal(containmentFilter)
+    if err != nil {
+        return nil, fmt.Errorf("marshal containment filter: %w", err)
+    }
+
+    // Explicit projection avoids reading unneeded TOAST columns
+    query := `
+        SELECT payload
+        FROM customer_events
+        WHERE tenant_id = $1
+          AND payload @> $2::jsonb
+        ORDER BY created_at DESC
+        LIMIT $3
+    `
+
+    rows, err := pool.Query(ctx, query, tenantID, filterJSON)
+    if err != nil {
+        return nil, fmt.Errorf("execute jsonb containment query: %w", err)
+    }
+    defer rows.Close()
+
+    var results []T
+    for rows.Next() {
+        var raw []byte
+        if err := rows.Scan(&raw); err != nil {
+            return nil, fmt.Errorf("scan jsonb row: %w", err)
+        }
+
+        var item T
+        if err := json.Unmarshal(raw, &item); err != nil {
+            return nil, fmt.Errorf("unmarshal jsonb into target struct: %w", err)
+        }
+        results = append(results, item)
+    }
+
+    return results, rows.Err()
+}
 ```

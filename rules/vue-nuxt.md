@@ -2854,5 +2854,30 @@ alwaysApply: false
         refresh,
       };
     }
+
+    // Nuxt 3 Database JSONB Document & TOAST Sentinel Composable
+    // Uses shallowRef to avoid deep reactive proxy traversal on multi-megabyte JSON payloads
+    export function useDatabaseJsonbSentinel(schemaName: string = 'public') {
+      const { data: jsonbData, refresh } = useFetch(`/api/admin/database-jsonb/${schemaName}`);
+      const rawPayloads = shallowRef<Record<string, unknown>>({});
+
+      const hasBloatedIndexes = computed(() => {
+        const warnings = jsonbData.value?.bloatWarnings || [];
+        return warnings.length > 0;
+      });
+
+      const largestToastTables = computed(() => {
+        const cols = jsonbData.value?.jsonbColumns || [];
+        return [...cols].sort((a: any, b: any) => b.toast_bytes - a.toast_bytes).slice(0, 5);
+      });
+
+      return {
+        jsonbData,
+        rawPayloads,
+        hasBloatedIndexes,
+        largestToastTables,
+        refresh,
+      };
+    }
     </script>
     ```

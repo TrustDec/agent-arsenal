@@ -2532,4 +2532,86 @@ alwaysApply: false
         }
       }
     );
+
+    // Tool: Audit JSONB Columns, TOAST Footprint & Inverted Index Optimization
+    server.tool(
+      'audit_database_jsonb_toast_and_indexes',
+      'Audit PostgreSQL JSONB column sizes, TOAST table footprints, storage strategies, CHECK constraints, and detect unoptimized default jsonb_ops index bloat',
+      {
+        schemaName: z.string().default('public').describe('Database schema name'),
+      },
+      async ({ schemaName }) => {
+        const client = await pool.connect();
+        try {
+          // 1. Audit JSONB columns and TOAST ratios
+          const colRes = await client.query(`
+            SELECT
+              c.relname AS table_name,
+              a.attname AS column_name,
+              pg_size_pretty(pg_relation_size(c.oid)) AS table_size,
+              pg_size_pretty(COALESCE(pg_relation_size(c.reltoastrelid), 0)) AS toast_size,
+              COALESCE(pg_relation_size(c.reltoastrelid), 0) AS toast_bytes,
+              CASE a.attstorage
+                WHEN 'x' THEN 'EXTENDED'
+                WHEN 'e' THEN 'EXTERNAL'
+                WHEN 'm' THEN 'MAIN'
+                WHEN 'p' THEN 'PLAIN'
+              END AS storage_strategy,
+              EXISTS (
+                SELECT 1 FROM pg_constraint con
+                WHERE con.conrelid = c.oid
+                  AND con.contype = 'c'
+                  AND pg_get_constraintdef(con.oid) ILIKE '%' || a.attname || '%'
+              ) AS has_check_constraint
+            FROM pg_attribute a
+            JOIN pg_class c ON c.oid = a.attrelid
+            JOIN pg_type t ON t.oid = a.atttypid
+            WHERE t.typname = 'jsonb'
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+              AND c.relnamespace = $1::regnamespace
+            ORDER BY COALESCE(pg_relation_size(c.reltoastrelid), 0) DESC;
+          `, [schemaName]);
+
+          // 2. Audit GIN operator classes (jsonb_path_ops vs jsonb_ops)
+          const idxRes = await client.query(`
+            SELECT
+              t.relname AS table_name,
+              i.relname AS index_name,
+              pg_size_pretty(pg_relation_size(i.oid)) AS index_size,
+              opc.opcname AS opclass_name
+            FROM pg_index x
+            JOIN pg_class t ON t.oid = x.indrelid
+            JOIN pg_class i ON i.oid = x.indexrelid
+            JOIN pg_am am ON am.oid = i.relam
+            JOIN pg_opclass opc ON opc.oid = ANY(x.indclass)
+            WHERE am.amname = 'gin'
+              AND opc.opcname IN ('jsonb_ops', 'jsonb_path_ops')
+              AND t.relnamespace = $1::regnamespace;
+          `, [schemaName]);
+
+          const bloatWarnings: string[] = [];
+          for (const idx of idxRes.rows) {
+            if (idx.opclass_name === 'jsonb_ops') {
+              bloatWarnings.push(`Index ${idx.index_name} uses default jsonb_ops. Migrate to jsonb_path_ops for up to 65% size reduction.`);
+            }
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                jsonbColumnsCount: colRes.rowCount,
+                jsonbColumns: colRes.rows,
+                jsonbIndexesCount: idxRes.rowCount,
+                jsonbIndexes: idxRes.rows,
+                bloatWarnings,
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
     ```

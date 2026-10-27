@@ -3531,4 +3531,45 @@ alwaysApply: false
         </div>
       </div>
     </div>
+
+    <!-- Svelte 5 JSONB Document & TOAST Sentinel Component -->
+    <!-- Invariant: Uses $state.raw for multi-megabyte JSON payloads to prevent deep proxy tracking overhead -->
+    <script lang="ts">
+      interface JsonbAuditSummary {
+        totalJsonbColumns: number;
+        toastBytesTotal: number;
+        bloatedIndexes: string[];
+        unconstrainedColumns: string[];
+      }
+
+      let { summary } = $props<{ summary: JsonbAuditSummary }>();
+
+      // Raw unproxied state for heavy document rendering
+      let rawJsonDocument = $state.raw<Record<string, unknown>>({});
+
+      let hasBloat = $derived(summary.bloatedIndexes.length > 0);
+      let hasMissingChecks = $derived(summary.unconstrainedColumns.length > 0);
+      let isHealthy = $derived(!hasBloat && !hasMissingChecks);
+    </script>
+
+    <div class="jsonb-sentinel-card" class:warning={!isHealthy}>
+      <header>
+        <h4>Database JSONB Document & TOAST Sentinel</h4>
+        <span class={`badge ${isHealthy ? 'success' : 'warning'}`}>
+          {isHealthy ? 'GOVERNED' : 'ACTION REQUIRED'}
+        </span>
+      </header>
+
+      {#if hasBloat}
+        <div class="alert warning">
+          <strong>Default jsonb_ops GIN Bloat Detected:</strong>
+          <p>The following indexes should be migrated to jsonb_path_ops:</p>
+          <ul>
+            {#each summary.bloatedIndexes as idx}
+              <li>{idx}</li>
+            {/each}
+          </ul>
+        </div>
+      {/if}
+    </div>
     ```

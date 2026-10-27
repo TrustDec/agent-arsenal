@@ -2418,3 +2418,50 @@ alwaysApply: false
     ORDER BY rank DESC
     LIMIT 20;
     ```
+
+- **Database JSONB Document-Relational Modeling, `jsonb_path_ops`, TOAST De-TOASTing Defense & Schema Invariants**:
+  - ❌ **Anti-Pattern: Unbounded `SELECT *`, Default `jsonb_ops` GIN Bloat, Non-Sargable `->>`, and Schemaless Mutation**:
+    - Executing `SELECT * FROM events` on tables containing multi-kilobyte JSONB payloads exceeding `TOAST_TUPLE_THRESHOLD` (2KB), forcing PostgreSQL to fetch, de-chunk, and decompress out-of-line TOAST slices across multiple 8KB pages, driving cache eviction in `shared_buffers` and collapsing throughput by $90\%$.
+    - Modifying single scalar keys via `UPDATE t SET payload = jsonb_set(payload, '{status}', '"paid"')`, rewriting the entire heap tuple and duplicating multi-kilobyte TOAST chunks with $10,000\times$ write amplification.
+    - Creating default GIN indexes `USING gin (payload)` with `jsonb_ops`, decomposing every key and sub-element individually and ballooning index size to $3\times–6\times$ the table heap.
+    - Querying via `WHERE payload->>'tenant_id' = $1`, which completely bypasses standard GIN indexes and degrades into a full-table sequential scan.
+  - ✅ **Production Invariant**:
+    - Mandate explicit column projection (`SELECT id, status, created_at`); never `SELECT *` on relations with JSONB columns.
+    - Use `jsonb_path_ops` GIN indexing (`USING gin (payload jsonb_path_ops)`) for containment `@>` queries to achieve up to $65\%$ index compression and faster scans.
+    - Build Expression B-Tree indexes (`CREATE INDEX ON t (((payload->>'tenant_id')::uuid))`) or `STORED GENERATED` columns for frequent scalar arrow lookups and foreign keys.
+    - Enforce database-level schema constraints: validate mandatory keys with `?&` and types with `jsonb_typeof()`.
+    - Hoist frequently mutated status flags and counters out of JSONB into dedicated relational columns to enable Heap-Only Tuples (HOT) updates without TOAST duplication.
+    ```sql
+    -- 1. Hardened Table with Relational Core + JSONB Satellite + Schema Fencing
+    CREATE TABLE IF NOT EXISTS audit_events (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL,
+      status VARCHAR(32) NOT NULL DEFAULT 'received',
+      retry_count INT NOT NULL DEFAULT 0,
+      external_id VARCHAR(128) GENERATED ALWAYS AS (
+        NULLIF(payload->>'external_id', '')
+      ) STORED,
+      payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CLOCK_TIMESTAMP(),
+      CONSTRAINT chk_payload_keys CHECK (payload ?& array['schema_version', 'data']),
+      CONSTRAINT chk_payload_version CHECK (jsonb_typeof(payload->'schema_version') = 'number')
+    );
+
+    -- 2. Compact jsonb_path_ops Inverted Index for Containment Scans
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_audit_events_payload_path_ops
+      ON audit_events USING gin (payload jsonb_path_ops)
+      WITH (fastupdate = on, gin_pending_list_limit = '16MB');
+
+    -- 3. Expression B-Tree Index for Arrow Lookups
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_audit_events_external_id
+      ON audit_events (external_id)
+      WHERE external_id IS NOT NULL;
+
+    -- 4. Sargable Containment Query Execution
+    SELECT id, tenant_id, status, created_at
+    FROM audit_events
+    WHERE tenant_id = 'a0000000-0000-0000-0000-000000000001'::uuid
+      AND payload @> '{"data": {"priority": "high"}}'::jsonb
+    ORDER BY created_at DESC
+    LIMIT 50;
+    ```
