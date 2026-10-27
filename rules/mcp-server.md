@@ -1648,6 +1648,71 @@ alwaysApply: false
         client.release();
       }
     });
+
+    // MCP Tool Read-After-Write Consistency: Causal LSN Token Propagation Invariant
+    // In multi-turn LLM agent execution, write tools return committed projections and WAL LSN tokens,
+    // and read tools accept causal tokens to prevent stale read hallucination across replicas.
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      if (request.params.name === 'create_document') {
+        const { title, content } = request.params.arguments as { title: string; content: string };
+        const client = await dbPoolPrimary.connect();
+        try {
+          const res = await client.query(
+            `INSERT INTO documents (title, content, updated_at) 
+             VALUES ($1, $2, NOW()) 
+             RETURNING id, title, content, updated_at`,
+            [title, content]
+          );
+          const lsnRes = await client.query('SELECT pg_current_wal_lsn()::text AS lsn');
+          const commitLsn = lsnRes.rows[0]?.lsn;
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: true,
+                document: res.rows[0],
+                // Return causal token so subsequent agent read tools avoid replica lag
+                causalToken: commitLsn,
+              }),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+
+      if (request.params.name === 'get_document') {
+        const { documentId, causalToken } = request.params.arguments as { documentId: string; causalToken?: string };
+        // If caller passes causal token, route to replica ONLY if replica has caught up
+        let targetPool = dbPoolReplica;
+        if (causalToken) {
+          const repClient = await dbPoolReplica.connect();
+          try {
+            const check = await repClient.query(
+              'SELECT pg_wal_lsn_diff(pg_last_wal_replay_lsn(), $1::pg_lsn) >= 0 AS ok',
+              [causalToken]
+            );
+            if (!check.rows[0]?.ok) {
+              targetPool = dbPoolPrimary; // Replica lagging, fallback to Primary
+            }
+          } finally {
+            repClient.release();
+          }
+        }
+
+        const client = await targetPool.connect();
+        try {
+          const res = await client.query('SELECT * FROM documents WHERE id = $1', [documentId]);
+          if (res.rows.length === 0) {
+            return { isError: true, content: [{ type: 'text', text: `Document ${documentId} not found` }] };
+          }
+          return { content: [{ type: 'text', text: JSON.stringify(res.rows[0]) }] };
+        } finally {
+          client.release();
+        }
+      }
+    });
     ```
 
 

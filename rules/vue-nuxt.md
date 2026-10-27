@@ -2578,6 +2578,24 @@ alwaysApply: false
         </button>
       </form>
     </template>
+
+    <!-- Nuxt 3 Server Route & Client Read-After-Write Consistency -->
+    <!-- server/api/posts.post.ts sets sticky epoch cookie; server/api/posts.get.ts reads from Primary if cookie active -->
+    <script setup lang="ts">
+    // Nuxt 3 Client page with refreshNuxtData()
+    const { data: posts, refresh } = await useFetch('/api/posts');
+
+    async function handleAddPost(title: string) {
+      // POST endpoint sets 'x-db-write-epoch' cookie
+      await $fetch('/api/posts', {
+        method: 'POST',
+        body: { title },
+      });
+      // Immediate re-fetch: Server API will inspect 'x-db-write-epoch' and query Primary DB,
+      // avoiding stale read / missing new item from asynchronous read replica!
+      await refresh();
+    }
+    </script>
     ```
 
 

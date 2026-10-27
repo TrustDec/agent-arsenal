@@ -2975,6 +2975,56 @@ alwaysApply: false
         }
         return ids, rows.Err()
     }
+
+    // Read-After-Write Consistency: Sticky Primary & Causal LSN Context Routing
+    type ReplicaRouter struct {
+        primary  *pgxpool.Pool
+        replicas []*pgxpool.Pool
+        nextIdx  uint64
+        stickyDuration time.Duration
+    }
+
+    type causalContextKey string
+    const (
+        ctxStickyExpiryKey causalContextKey = "db:sticky_expiry"
+        ctxCausalLSNKey     causalContextKey = "db:causal_lsn"
+    )
+
+    func WithStickyPrimary(ctx context.Context, dur time.Duration) context.Context {
+        return context.WithValue(ctx, ctxStickyExpiryKey, time.Now().Add(dur))
+    }
+
+    func WithCausalLSN(ctx context.Context, lsn string) context.Context {
+        return context.WithValue(ctx, ctxCausalLSNKey, lsn)
+    }
+
+    func (r *ReplicaRouter) RouteReadPool(ctx context.Context) *pgxpool.Pool {
+        // Invariant 1: If session wrote within sticky duration, pin to Primary
+        if expiry, ok := ctx.Value(ctxStickyExpiryKey).(time.Time); ok && time.Now().Before(expiry) {
+            return r.primary
+        }
+
+        if len(r.replicas) == 0 {
+            return r.primary
+        }
+
+        // Round-robin replica selection
+        idx := atomic.AddUint64(&r.nextIdx, 1) % uint64(len(r.replicas))
+        selected := r.replicas[idx]
+
+        // Invariant 2: Verify causal LSN if provided
+        if targetLSN, ok := ctx.Value(ctxCausalLSNKey).(string); ok && targetLSN != "" {
+            var caughtUp bool
+            err := selected.QueryRow(ctx, 
+                "SELECT pg_wal_lsn_diff(pg_last_wal_replay_lsn(), $1::pg_lsn) >= 0", targetLSN).Scan(&caughtUp)
+            if err != nil || !caughtUp {
+                // Replica lagging behind causal mutation -> Fallback to Primary
+                return r.primary
+            }
+        }
+
+        return selected
+    }
     ```
 
 

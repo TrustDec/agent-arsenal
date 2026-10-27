@@ -1814,6 +1814,29 @@ alwaysApply: false
     RETURNING id, payload, attempts;
     ```
 
+- **Read-After-Write Consistency, Replica Lag Fencing & Causal Read Routing**:
+  - ❌ **Anti-Pattern: Blind Replica Routing & 404 Mirages**: Routing all `SELECT` queries to an asynchronous read replica immediately following an `INSERT` or `UPDATE`, causing intermittent 404 Not Found errors or data reversion due to replication lag ($\tau_{\text{lag}} \in [50\text{ms}, 2000\text{ms}]$).
+  - ✅ **Production Invariant**: Return fresh mutation projections immediately via `RETURNING *` (0 read roundtrips), pin client sessions to the Primary writer for $T_{\text{sticky}} \ge 5.0\text{s}$ following any write, capture the Primary WAL Log Sequence Number via `pg_current_wal_lsn()`, and verify replica replay readiness with `pg_last_wal_replay_lsn()` before serving reads from replicas:
+    ```sql
+    -- 1. Single-Statement Write-Through Return (Eliminates subsequent read roundtrips)
+    INSERT INTO orders (user_id, status, total_cents) 
+    VALUES ('a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d'::UUID, 'pending', 9900)
+    RETURNING id, user_id, status, total_cents, created_at;
+
+    -- 2. Capture Primary WAL LSN for Causal Session Fencing
+    SELECT pg_current_wal_lsn()::text AS commit_lsn;
+
+    -- 3. Verify Replica Replay Readiness before Dispatching Read
+    -- Returns TRUE if replica has replayed at or beyond the client's causal mutation LSN
+    SELECT pg_wal_lsn_diff(pg_last_wal_replay_lsn(), '0/1A2B3C4D'::pg_lsn) >= 0 AS caught_up;
+
+    -- 4. Monitor Replication Lag in Seconds & Byte Offset
+    SELECT 
+        EXTRACT(EPOCH FROM (clock_timestamp() - pg_last_xact_replay_timestamp())) AS lag_seconds,
+        pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()) AS replay_pending_bytes;
+    ```
+
+
 
 
 

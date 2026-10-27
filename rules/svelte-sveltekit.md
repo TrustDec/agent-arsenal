@@ -2904,6 +2904,37 @@ alwaysApply: false
         }
       },
     };
+
+    // SvelteKit Read-After-Write Consistency: Sticky Primary Session Cookie & InvalidateAll
+    // When executing mutations in Form Actions, set a short-lived sticky write epoch cookie.
+    // In load() functions, check the cookie to decide whether to query Primary vs Replica,
+    // preventing stale data during immediate client-side invalidateAll() navigations.
+    export const actionsWithSticky: Actions = {
+      create: async ({ request, cookies }) => {
+        const formData = await request.formData();
+        const text = formData.get('text') as string;
+
+        const client = await dbPoolPrimary.connect();
+        try {
+          const res = await client.query(
+            'INSERT INTO posts (content, created_at) VALUES ($1, NOW()) RETURNING id, content, created_at',
+            [text]
+          );
+
+          // Set 5-second sticky write epoch cookie to pin subsequent SSR load() to Primary
+          cookies.set('x-db-write-epoch', Date.now().toString(), {
+            path: '/',
+            maxAge: 5,
+            httpOnly: true,
+            sameSite: 'lax',
+          });
+
+          return { success: true, post: res.rows[0] };
+        } finally {
+          client.release();
+        }
+      },
+    };
     ```
 
 
