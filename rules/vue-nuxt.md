@@ -2172,6 +2172,49 @@ alwaysApply: false
       return { execute, isSubmitting, idempotencyKey: readonly(idempotencyKey) };
     }
     ```
+- **Async Concurrency Fencing & Stale Action Cancellation (`useConcurrentFencing`)**:
+  - ❌ **Anti-Pattern: Unfenced Rapid Async State Updates (Out-of-Order Race Condition)**: When a user quickly toggles search filters, tabs, or pagination, multiple asynchronous requests fly concurrently. If request #1 returns after request #2 due to variable network latency, request #1's stale data overwrites request #2's fresh state.
+  - ✅ **Production Invariant**: Implement a concurrency fencing composable with monotonic generation tokens and `AbortController`. Reject any resolved response whose generation token is older than the latest initiated action:
+    ```typescript
+    // composables/useConcurrentFencing.ts
+    export function useConcurrentFencing<TArgs extends any[], TResult>(
+      asyncFn: (signal: AbortSignal, ...args: TArgs) => Promise<TResult>
+    ) {
+      const latestToken = ref(0);
+      let activeController: AbortController | null = null;
+      const data = ref<TResult | null>(null);
+      const isLoading = ref(false);
+
+      async function trigger(...args: TArgs): Promise<TResult | null> {
+        // Abort previous in-flight request
+        if (activeController) {
+          activeController.abort();
+        }
+        activeController = new AbortController();
+        const currentToken = ++latestToken.value;
+        isLoading.value = true;
+
+        try {
+          const result = await asyncFn(activeController.signal, ...args);
+          // Fencing invariant: ignore if a newer execution was triggered
+          if (currentToken !== latestToken.value) {
+            return null;
+          }
+          data.value = result;
+          return result;
+        } catch (err: any) {
+          if (err.name === 'AbortError') return null;
+          throw err;
+        } finally {
+          if (currentToken === latestToken.value) {
+            isLoading.value = false;
+          }
+        }
+      }
+
+      return { trigger, data: readonly(data), isLoading: readonly(isLoading) };
+    }
+    ```
 
 
 

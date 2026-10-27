@@ -1553,6 +1553,27 @@ alwaysApply: false
     -- Returns true if acquired immediately; false if held by another concurrent transaction.
     -- Released automatically upon COMMIT or ROLLBACK of current transaction!
     ```
+- **Storage-Level Monotonic Fencing Token Check Against Lease Expiry (`WHERE fencing_token < :token`)**:
+  - ❌ **Anti-Pattern: Unconditional Writes Guarded Only by Application Locks**: Believing that holding an in-memory lock or distributed Redis lease makes `UPDATE items SET quantity = quantity - :qty WHERE id = :id` safe without checking fencing versions. If a network blip or GC pause causes the lock lease to expire, another node acquires the lock and proceeds. The delayed node then executes its update, overwriting newer state without detection.
+  - ✅ **Production Invariant**: Every mutable row guarded by distributed leases MUST maintain a `fencing_token BIGINT NOT NULL DEFAULT 0`. The database write MUST enforce monotonic progression:
+    ```sql
+    UPDATE inventory_items
+    SET quantity = quantity - 5,
+        fencing_token = :fencing_token,
+        updated_at = NOW()
+    WHERE id = :item_id
+      AND fencing_token < :fencing_token;
+    -- If 0 rows updated, the storage engine detects an outdated lease and rejects the stale write!
+    ```
+- **PostgreSQL Multi-Resource Advisory Lock Sorting Invariant (`ORDER BY hashtext`)**:
+  - ❌ **Anti-Pattern: Unsorted Advisory Lock Acquisition in Distributed Transactions**: When reserving multiple database resources, acquiring advisory locks in arbitrary order: `SELECT pg_advisory_xact_lock(hashtext(a)); SELECT pg_advisory_xact_lock(hashtext(b));`. Concurrent transactions with reversed arguments produce PostgreSQL deadlock exceptions (`40P01 deadlocks detected`).
+  - ✅ **Production Invariant**: Deterministically sort all resource keys using `ORDER BY hashtext(resource_key)` before acquiring transaction-level advisory locks:
+    ```sql
+    -- Atomic deadlock-free multi-resource advisory locking:
+    SELECT pg_advisory_xact_lock(hashtext(resource_key))
+    FROM unnest(ARRAY['account_001', 'account_002', 'order_999']) AS resource_key
+    ORDER BY hashtext(resource_key) ASC;
+    ```
 
 
 

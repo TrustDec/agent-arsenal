@@ -1239,6 +1239,44 @@ alwaysApply: false
       }
     );
     ```
+- **Serialized Mutating Tool Execution via Named In-Process Mutexes**:
+  - ❌ **Anti-Pattern: Concurrent Non-Thread-Safe Mutating Tool Calls in Multi-Agent Loops**: When an autonomous orchestrator runs multiple parallel sub-agents or issues concurrent tool calls (`tools/call`) mutating the same local repository or workspace state (e.g. `git checkout`, `npm install`, file writing), executing them without serialization causes file system corruptions, git index lock collisions (`.git/index.lock`), or partial writes.
+  - ✅ **Production Invariant**: Implement a keyed in-process mutex manager inside the MCP server. Mutating tools acquiring workspace resources MUST serialize operations with unique locks and timeouts:
+    ```typescript
+    class KeyedMutex {
+      private locks = new Map<string, Promise<void>>();
+
+      async runExclusive<T>(key: string, task: () => Promise<T>): Promise<T> {
+        while (this.locks.has(key)) {
+          await this.locks.get(key);
+        }
+        let release: () => void;
+        const lockPromise = new Promise<void>((resolve) => { release = resolve; });
+        this.locks.set(key, lockPromise);
+
+        try {
+          return await task();
+        } finally {
+          this.locks.delete(key);
+          release!();
+        }
+      }
+    }
+
+    const workspaceMutex = new KeyedMutex();
+
+    server.tool(
+      'git_apply_patch',
+      'Applies a patch safely with exclusive workspace lock',
+      z.object({ patch: z.string() }).shape,
+      async (args) => {
+        return workspaceMutex.runExclusive('workspace-git', async () => {
+          // Guaranteed single-agent exclusive execution; zero .git/index.lock contention!
+          return await applyGitPatch(args.patch);
+        });
+      }
+    );
+    ```
 
 
 

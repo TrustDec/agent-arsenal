@@ -2522,6 +2522,55 @@ alwaysApply: false
         return c.count
     }
     ```
+- **Distributed Concurrency Fencing & Monotonic Version Checks in SQL (`pgx`)**:
+  - ❌ **Anti-Pattern: Blind State Overwrite After Distributed Lock Acquisition**: Acquiring a distributed Redis or etcd lock and then running `UPDATE accounts SET balance = $1 WHERE id = $2` without monotonic fencing token verification. If a Go runtime GC pause or thread stall exceeds the lock lease TTL, another goroutine/node acquires the lock, and the delayed write clobbers newer balance state.
+  - ✅ **Production Invariant**: Always issue SQL mutations with monotonic fencing checks `WHERE id = $1 AND fencing_token < $2`. Inspect `cmdTag.RowsAffected()`; if 0 rows are updated, raise `ErrStaleFencingToken` to abort the operation and trigger compensation:
+    ```go
+    // Monotonic fencing verification with pgx in Go:
+    func (s *AccountService) DeductBalance(ctx context.Context, accountID string, amount decimal.Decimal, fenceToken uint64) error {
+        tag, err := s.db.Exec(ctx, `
+            UPDATE bank_accounts
+            SET balance = balance - $1,
+                fencing_token = $2,
+                updated_at = NOW()
+            WHERE id = $3
+              AND fencing_token < $2;
+        `, amount, fenceToken, accountID)
+        if err != nil {
+            return fmt.Errorf("failed executing balance deduction: %w", err)
+        }
+        if tag.RowsAffected() == 0 {
+            return fmt.Errorf("stale fencing token %d: account %s was mutated by newer lease", fenceToken, accountID)
+        }
+        return nil
+    }
+    ```
+- **Lexicographical Mutex Sorting for Cycle-Free Multi-Lock Acquisition**:
+  - ❌ **Anti-Pattern: Acquiring Multiple Locks in Caller-Provided Argument Order**: Implementing operations like `Transfer(ctx, fromID, toID)` by directly locking `fromID.mu.Lock()` followed by `toID.mu.Lock()`. When concurrent callers invoke `Transfer(A, B)` and `Transfer(B, A)` simultaneously, goroutines deadlock immediately.
+  - ✅ **Production Invariant**: Deterministically sort resource identifiers lexicographically before acquiring mutexes:
+    ```go
+    func (m *AccountManager) Transfer(ctx context.Context, fromID, toID string, amount decimal.Decimal) error {
+        if fromID == toID {
+            return errors.New("cannot transfer to self")
+        }
+
+        firstID, secondID := fromID, toID
+        if firstID > secondID {
+            firstID, secondID = toID, fromID
+        }
+
+        firstLock := m.getLock(firstID)
+        secondLock := m.getLock(secondID)
+
+        firstLock.Lock()
+        defer firstLock.Unlock()
+
+        secondLock.Lock()
+        defer secondLock.Unlock()
+
+        return m.executeTransfer(ctx, fromID, toID, amount)
+    }
+    ```
 
 
 

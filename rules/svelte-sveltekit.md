@@ -2520,6 +2520,45 @@ alwaysApply: false
       </button>
     </form>
     ```
+- **Svelte 5 Concurrency Fencing & Stale Async Race Condition Defense with Runes**:
+  - ❌ **Anti-Pattern: Async Fetch Race Condition Overwriting Reactive State**: Calling `fetch()` inside event handlers or `$effect` without fencing tokens. If slower network responses arrive out of sequence, obsolete search or filter results overwrite the most recent user action.
+  - ✅ **Production Invariant**: Use monotonic sequence counters and `AbortController` in Svelte 5 runes to fence out-of-order async responses:
+    ```svelte
+    <script lang="ts">
+    let query = $state('');
+    let results = $state<string[]>([]);
+    let isPending = $state(false);
+
+    let activeSequence = 0;
+    let abortController: AbortController | null = null;
+
+    async function handleSearch(searchQuery: string) {
+      if (abortController) abortController.abort();
+      abortController = new AbortController();
+
+      const sequence = ++activeSequence;
+      isPending = true;
+
+      try {
+        const response = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}`, {
+          signal: abortController.signal
+        });
+        const data = await response.json();
+
+        // Concurrency fence: strictly discard if newer query dispatched
+        if (sequence !== activeSequence) return;
+        results = data.items;
+      } catch (err: any) {
+        if (err.name === 'AbortError') return;
+        console.error('Search failure:', err);
+      } finally {
+        if (sequence === activeSequence) {
+          isPending = false;
+        }
+      }
+    }
+    </script>
+    ```
 
 
 
