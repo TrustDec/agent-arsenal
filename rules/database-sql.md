@@ -1626,6 +1626,47 @@ alwaysApply: false
       AND state = 'idle in transaction'
       AND state_change < NOW() - INTERVAL '15 seconds';
     ```
+- **Durable Dead-Letter Queue (DLQ) Schema, Keyset Redrive Fencing & FOR UPDATE SKIP LOCKED Consumption**:
+  - ❌ **Anti-Pattern: Transient In-Memory Error Dropping or Full-Table Lock Redrives**: Storing failed asynchronous events in memory or unindexed error tables, or executing redrives with monolithic unindexed `UPDATE errors SET retried = true` queries that lock thousands of rows and block concurrent ingestion workers.
+  - ✅ **Production Invariant**: Implement durable DLQ tables with `jsonb` payloads, SHA-256 payload digests, structured error taxonomy, and keyset cursor paging with `FOR UPDATE SKIP LOCKED` for zero-contention concurrent canary redrive workers:
+    ```sql
+    -- Industrial PostgreSQL Dead Letter Queue Table & Concurrent Batched Redrive
+    CREATE TABLE IF NOT EXISTS dead_letter_events (
+        dlq_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        topic VARCHAR(255) NOT NULL,
+        payload JSONB NOT NULL,
+        payload_sha256 CHAR(64) NOT NULL,
+        attempt_count INT NOT NULL DEFAULT 1,
+        error_category VARCHAR(64) NOT NULL,
+        error_message TEXT NOT NULL,
+        traceparent VARCHAR(128),
+        status VARCHAR(32) NOT NULL DEFAULT 'QUARANTINED',
+        quarantined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_dlq_topic_quarantined 
+      ON dead_letter_events (topic, quarantined_at) 
+      WHERE status = 'QUARANTINED';
+
+    -- Non-blocking batched reservation for concurrent redrive workers
+    WITH leased_batch AS (
+        SELECT dlq_id
+        FROM dead_letter_events
+        WHERE topic = 'orders.v1'
+          AND status = 'QUARANTINED'
+        ORDER BY quarantined_at ASC
+        LIMIT 25
+        FOR UPDATE SKIP LOCKED
+    )
+    UPDATE dead_letter_events d
+    SET status = 'REDRIVING',
+        updated_at = NOW()
+    FROM leased_batch b
+    WHERE d.dlq_id = b.dlq_id
+    RETURNING d.dlq_id, d.payload, d.traceparent;
+    ```
+
 
 
 

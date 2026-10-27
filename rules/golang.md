@@ -2672,6 +2672,32 @@ alwaysApply: false
         return nil
     }
     ```
+- **Kafka / Broker Poison Pill Quarantine, Non-Blocking Retry Routing & W3C Traceparent DLQ Enrichment**:
+  - ❌ **Anti-Pattern: Synchronous Retry Sleeps & Infinite Crash-Loop Requeuing**: Sleeping inside the Kafka/consumer loop (`time.Sleep(5 * time.Second)`) upon transient downstream failure, stalling the partition offset for all healthy tenant records, or executing `nack(requeue=true)` on un-parseable JSON payloads causing 10,000 crashes per minute.
+  - ✅ **Production Invariant**: Triage deterministic syntax/deserialization errors directly to the Dead Letter Queue on attempt 1. Route transient errors to exponential non-blocking retry topics (`topic.retry-10s`), commit the primary partition offset immediately, and enrich DLQ records with SHA-256 digests and W3C traceparents:
+    ```go
+    // Industrial Poison Pill Quarantine & Non-Blocking Retry Routing in Go
+    func HandleIncomingMessage(ctx context.Context, msg kafka.Message, dlqWriter, retryWriter *kafka.Writer) error {
+        var event DomainEvent
+        // 1. Poison pill detection: un-parseable JSON goes directly to DLQ
+        if err := json.Unmarshal(msg.Value, &event); err != nil {
+            return publishDLQ(ctx, dlqWriter, msg, "DETERMINISTIC_SCHEMA", err, 1)
+        }
+
+        attempt := getAttemptHeader(msg) // e.g. from x-delivery-count or x-attempt
+        const maxAttempts = 3
+
+        if err := processDomainEvent(ctx, event); err != nil {
+            if attempt >= maxAttempts {
+                return publishDLQ(ctx, dlqWriter, msg, "MAX_ATTEMPTS_EXHAUSTED", err, attempt)
+            }
+            // 2. Non-blocking delayed retry topic avoids Head-of-Line partition stall
+            return publishDelayedRetry(ctx, retryWriter, msg, attempt+1)
+        }
+        return nil
+    }
+    ```
+
 
 
 

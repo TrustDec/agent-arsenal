@@ -2646,6 +2646,31 @@ alwaysApply: false
       });
     }
     ```
+- **SvelteKit Server Actions & Background Job DLQ Dead-Letter Boundary**:
+  - ❌ **Anti-Pattern: Blind Unhandled Action Crashes & Unlogged Queue Failures**: Letting background tasks or webhook handlers triggered by SvelteKit actions fail silently without capturing failure taxonomy or allowing admin operators to replay dead-lettered events.
+  - ✅ **Production Invariant**: Isolate async worker and server action failures, wrap failed jobs into structured diagnostic envelopes, and provide authenticated canary redrive endpoints bounded by rate limiters:
+    ```typescript
+    // src/routes/api/admin/dlq/redrive/+server.ts - Rate-Limited Canary Redrive Endpoint
+    import { json, error } from '@sveltejs/kit';
+    import type { RequestHandler } from './$types';
+
+    export const POST: RequestHandler = async ({ request, locals }) => {
+      if (!locals.user?.isAdmin) throw error(403, 'Unauthorized');
+
+      const { dlqId, dryRun } = await request.json();
+      const deadLetter = await locals.db.deadLetterEvents.findUnique({ where: { dlqId } });
+      if (!deadLetter) throw error(404, 'Dead letter record not found');
+
+      // Dispatch canary redrive with explicit X-Redrive-Attempt header
+      const outcome = await replayDomainEvent(deadLetter.payload, {
+        isCanary: dryRun ?? true,
+        traceparent: deadLetter.traceparent
+      });
+
+      return json({ dlqId, status: outcome.success ? 'REPLAY_SUCCEEDED' : 'REPLAY_FAILED' });
+    };
+    ```
+
 
 
 

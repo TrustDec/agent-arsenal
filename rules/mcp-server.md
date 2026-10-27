@@ -1344,6 +1344,32 @@ alwaysApply: false
       });
     }
     ```
+- **MCP Poison Tool-Call Quarantine, Dead-Letter Execution Logging & Stdio Transport Isolation**:
+  - ❌ **Anti-Pattern: Uncaught Tool Exception Severing Stdio JSON-RPC Stream**: Allowing an unhandled tool exception or OOM in a tool handler to crash the MCP server process, severing the stdio JSON-RPC pipe and breaking the entire host agent session (Claude Desktop, Cursor, Pi).
+  - ✅ **Production Invariant**: Enclose all tool dispatches in an execution boundary that catches poison inputs, routes diagnostic details (tool name, arguments hash, error stack) to a local dead-letter audit buffer, and returns a structured JSON-RPC error response with `isError: true` so the model can self-correct without crashing the transport:
+    ```typescript
+    // Industrial MCP Poison Tool-Call Quarantine & Safe Error Framing
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      const { name, arguments: args } = request.params;
+      const callHash = crypto.createHash('sha256').update(JSON.stringify({ name, args })).digest('hex').slice(0, 16);
+
+      try {
+        const result = await executeToolWithTimeout(name, args, 30000);
+        return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+      } catch (err: any) {
+        // Quarantine poison tool call into diagnostic dead-letter log
+        console.error(`[MCP DLQ] Tool "${name}" call ${callHash} failed:`, err.message);
+        return {
+          isError: true,
+          content: [{
+            type: 'text',
+            text: `Tool execution failed [call_id: ${callHash}]: ${err.message}. Please refine your arguments.`
+          }]
+        };
+      }
+    });
+    ```
+
 
 
 

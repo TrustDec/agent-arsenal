@@ -2315,6 +2315,37 @@ alwaysApply: false
       });
     });
     ```
+- **Nuxt Nitro Event Ingestion DLQ Boundary & Admin Redrive Composables**:
+  - ❌ **Anti-Pattern: Unchecked Bulk Replay from Admin UI Crushing Backend Services**: Triggering unconstrained client-side loops (`for id in ids: await fetch('/api/redrive', ...)`) from a Nuxt admin page without rolling error rate checks or progress streaming, knocking down the backend service.
+  - ✅ **Production Invariant**: Implement typed DLQ management composables (`useDeadLetterQueue`) that stream redrive progress via SSE, monitor error rates in real-time, and trip an internal circuit breaker if the failure rate exceeds $2\%$:
+    ```typescript
+    // composables/useDeadLetterQueue.ts - Resilient DLQ Canary Redrive Composable
+    export function useDeadLetterQueue(topic: string) {
+      const isRedriving = ref(false);
+      const circuitTripped = ref(false);
+      const redriveStats = ref({ attempted: 0, succeeded: 0, failed: 0 });
+
+      async function triggerCanaryRedrive(batchSize = 5) {
+        isRedriving.value = true;
+        circuitTripped.value = false;
+
+        const { data, error } = await useFetch('/api/admin/dlq/canary', {
+          method: 'POST',
+          body: { topic, batchSize }
+        });
+
+        if (error.value || (data.value && data.value.failureRate > 0.20)) {
+          circuitTripped.value = true;
+          console.error('[DLQ] Canary redrive aborted: failure rate exceeded 20% limit');
+        }
+        isRedriving.value = false;
+        return data.value;
+      }
+
+      return { isRedriving: readonly(isRedriving), circuitTripped: readonly(circuitTripped), triggerCanaryRedrive };
+    }
+    ```
+
 
 
 
