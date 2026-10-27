@@ -1465,6 +1465,49 @@ alwaysApply: false
     });
     ```
 
+- **Database Connection Pool Scoping & Leak Elimination in MCP Database Tools**:
+  - ❌ **Anti-Pattern: Leaking Connections Across Tool Invocations**: Acquiring direct database client connections inside MCP tool handlers without guaranteed `try/finally` release, exhausting pool connections across multiple agent prompt loops until the entire MCP server freezes.
+  - ✅ **Production Invariant**: Always wrap MCP database tools in scoped transaction/connection helpers with bounded acquisition timeouts and explicit connection return:
+    ```typescript
+    // Industrial MCP Database Tool with Scoped Leak-Proof Pool Execution
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      if (request.params.name !== 'query_database') return;
+
+      const { sql, params } = request.params.arguments as { sql: string; params?: any[] };
+
+      // Enforce read-only safety for general query tool
+      if (!/^\s*(SELECT|WITH)\b/i.test(sql)) {
+        return {
+          content: [{ type: 'text', text: 'Error: Only SELECT queries permitted in read-only tool' }],
+          isError: true,
+        };
+      }
+
+      // Scoped checkout: connection release guaranteed even if serialization throws
+      const client = await dbPool.connect();
+      try {
+        // Enforce 5s query deadline inside MCP tool
+        await client.query('SET LOCAL statement_timeout = 5000');
+        const res = await client.query(sql, params);
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ rowCount: res.rowCount, rows: res.rows }),
+          }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{ type: 'text', text: `Database error: ${err.message}` }],
+          isError: true,
+        };
+      } finally {
+        client.release(); // Crucial: connection always returned to pool
+      }
+    });
+    ```
+
+
 
 
 

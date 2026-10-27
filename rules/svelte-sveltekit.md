@@ -2753,6 +2753,49 @@ alwaysApply: false
     };
     ```
 
+- **SvelteKit Server Route Database Connection Scoping & PgBouncer Safety**:
+  - ❌ **Anti-Pattern: Creating Ad-Hoc Connection Pools or Abandoned Transactions in `+page.server.ts`**: Initializing `new Pool()` inside route loaders or failing to release connections when a server action errors out, quickly exhausting database connections during SSR rendering spikes.
+  - ✅ **Production Invariant**: Maintain a singleton database pool instance in `$lib/server/db.ts`, execute all mutations in scoped transaction helpers, and ensure `event.locals` carries pre-scoped transaction contexts:
+    ```typescript
+    // src/routes/api/orders/+server.ts
+    import { json, error } from '@sveltejs/kit';
+    import { pool } from '$lib/server/db';
+    import type { RequestHandler } from './$types';
+
+    export const POST: RequestHandler = async ({ request }) => {
+      const { customerId, items } = await request.json();
+
+      // Scoped connection acquisition: guarantees release on route completion or error
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query('SET LOCAL statement_timeout = 3000');
+
+        const orderRes = await client.query(
+          'INSERT INTO orders (customer_id, status) VALUES ($1, $2) RETURNING id',
+          [customerId, 'pending']
+        );
+        const orderId = orderRes.rows[0].id;
+
+        for (const item of items) {
+          await client.query(
+            'INSERT INTO order_items (order_id, product_id, quantity) VALUES ($1, $2, $3)',
+            [orderId, item.productId, item.quantity]
+          );
+        }
+
+        await client.query('COMMIT');
+        return json({ orderId, status: 'created' });
+      } catch (err: any) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error(500, `Transaction aborted: ${err.message}`);
+      } finally {
+        client.release(); // Crucial: prevent connection pool exhaustion in SSR workloads
+      }
+    };
+    ```
+
+
 
 
 

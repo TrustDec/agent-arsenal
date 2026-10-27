@@ -2407,6 +2407,46 @@ alwaysApply: false
     }
     ```
 
+- **Nuxt 3 Nitro Server Handlers Database Connection Scoping & Transaction Safety**:
+  - ❌ **Anti-Pattern: Unscoped Connection Checkouts in Nitro Handlers**: Calling `const client = await pool.connect()` inside `server/api/...` without a guaranteed `finally { client.release() }`, causing connection leaks on client disconnection or validation errors.
+  - ✅ **Production Invariant**: Use a shared server plugin singleton (`server/plugins/database.ts`) with a scoped transaction utility `withScopedTransaction`:
+    ```typescript
+    // server/api/billing/charge.post.ts
+    import { defineEventHandler, readBody, createError } from 'h3';
+    import { dbPool } from '~/server/utils/db';
+
+    export default defineEventHandler(async (event) => {
+      const body = await readBody(event);
+
+      // Scoped database lease: connection release guaranteed on error, abort, or success
+      const client = await dbPool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query('SET LOCAL statement_timeout = 5000');
+
+        const user = await client.query('SELECT balance FROM users WHERE id = $1 FOR UPDATE', [body.userId]);
+        if (!user.rows[0] || user.rows[0].balance < body.amount) {
+          throw createError({ statusCode: 400, message: 'Insufficient funds' });
+        }
+
+        await client.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [body.amount, body.userId]);
+        await client.query('INSERT INTO transactions (user_id, amount) VALUES ($1, $2)', [body.userId, body.amount]);
+
+        await client.query('COMMIT');
+        return { success: true };
+      } catch (err: any) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw createError({
+          statusCode: err.statusCode || 500,
+          message: err.message || 'Billing transaction failed',
+        });
+      } finally {
+        client.release(); // Crucial: return connection to pool immediately
+      }
+    });
+    ```
+
+
 
 
 

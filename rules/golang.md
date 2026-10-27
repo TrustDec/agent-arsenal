@@ -2780,6 +2780,55 @@ alwaysApply: false
     }
     ```
 
+- **PostgreSQL Connection Pool (`pgxpool`), Scoped Transaction Hygiene & Leak Elimination**:
+  - ❌ **Anti-Pattern: Leaked `pgx.Conn` / `rows` & Unbounded Connection Spikes**: Calling `pool.Acquire(ctx)` without immediate `defer conn.Release()`, forgetting `defer rows.Close()`, or initiating transactions without `defer tx.Rollback(ctx)`, permanently trapping connection slots until the pool starves.
+  - ✅ **Production Invariant**: Enforce strict RAII transaction runners with automatic rollback, connection acquisition deadlines, and runtime parameters preventing `idle in transaction` stalls:
+    ```go
+    // Industrial pgxpool Configuration with Hard Sizing & Timeout Boundaries
+    func InitProductionPgxPool(ctx context.Context, dsn string, maxConns int32) (*pgxpool.Pool, error) {
+        cfg, err := pgxpool.ParseConfig(dsn)
+        if err != nil {
+            return nil, fmt.Errorf("parse dsn: %w", err)
+        }
+
+        // Little's Law / Hardware Sizing: maxConns = (2 * CPU cores) + disk spindles
+        cfg.MaxConns = maxConns
+        cfg.MinConns = 2
+        cfg.MaxConnIdleTime = 5 * time.Minute
+        cfg.MaxConnLifetime = 30 * time.Minute
+        cfg.MaxConnLifetimeJitter = 5 * time.Minute // Prevent synchronized expiration stampedes
+        cfg.HealthCheckPeriod = 1 * time.Minute
+
+        // Server-Side Guardrails (Anti-Idle-In-Transaction Lock Freezing)
+        cfg.ConnConfig.ConnectTimeout = 2 * time.Second
+        cfg.ConnConfig.RuntimeParams = map[string]string{
+            "idle_in_transaction_session_timeout": "5000", // 5s max idle lock duration
+            "statement_timeout":                   "10000", // 10s max execution boundary
+            "lock_timeout":                        "2000",  // 2s lock queue ceiling
+        }
+
+        return pgxpool.NewWithConfig(ctx, cfg)
+    }
+
+    // Leak-Proof Scoped Transaction Helper
+    func WithinTx(ctx context.Context, pool *pgxpool.Pool, fn func(tx pgx.Tx) error) error {
+        acquireCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+        defer cancel()
+
+        tx, err := pool.Begin(acquireCtx)
+        if err != nil {
+            return fmt.Errorf("failed to begin transaction: %w", err)
+        }
+        defer tx.Rollback(ctx) // Safe: no-op if tx.Commit() has already succeeded
+
+        if err := fn(tx); err != nil {
+            return err
+        }
+        return tx.Commit(ctx)
+    }
+    ```
+
+
 
 
 

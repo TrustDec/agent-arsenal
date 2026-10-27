@@ -1731,6 +1731,34 @@ alwaysApply: false
     $$ LANGUAGE plpgsql;
     ```
 
+- **PgBouncer Transaction-Mode Compatibility, Session Pinning & Leak Defense**:
+  - ❌ **Anti-Pattern: Session State Mutations in Transaction Pooling**: Running `SET search_path = ...`, `SET timezone = ...`, `LISTEN/NOTIFY`, or un-named prepared statements in PgBouncer transaction mode (`pool_mode = transaction`), corrupting shared physical connections across different client requests or triggering permanent server connection pinning.
+  - ✅ **Production Invariant**: Use transaction-scoped `SET LOCAL`, enforce `server_reset_query = DISCARD ALL`, mandate `idle_in_transaction_session_timeout`, and isolate pub/sub to dedicated session pools:
+    ```sql
+    -- Transaction-safe tenant context setting in PgBouncer transaction pooling mode
+    -- NEVER use "SET app.current_tenant = ...", which persists across transactions!
+    BEGIN;
+      -- SET LOCAL automatically rolls back when transaction commits or aborts
+      SET LOCAL app.current_tenant_id = 'a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d';
+      
+      SELECT * FROM tenant_records 
+      WHERE tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::UUID;
+    COMMIT;
+
+    -- Query to detect and terminate runaway connections stuck in "idle in transaction"
+    SELECT 
+        pid, 
+        usename, 
+        client_addr, 
+        state, 
+        NOW() - state_change AS idle_duration,
+        query
+    FROM pg_stat_activity
+    WHERE state = 'idle in transaction'
+      AND (NOW() - state_change) > INTERVAL '10 seconds';
+    ```
+
+
 
 
 
