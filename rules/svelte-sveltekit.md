@@ -3308,4 +3308,63 @@ alwaysApply: false
         </div>
       </div>
     </div>
+
+    <!-- Svelte 5 Row-Level Security (RLS) & Multi-Tenant Sentinel Component -->
+    <script lang="ts">
+      interface RLSTableStatus {
+        tableName: string;
+        isRLSEnabled: boolean;
+        isRLSForced: boolean;
+        policyCount: number;
+        hasLeftmostTenantIndex: boolean;
+        isCompliant: boolean;
+        violations: string[];
+      }
+
+      let { rlsTable } = $props<{ rlsTable: RLSTableStatus }>();
+
+      let isOwnerBypassRisk = $derived(rlsTable.isRLSEnabled && !rlsTable.isRLSForced);
+      let isSeqScanRisk = $derived(!rlsTable.hasLeftmostTenantIndex);
+      let statusTheme = $derived(rlsTable.isCompliant ? 'success' : 'danger');
+    </script>
+
+    <div class="rls-audit-card" class:warning={isOwnerBypassRisk} class:critical={!rlsTable.isRLSEnabled || isSeqScanRisk}>
+      <header>
+        <h4>Relation: {rlsTable.tableName}</h4>
+        <span class={`badge ${statusTheme}`}>
+          {rlsTable.isCompliant ? 'SECURE' : 'VULNERABLE'}
+        </span>
+      </header>
+
+      {#if !rlsTable.isRLSEnabled}
+        <div class="alert danger">
+          <strong>Critical Isolation Breach:</strong> RLS is completely disabled on this multi-tenant relation!
+        </div>
+      {:else if isOwnerBypassRisk}
+        <div class="alert warning">
+          <strong>Owner Bypass Hazard:</strong> Table lacks FORCE ROW LEVEL SECURITY; administrative connections bypass filters.
+        </div>
+      {/if}
+
+      {#if isSeqScanRisk}
+        <div class="alert warning">
+          <strong>Performance Risk:</strong> Missing leftmost index on tenant_id; queries risk full sequential table scans.
+        </div>
+      {/if}
+
+      <div class="metrics-grid">
+        <div class="metric">
+          <label>RLS Forced</label>
+          <span class="value">{rlsTable.isRLSForced ? 'YES (Protected)' : 'NO (Vulnerable)'}</span>
+        </div>
+        <div class="metric">
+          <label>Active Policies</label>
+          <span class="value">{rlsTable.policyCount}</span>
+        </div>
+        <div class="metric">
+          <label>Leftmost Tenant Index</label>
+          <span class="value">{rlsTable.hasLeftmostTenantIndex ? 'OPTIMAL' : 'MISSING'}</span>
+        </div>
+      </div>
+    </div>
     ```

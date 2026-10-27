@@ -2240,3 +2240,59 @@ alwaysApply: false
     ALTER SYSTEM SET logical_decoding_work_mem = '131072kB';
     SELECT pg_reload_conf();
     ```
+
+- **Row-Level Security (RLS), `FORCE ROW LEVEL SECURITY` & Multi-Tenant Isolation Invariants**:
+  - ❌ **Anti-Pattern: Table Owner Bypass, Session Context Bleed & Unindexed RLS Meltdown**:
+    - Executing `ALTER TABLE t ENABLE ROW LEVEL SECURITY` without `FORCE ROW LEVEL SECURITY`, allowing application connections using the migration owner role to silently bypass RLS and leak multi-tenant records across organizations.
+    - Setting tenant context with session scope (`SET app.current_tenant_id = '...'`) instead of `SET LOCAL`, causing connection pooling (PgBouncer in transaction mode or backend pools) to leak the previous tenant's identity to subsequent requests.
+    - Creating views over RLS tables without `WITH (security_invoker = true)` in PostgreSQL 15+, executing views with the creator's elevated permissions and stripping tenant RLS filters.
+    - Defining RLS policies on tables lacking composite indexes with `tenant_id` as the leading leftmost column, forcing PostgreSQL to execute sequential table scans across millions of rows for simple primary key lookups.
+  - ✅ **Production Invariant**:
+    - Enforce `ALTER TABLE <table> FORCE ROW LEVEL SECURITY;` on 100% of multi-tenant tables.
+    - Application pools connect strictly as an unprivileged role (`app_user`) with `NOSUPERUSER NOBYPASSRLS`.
+    - Mandatory transaction-scoped context setting `SET LOCAL app.current_tenant_id = '...'` or parameterized `set_config('app.current_tenant_id', $1, true)`.
+    - Fail-closed policy evaluation: `USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::UUID)`.
+    - 100% composite index coverage with `tenant_id` as the leftmost column (`PRIMARY KEY (tenant_id, id)`).
+    - Mandatory `WITH (security_invoker = true, security_barrier = true)` on all multi-tenant views.
+    ```sql
+    -- 1. Comprehensive RLS & FORCE Flag Compliance Audit
+    SELECT
+      c.relname AS table_name,
+      pg_get_userbyid(c.relowner) AS table_owner,
+      c.relrowsecurity AS is_rls_enabled,
+      c.relforcerowsecurity AS is_rls_forced,
+      (SELECT count(*) FROM pg_policy p WHERE p.polrelid = c.oid) AS policy_count,
+      EXISTS (
+        SELECT 1 FROM pg_index i
+        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+        WHERE i.indrelid = c.oid AND a.attname = 'tenant_id'
+      ) AS has_leftmost_tenant_index
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'r'
+      AND n.nspname = 'public'
+      AND c.relname NOT IN ('schema_migrations');
+
+    -- 2. View Security Invoker & Barrier Compliance Audit
+    SELECT
+      c.relname AS view_name,
+      pg_get_userbyid(c.relowner) AS view_owner,
+      COALESCE('security_invoker=true' = ANY(c.reloptions), false) AS has_security_invoker,
+      COALESCE('security_barrier=true' = ANY(c.reloptions), false) AS has_security_barrier
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'v'
+      AND n.nspname = 'public';
+
+    -- 3. Production Hardening Template
+    ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE documents FORCE ROW LEVEL SECURITY;
+
+    CREATE POLICY documents_tenant_isolation ON documents
+      FOR ALL
+      TO app_user
+      USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::UUID)
+      WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::UUID);
+
+    CREATE INDEX idx_documents_tenant_created ON documents (tenant_id, created_at DESC);
+    ```

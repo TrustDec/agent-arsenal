@@ -2213,4 +2213,134 @@ alwaysApply: false
         }
       }
     );
+
+    // Multi-Tenant Row-Level Security (RLS) & Policy Bypass Audit Tool
+    server.tool(
+      'audit_database_rls_policies',
+      {
+        schemaName: z.string().default('public').describe('PostgreSQL schema to inspect for multi-tenant RLS compliance'),
+        requireForceRLS: z.boolean().default(true).describe('Whether to require FORCE ROW LEVEL SECURITY to prevent table owner bypass'),
+      },
+      async ({ schemaName, requireForceRLS }) => {
+        const client = await dbPool.connect();
+        try {
+          const tableQuery = `
+            WITH table_meta AS (
+              SELECT
+                c.oid AS table_oid,
+                c.relname AS tablename,
+                pg_get_userbyid(c.relowner) AS tableowner,
+                c.relrowsecurity AS rowsecurity,
+                c.relforcerowsecurity AS forcerowsecurity
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE c.relkind = 'r'
+                AND n.nspname = $1
+                AND c.relname NOT IN ('schema_migrations', 'spatial_ref_sys')
+            ),
+            policies_meta AS (
+              SELECT polrelid, count(*) AS policy_count
+              FROM pg_policy
+              GROUP BY polrelid
+            ),
+            tenant_indexes AS (
+              SELECT
+                i.indrelid,
+                bool_or(a.attname = 'tenant_id' AND i.indkey[0] = a.attnum) AS has_leftmost_tenant_index
+              FROM pg_index i
+              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+              GROUP BY i.indrelid
+            )
+            SELECT
+              tm.tablename,
+              tm.tableowner,
+              tm.rowsecurity,
+              tm.forcerowsecurity,
+              COALESCE(pm.policy_count, 0)::int AS policy_count,
+              COALESCE(ti.has_leftmost_tenant_index, false) AS has_leftmost_tenant_index
+            FROM table_meta tm
+            LEFT JOIN policies_meta pm ON pm.polrelid = tm.table_oid
+            LEFT JOIN tenant_indexes ti ON ti.indrelid = tm.table_oid
+            ORDER BY tm.tablename;
+          `;
+
+          const viewQuery = `
+            SELECT
+              c.relname AS viewname,
+              pg_get_userbyid(c.relowner) AS viewowner,
+              COALESCE('security_invoker=true' = ANY(c.reloptions), false) AS security_invoker,
+              COALESCE('security_barrier=true' = ANY(c.reloptions), false) AS security_barrier
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relkind = 'v'
+              AND n.nspname = $1
+            ORDER BY c.relname;
+          `;
+
+          const [tableRes, viewRes] = await Promise.all([
+            client.query(tableQuery, [schemaName]),
+            client.query(viewQuery, [schemaName]),
+          ]);
+
+          const tableAudits = tableRes.rows.map((row: any) => {
+            const violations: string[] = [];
+            if (!row.rowsecurity) violations.push('Missing ENABLE ROW LEVEL SECURITY');
+            if (requireForceRLS && !row.forcerowsecurity) violations.push('Missing FORCE ROW LEVEL SECURITY (owner bypass hazard)');
+            if (row.policy_count === 0) violations.push('No policies defined');
+            if (!row.has_leftmost_tenant_index) violations.push('Missing composite index with tenant_id as leftmost column');
+
+            return {
+              tableName: row.tablename,
+              tableOwner: row.tableowner,
+              isRLSEnabled: row.rowsecurity,
+              isRLSForced: row.forcerowsecurity,
+              policyCount: row.policy_count,
+              hasLeftmostTenantIndex: row.has_leftmost_tenant_index,
+              isCompliant: violations.length === 0,
+              violations,
+            };
+          });
+
+          const viewAudits = viewRes.rows.map((row: any) => {
+            const violations: string[] = [];
+            if (!row.security_invoker) violations.push('Missing WITH (security_invoker = true); executes under view owner context');
+
+            return {
+              viewName: row.viewname,
+              viewOwner: row.viewowner,
+              securityInvoker: row.security_invoker,
+              securityBarrier: row.security_barrier,
+              isCompliant: violations.length === 0,
+              violations,
+            };
+          });
+
+          const totalTables = tableAudits.length;
+          const compliantTables = tableAudits.filter((t: any) => t.isCompliant).length;
+          const totalViews = viewAudits.length;
+          const compliantViews = viewAudits.filter((v: any) => v.isCompliant).length;
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                schema: schemaName,
+                summary: {
+                  totalTables,
+                  compliantTables,
+                  isTablesFullyHardened: totalTables === compliantTables,
+                  totalViews,
+                  compliantViews,
+                  isViewsFullyHardened: totalViews === compliantViews,
+                },
+                tableAudits,
+                viewAudits,
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
     ```

@@ -3573,4 +3573,140 @@ func AuditCDCSlotHealth(ctx context.Context, pool *pgxpool.Pool, slotName string
 
     return &h, nil
 }
+
+// ============================================================================
+// AGENTIC DATABASE ROW-LEVEL SECURITY (RLS) & TENANT ISOLATION INVARIANTS
+// ============================================================================
+
+// RLSTableReport represents the compliance and security posture of a database table.
+type RLSTableReport struct {
+    TableName              string `json:"table_name"`
+    TableOwner             string `json:"table_owner"`
+    IsRLSEnabled           bool   `json:"is_rls_enabled"`
+    IsRLSForced            bool   `json:"is_rls_forced"`
+    PolicyCount            int    `json:"policy_count"`
+    HasLeftmostTenantIndex bool   `json:"has_leftmost_tenant_index"`
+    IsCompliant            bool   `json:"is_compliant"`
+    ViolationReason        string `json:"violation_reason,omitempty"`
+}
+
+// WithTenantTx executes database operations within an isolated transaction scoped strictly
+// to the specified tenant using SET LOCAL app.current_tenant_id.
+// Invariant: SET LOCAL automatically reverts upon COMMIT or ROLLBACK, mathematically
+// preventing cross-tenant session leaks across pooled PgBouncer connections.
+func WithTenantTx(ctx context.Context, pool *pgxpool.Pool, tenantID uuid.UUID, fn func(tx pgx.Tx) error) error {
+    if tenantID == uuid.Nil {
+        return fmt.Errorf("rls tenant transaction: tenantID cannot be nil")
+    }
+
+    tx, err := pool.BeginTx(ctx, pgx.TxOptions{
+        IsoLevel: pgx.ReadCommitted,
+    })
+    if err != nil {
+        return fmt.Errorf("begin tenant tx: %w", err)
+    }
+    defer tx.Rollback(ctx)
+
+    // Set transaction-scoped tenant GUC (is_local = true)
+    _, err = tx.Exec(ctx, "SELECT set_config('app.current_tenant_id', $1, true);", tenantID.String())
+    if err != nil {
+        return fmt.Errorf("set tenant local context: %w", err)
+    }
+
+    if err := fn(tx); err != nil {
+        return err
+    }
+
+    if err := tx.Commit(ctx); err != nil {
+        return fmt.Errorf("commit tenant tx: %w", err)
+    }
+
+    return nil
+}
+
+// AuditRLSCompliance scans all application relations to ensure:
+// 1. RLS is enabled (relrowsecurity = true)
+// 2. RLS is FORCED (relforcerowsecurity = true) to prevent table owner bypass
+// 3. At least one policy is declared
+// 4. A composite B-tree index exists with tenant_id as the leading column
+func AuditRLSCompliance(ctx context.Context, pool *pgxpool.Pool, schema string) ([]RLSTableReport, error) {
+    query := `
+        WITH table_meta AS (
+            SELECT
+                c.oid AS table_oid,
+                c.relname AS tablename,
+                pg_get_userbyid(c.relowner) AS tableowner,
+                c.relrowsecurity AS rowsecurity,
+                c.relforcerowsecurity AS forcerowsecurity
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relkind = 'r'
+              AND n.nspname = $1
+              AND c.relname NOT IN ('schema_migrations', 'spatial_ref_sys')
+        ),
+        policies_meta AS (
+            SELECT polrelid, count(*) AS policy_count
+            FROM pg_policy
+            GROUP BY polrelid
+        ),
+        tenant_indexes AS (
+            SELECT
+                i.indrelid,
+                bool_or(a.attname = 'tenant_id' AND i.indkey[0] = a.attnum) AS has_leftmost_tenant_index
+            FROM pg_index i
+            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+            GROUP BY i.indrelid
+        )
+        SELECT
+            tm.tablename,
+            tm.tableowner,
+            tm.rowsecurity,
+            tm.forcerowsecurity,
+            COALESCE(pm.policy_count, 0),
+            COALESCE(ti.has_leftmost_tenant_index, false)
+        FROM table_meta tm
+        LEFT JOIN policies_meta pm ON pm.polrelid = tm.table_oid
+        LEFT JOIN tenant_indexes ti ON ti.indrelid = tm.table_oid
+        ORDER BY tm.tablename;
+    `
+
+    rows, err := pool.Query(ctx, query, schema)
+    if err != nil {
+        return nil, fmt.Errorf("audit rls compliance: %w", err)
+    }
+    defer rows.Close()
+
+    var reports []RLSTableReport
+    for rows.Next() {
+        var r RLSTableReport
+        err := rows.Scan(
+            &r.TableName,
+            &r.TableOwner,
+            &r.IsRLSEnabled,
+            &r.IsRLSForced,
+            &r.PolicyCount,
+            &r.HasLeftmostTenantIndex,
+        )
+        if err != nil {
+            return nil, fmt.Errorf("scan rls audit row: %w", err)
+        }
+
+        switch {
+        case !r.IsRLSEnabled:
+            r.ViolationReason = "RLS is not enabled (missing ENABLE ROW LEVEL SECURITY)"
+        case !r.IsRLSForced:
+            r.ViolationReason = "RLS is not forced (missing FORCE ROW LEVEL SECURITY; table owner bypass risk)"
+        case r.PolicyCount == 0:
+            r.ViolationReason = "No RLS policies defined; default deny or unconfigured relation"
+        case !r.HasLeftmostTenantIndex:
+            r.ViolationReason = "Missing composite index with tenant_id as leftmost column; risk of sequential scans"
+        default:
+            r.IsCompliant = true
+        }
+
+        reports = append(reports, r)
+    }
+
+    return reports, nil
+}
 ```

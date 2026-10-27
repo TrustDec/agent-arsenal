@@ -2756,5 +2756,35 @@ alwaysApply: false
         refresh,
       };
     }
+
+    // Nuxt 3 Database Row-Level Security (RLS) & Multi-Tenant Sentinel Composable
+    export function useDatabaseRLSSentinel(schemaName: string = 'public') {
+      const { data: rlsData, refresh } = useFetch(`/api/admin/database-rls/${schemaName}`);
+      const unforcedTables = computed(() => {
+        return (rlsData.value?.tableAudits ?? []).filter((t: any) => t.isRLSEnabled && !t.isRLSForced);
+      });
+      const unindexedTables = computed(() => {
+        return (rlsData.value?.tableAudits ?? []).filter((t: any) => !t.hasLeftmostTenantIndex);
+      });
+      const leakyViews = computed(() => {
+        return (rlsData.value?.viewAudits ?? []).filter((v: any) => !v.securityInvoker);
+      });
+      const isFleetCompliant = computed(() => {
+        return (
+          unforcedTables.value.length === 0 &&
+          unindexedTables.value.length === 0 &&
+          leakyViews.value.length === 0
+        );
+      });
+
+      return {
+        rlsData,
+        unforcedTables,
+        unindexedTables,
+        leakyViews,
+        isFleetCompliant,
+        refresh,
+      };
+    }
     </script>
     ```
