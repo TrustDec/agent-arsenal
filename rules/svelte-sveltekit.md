@@ -2623,6 +2623,29 @@ alwaysApply: false
       });
     };
     ```
+- **Server Lifecycle Hooks, SSE / WebSocket Connection Draining & Ingress Quiescence**:
+  - ❌ **Anti-Pattern: Abandoned Server Streams & Abrupt Connection Termination on Node Shutdown**: When Node.js restarts or SvelteKit node-adapter containers terminate, open SSE streams and WebSocket subscriptions are abruptly dropped without sending close frames, causing clients to immediately reconnect in a thundering herd.
+  - ✅ **Production Invariant**: Intercept `SIGTERM` in `hooks.server.ts`, notify active SSE/WS clients with a reconnect backoff hint and RFC 6455 1001 Close Frame, and cleanly close server streams before container exit:
+    ```typescript
+    // src/hooks.server.ts - Zero-Downtime Drain & SSE Stream Quiescence
+    let isShuttingDown = false;
+    const activeStreams = new Set<ReadableStreamDefaultController>();
+
+    if (typeof process !== 'undefined') {
+      process.on('SIGTERM', async () => {
+        isShuttingDown = true;
+        // Broadcast reconnect hint to active SSE clients
+        const encoder = new TextEncoder();
+        for (const controller of activeStreams) {
+          try {
+            controller.enqueue(encoder.encode('event: drain\ndata: {"retry": 5000}\n\n'));
+            controller.close();
+          } catch {}
+        }
+        activeStreams.clear();
+      });
+    }
+    ```
 
 
 

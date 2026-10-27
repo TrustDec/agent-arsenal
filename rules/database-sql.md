@@ -1609,6 +1609,23 @@ alwaysApply: false
     LIMIT 10
     FOR UPDATE SKIP LOCKED;
     ```
+- **Connection Pool Draining, In-Flight Transaction Completion & Idle Connection Termination on Shutdown**:
+  - ❌ **Anti-Pattern: Hard Abrupt Pool Destruction or Hanging Shutdown Locks**: Destroying database connection pools immediately while transactions are in-flight, leaving stranded uncommitted locks on the server side until `idle_in_transaction_session_timeout` expires, or allowing shutdown scripts to hang indefinitely on unclosed transactions.
+  - ✅ **Production Invariant**: Enforce server-side transaction timeouts (`idle_in_transaction_session_timeout = '10s'`) and client-side pool drain barriers. Explicitly rollback uncommitted transactions, allow active transactions to commit within the drain window, and close the pool with a bounded timeout:
+    ```sql
+    -- PostgreSQL Server-Side Safeguards Against Stranded Connections from Abrupt Restarts
+    ALTER SYSTEM SET idle_in_transaction_session_timeout = '10s';
+    ALTER SYSTEM SET statement_timeout = '30s';
+    SELECT pg_reload_conf();
+
+    -- Administrative Terminating Query for Drain & Eviction Verification:
+    SELECT pg_terminate_backend(pid)
+    FROM pg_stat_activity
+    WHERE datname = current_database()
+      AND pid <> pg_backend_pid()
+      AND state = 'idle in transaction'
+      AND state_change < NOW() - INTERVAL '15 seconds';
+    ```
 
 
 

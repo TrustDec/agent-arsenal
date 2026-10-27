@@ -2634,6 +2634,44 @@ alwaysApply: false
         }
     }
     ```
+- **Zero-Downtime Kubernetes Readiness Quiescence & Reverse Dependency DAG Teardown**:
+  - ❌ **Anti-Pattern: Immediate Socket Close on `SIGTERM` & Random Resource Teardown**: Closing the HTTP listener immediately when `SIGTERM` is received while kube-proxy is still propagating pod removal, causing a burst of 502 Bad Gateways, or closing `pgxpool.Pool` while HTTP handlers are still running active queries.
+  - ✅ **Production Invariant**: Flip readiness probe `/readyz` to HTTP 503, pause for ingress propagation ($T_{\text{quiesce}} \ge 2\text{s}$), bound in-flight request draining with `srv.Shutdown(ctx)`, and cleanly close database pools strictly after all handlers exit:
+    ```go
+    // Industrial Zero-502 Kubernetes Graceful Drain & Reverse DAG Teardown
+    type LifecycleManager struct {
+        draining atomic.Bool
+        srv      *http.Server
+        pool     *pgxpool.Pool
+    }
+
+    func (lm *LifecycleManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+        if r.URL.Path == "/readyz" {
+            if lm.draining.Load() {
+                http.Error(w, `{"serving":false}`, http.StatusServiceUnavailable)
+                return
+            }
+            w.WriteHeader(http.StatusOK)
+            return
+        }
+        // ... business routing
+    }
+
+    func (lm *LifecycleManager) DrainAndShutdown(ctx context.Context) error {
+        // 1. Quiesce ingress: signal unready and pause for kube-proxy route eviction
+        lm.draining.Store(true)
+        time.Sleep(2500 * time.Millisecond)
+
+        // 2. Stop accepting new connections and drain in-flight requests
+        if err := lm.srv.Shutdown(ctx); err != nil {
+            return err
+        }
+
+        // 3. Close database connection pool strictly AFTER HTTP server finishes
+        lm.pool.Close()
+        return nil
+    }
+    ```
 
 
 

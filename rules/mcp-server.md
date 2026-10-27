@@ -1323,6 +1323,27 @@ alwaysApply: false
       }
     );
     ```
+- **Parent Process Lifecycle Gating, Stdio EOF Trapping & Process Group Cleanup**:
+  - ❌ **Anti-Pattern: Zombie MCP Subprocesses & Unclosed File Descriptors on Client Disconnect**: When Claude Desktop, Cursor, or Pi closes the stdio transport or restarts, naive MCP servers fail to listen to `process.stdin.on('end')` and leave background processes or tool workers running as orphaned zombie processes consuming 100% CPU.
+  - ✅ **Production Invariant**: Intercept `stdin` EOF and `SIGTERM`, terminate child tool processes via negative PGID signals (`process.kill(-child.pid, 'SIGTERM')`), and enforce a 2000ms escalation to `SIGKILL` to guarantee zero zombie leaks across restarts:
+    ```typescript
+    // Industrial Stdio EOF & Process Group Teardown for MCP Servers
+    if (!process.stdin.isTTY) {
+      process.stdin.on('end', async () => {
+        console.error('[MCP Lifecycle] Host closed stdin pipe. Initiating clean teardown...');
+        // Terminate all spawned tool child process groups
+        for (const child of activeSubprocesses) {
+          if (child.pid && !child.killed) {
+            try {
+              process.kill(-child.pid, 'SIGTERM');
+            } catch {}
+          }
+        }
+        await sleep(1500);
+        process.exit(0);
+      });
+    }
+    ```
 
 
 

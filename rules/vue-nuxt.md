@@ -2290,6 +2290,31 @@ alwaysApply: false
       return { status: readonly(status), currentStep: readonly(currentStep), error: readonly(error) };
     }
     ```
+- **Nuxt Nitro Engine Graceful Shutdown & Zero-502 Readiness Middleware**:
+  - ❌ **Anti-Pattern: Unhandled Node Process Signals in Nuxt SSR Containers**: Running `nuxt start` in Kubernetes or Docker without registering Nitro runtime close hooks or readiness gating, causing rolling deployments to drop in-flight SSR renders and throw 502 errors to incoming traffic.
+  - ✅ **Production Invariant**: Register Nitro runtime plugins that hook into `nitroApp.hooks.hook('close')`, flip an internal readiness flag, and allow active SSR renders to finish within a bounded drain budget:
+    ```typescript
+    // server/plugins/lifecycle.ts - Nuxt Nitro Graceful Drain & Readiness Invariant
+    export default defineNitroPlugin((nitroApp) => {
+      let isDraining = false;
+
+      nitroApp.hooks.hook('request', (event) => {
+        if (event.path === '/readyz') {
+          if (isDraining) {
+            setResponseStatus(event, 503);
+            return { status: 'DRAINING', serving: false };
+          }
+          return { status: 'READY', serving: true };
+        }
+      });
+
+      nitroApp.hooks.hook('close', async () => {
+        isDraining = true;
+        // Pause 2.5s for Kubernetes ingress endpoint propagation
+        await new Promise((r) => setTimeout(r, 2500));
+      });
+    });
+    ```
 
 
 
