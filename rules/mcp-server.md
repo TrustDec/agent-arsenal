@@ -1712,6 +1712,56 @@ alwaysApply: false
           client.release();
         }
       }
+
+      // MCP Tool Soft-Delete & Restore Invariant: Atomic Tombstone Cascades & Conflict Preflight
+      if (request.params.name === 'soft_delete_workspace') {
+        const { workspaceId, actorId } = request.params.arguments as { workspaceId: string; actorId: string };
+        const batchId = crypto.randomUUID();
+        const client = await dbPoolPrimary.connect();
+        try {
+          await client.query('BEGIN');
+          // Atomic cascade CTE updates parent and children with single batch ID
+          const res = await client.query(
+            `WITH del_ws AS (
+               UPDATE workspaces SET
+                 deleted_at = NOW(), deleted_by = $1, deleted_batch_id = $2, version = version + 1
+               WHERE id = $3 AND deleted_at IS NULL
+               RETURNING id, slug
+             ),
+             del_docs AS (
+               UPDATE documents SET
+                 deleted_at = NOW(), deleted_by = $1, deleted_batch_id = $2, version = version + 1
+               WHERE workspace_id IN (SELECT id FROM del_ws) AND deleted_at IS NULL
+               RETURNING id
+             )
+             SELECT id, slug FROM del_ws;`,
+            [actorId, batchId, workspaceId]
+          );
+
+          if (res.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return { isError: true, content: [{ type: 'text', text: `Workspace ${workspaceId} not found or already deleted` }] };
+          }
+
+          await client.query('COMMIT');
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: true,
+                workspaceId,
+                batchId,
+                message: 'Workspace and child documents atomically soft-deleted. Use batchId to restore.',
+              }),
+            }],
+          };
+        } catch (err) {
+          await client.query('ROLLBACK');
+          throw err;
+        } finally {
+          client.release();
+        }
+      }
     });
     ```
 

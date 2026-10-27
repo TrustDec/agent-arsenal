@@ -2935,6 +2935,63 @@ alwaysApply: false
         }
       },
     };
+
+    // SvelteKit Soft-Delete & Instant Undo Invariant: Atomic Tombstone Batching
+    // Form Action returns a unique batchId. If the user clicks "Undo" within 10s,
+    // the restore action uses the exact batchId to unmask parent and child entities.
+    export const actionsWithSoftDelete: Actions = {
+      deleteWorkspace: async ({ request, locals }) => {
+        const formData = await request.formData();
+        const workspaceId = formData.get('workspaceId') as string;
+        const batchId = crypto.randomUUID();
+
+        const client = await dbPoolPrimary.connect();
+        try {
+          const res = await client.query(
+            `WITH del_ws AS (
+               UPDATE workspaces SET
+                 deleted_at = NOW(), deleted_by = $1, deleted_batch_id = $2, version = version + 1
+               WHERE id = $3 AND deleted_at IS NULL
+               RETURNING id
+             )
+             UPDATE documents SET
+               deleted_at = NOW(), deleted_by = $1, deleted_batch_id = $2
+             WHERE workspace_id IN (SELECT id FROM del_ws) AND deleted_at IS NULL;`,
+            [locals.user.id, batchId, workspaceId]
+          );
+
+          return { success: true, workspaceId, batchId, undoable: true };
+        } finally {
+          client.release();
+        }
+      },
+
+      undoDeleteWorkspace: async ({ request }) => {
+        const formData = await request.formData();
+        const workspaceId = formData.get('workspaceId') as string;
+        const batchId = formData.get('batchId') as string;
+
+        const client = await dbPoolPrimary.connect();
+        try {
+          await client.query(
+            `WITH res_ws AS (
+               UPDATE workspaces SET
+                 deleted_at = NULL, deleted_by = NULL, deleted_batch_id = NULL, version = version + 1
+               WHERE id = $1 AND deleted_batch_id = $2::uuid
+               RETURNING id
+             )
+             UPDATE documents SET
+               deleted_at = NULL, deleted_by = NULL, deleted_batch_id = NULL
+             WHERE workspace_id IN (SELECT id FROM res_ws) AND deleted_batch_id = $2::uuid;`,
+            [workspaceId, batchId]
+          );
+
+          return { success: true, restored: true };
+        } finally {
+          client.release();
+        }
+      },
+    };
     ```
 
 

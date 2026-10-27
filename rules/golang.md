@@ -3025,6 +3025,64 @@ alwaysApply: false
 
         return selected
     }
+
+    // Soft-Delete Cascade CTE & Tamper-Evident HMAC Audit Invariant
+    type SoftDeleteService struct {
+        pool       *pgxpool.Pool
+        hmacSecret []byte
+    }
+
+    func NewSoftDeleteService(pool *pgxpool.Pool, secret string) *SoftDeleteService {
+        return &SoftDeleteService{pool: pool, hmacSecret: []byte(secret)}
+    }
+
+    func (s *SoftDeleteService) CascadeSoftDelete(ctx context.Context, orgID [16]byte, actorID string) ([16]byte, error) {
+        batchID := [16]byte(uuid.New())
+        now := time.Now().UTC()
+
+        tx, err := s.pool.Begin(ctx)
+        if err != nil {
+            return [16]byte{}, fmt.Errorf("begin tx: %w", err)
+        }
+        defer tx.Rollback(ctx)
+
+        // Single-statement recursive CTE guarantees atomic multi-table soft deletion
+        const cteQuery = `
+            WITH del_org AS (
+                UPDATE organizations SET
+                    deleted_at = $1, deleted_by = $2, deleted_batch_id = $3, version = version + 1
+                WHERE id = $4 AND deleted_at IS NULL
+                RETURNING id, slug
+            ),
+            del_projects AS (
+                UPDATE projects SET
+                    deleted_at = $1, deleted_by = $2, deleted_batch_id = $3, version = version + 1
+                WHERE org_id IN (SELECT id FROM del_org) AND deleted_at IS NULL
+                RETURNING id
+            )
+            SELECT id, slug FROM del_org;
+        `
+        var returnedID [16]byte
+        var slug string
+        if err := tx.QueryRow(ctx, cteQuery, now, actorID, batchID, orgID).Scan(&returnedID, &slug); err != nil {
+            return [16]byte{}, fmt.Errorf("cascade soft-delete failed: %w", err)
+        }
+
+        // Compute HMAC-SHA256 for immutable audit record
+        h := hmac.New(sha256.New, s.hmacSecret)
+        h.Write([]byte(fmt.Sprintf("%x:%s:%s", orgID, "SOFT_DELETE", slug)))
+        currentHash := hex.EncodeToString(h.Sum(nil))
+
+        _, err = tx.Exec(ctx, `
+            INSERT INTO entity_audit_ledger (entity_name, entity_id, action, actor_id, timestamp, hash)
+            VALUES ($1, $2, $3, $4, $5, $6)
+        `, "organizations", orgID, "SOFT_DELETE", actorID, now, currentHash)
+        if err != nil {
+            return [16]byte{}, fmt.Errorf("audit log insert failed: %w", err)
+        }
+
+        return batchID, tx.Commit(ctx)
+    }
     ```
 
 

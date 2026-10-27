@@ -1836,6 +1836,57 @@ alwaysApply: false
         pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()) AS replay_pending_bytes;
     ```
 
+- **Soft Deletes, Partial Unique Indexes, Recursive Cascade CTEs & Immutable Audit Trails**:
+  - ❌ **Anti-Pattern: Plain UNIQUE on Soft-Deletable Tables & Broken Cascades**: Using standard `UNIQUE (slug)` or boolean `is_deleted = true`, which prevents re-registering previously deleted records, leaves child records orphaned because physical `ON DELETE CASCADE` never fires on `UPDATE`, and leaks soft-deleted ghost records when `WHERE deleted_at IS NULL` is omitted in multi-table joins.
+  - ✅ **Production Invariant**: Use `deleted_at TIMESTAMPTZ NULL` with partial unique indexes `WHERE deleted_at IS NULL`, enforce transparent isolation via PostgreSQL `FORCE ROW LEVEL SECURITY`, execute cascade soft-deletions in a single recursive CTE with a shared `deleted_batch_id`, and protect audit tables with an immutable append-only exception trigger:
+    ```sql
+    -- 1. Partial Unique Index: Allows slug reuse after soft deletion
+    CREATE UNIQUE INDEX idx_organizations_slug_active 
+    ON organizations (tenant_id, slug) 
+    WHERE deleted_at IS NULL;
+
+    -- 2. Declarative Transparent Soft-Delete RLS Policy
+    ALTER TABLE organizations ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE organizations FORCE ROW LEVEL SECURITY;
+
+    CREATE POLICY organizations_active_isolation ON organizations
+    FOR ALL TO authenticated, service_role
+    USING (deleted_at IS NULL OR current_setting('app.include_soft_deleted', true) = 'true');
+
+    -- 3. Atomic Recursive Cascade Soft-Delete CTE with Shared Batch UUID
+    WITH target_org AS (
+      UPDATE organizations SET
+        deleted_at = NOW(),
+        deleted_by = 'usr_admin123',
+        deleted_batch_id = 'b3f5c7d2-4e1a-4c8f-9a1b-2c3d4e5f6a7b'::UUID,
+        version = version + 1
+      WHERE id = 'a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d'::UUID AND deleted_at IS NULL
+      RETURNING id, deleted_batch_id
+    ),
+    del_projects AS (
+      UPDATE projects SET
+        deleted_at = NOW(),
+        deleted_by = 'usr_admin123',
+        deleted_batch_id = 'b3f5c7d2-4e1a-4c8f-9a1b-2c3d4e5f6a7b'::UUID,
+        version = version + 1
+      WHERE org_id IN (SELECT id FROM target_org) AND deleted_at IS NULL
+      RETURNING id
+    )
+    SELECT id, deleted_batch_id FROM target_org;
+
+    -- 4. Immutable Audit Ledger Protection (Append-Only Invariant)
+    CREATE OR REPLACE FUNCTION prevent_audit_ledger_mutation()
+    RETURNS TRIGGER AS $$
+    BEGIN
+      RAISE EXCEPTION 'SECURITY ERROR: Audit ledger records are append-only and cryptographically immutable';
+    END;
+    $$ LANGUAGE plpgsql;
+
+    CREATE TRIGGER trg_audit_ledger_immutable
+    BEFORE UPDATE OR DELETE ON entity_audit_ledger
+    FOR EACH ROW EXECUTE FUNCTION prevent_audit_ledger_mutation();
+    ```
+
 
 
 

@@ -2596,6 +2596,37 @@ alwaysApply: false
       await refresh();
     }
     </script>
+
+    <!-- Nuxt 3 Soft-Delete & Instant Undo Toast Pattern -->
+    <script setup lang="ts">
+    const toast = useToast();
+    const { data: workspaces, refresh } = await useFetch('/api/workspaces');
+
+    async function handleDelete(workspaceId: string) {
+      // 1. Soft-delete API call returns tombstone batch ID
+      const { batchId } = await $fetch(`/api/workspaces/${workspaceId}`, {
+        method: 'DELETE',
+      });
+      await refresh();
+
+      // 2. Show 10-second undo toast
+      toast.add({
+        title: 'Workspace Deleted',
+        description: 'Workspace and related documents have been soft-deleted.',
+        actions: [{
+          label: 'Undo',
+          click: async () => {
+            await $fetch(`/api/workspaces/${workspaceId}/restore`, {
+              method: 'POST',
+              body: { batchId },
+            });
+            await refresh();
+            toast.add({ title: 'Workspace Restored', color: 'green' });
+          },
+        }],
+      });
+    }
+    </script>
     ```
 
 
