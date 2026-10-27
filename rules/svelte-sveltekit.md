@@ -2670,6 +2670,43 @@ alwaysApply: false
       return json({ dlqId, status: outcome.success ? 'REPLAY_SUCCEEDED' : 'REPLAY_FAILED' });
     };
     ```
+- **SvelteKit Server-Side Read-Through Cache, In-Process Singleflight & Cache-Control Headers**:
+  - ❌ **Anti-Pattern: SSR Database Slamming & Missing Shared In-Process Deduplication**: Executing identical database queries on every incoming SSR page render or API load function without in-memory coalescing, causing database CPU spikes during traffic surges.
+  - ✅ **Production Invariant**: Implement in-process singleflight coalescing inside SvelteKit server hooks / load functions with decorrelated caching and HTTP `stale-while-revalidate` response headers:
+    ```typescript
+    // src/routes/api/products/[id]/+server.ts - SvelteKit Resilient Singleflight Server Endpoint
+    import { json, error } from '@sveltejs/kit';
+    import type { RequestHandler } from './$types';
+
+    const productInFlight = new Map<string, Promise<any>>();
+
+    export const GET: RequestHandler = async ({ params, setHeaders, locals }) => {
+      const productId = params.id;
+      if (!productId) throw error(400, 'Missing product ID');
+
+      // Coalesce concurrent SSR requests for the exact same product ID
+      if (!productInFlight.has(productId)) {
+        const fetchPromise = locals.db.product.findUnique({
+          where: { id: productId }
+        }).finally(() => {
+          productInFlight.delete(productId);
+        });
+        productInFlight.set(productId, fetchPromise);
+      }
+
+      const product = await productInFlight.get(productId);
+      if (!product) throw error(404, 'Product not found');
+
+      // Edge CDN and browser caching with background revalidation
+      setHeaders({
+        'Cache-Control': 'public, max-age=60, s-maxage=300, stale-while-revalidate=600',
+        'Vary': 'Accept-Encoding'
+      });
+
+      return json(product);
+    };
+    ```
+
 
 
 

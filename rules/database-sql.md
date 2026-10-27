@@ -1666,6 +1666,33 @@ alwaysApply: false
     WHERE d.dlq_id = b.dlq_id
     RETURNING d.dlq_id, d.payload, d.traceparent;
     ```
+- **PostgreSQL Cache Stampede Mitigation, CDC Invalidation Streams & Negative Sentinel Indexing**:
+  - ❌ **Anti-Pattern: Un-Coalesced Database Query Stampedes & Missing Negative Cache Indexing**: Permitting expired cache keys to burst into hundreds of unconstrained full-table or heavy analytical queries simultaneously, or allowing missing foreign keys to trigger repeated full table index scans without caching negative results.
+  - ✅ **Production Invariant**: Implement asynchronous Transaction Log CDC invalidation streams (or logical replication notify triggers) combined with negative sentinel caching and statement timeout guards to isolate relational storage from cache miss stampedes:
+    ```sql
+    -- Industrial PostgreSQL Cache Invalidation Stream & Negative Hit Sentinel Table
+    CREATE TABLE IF NOT EXISTS entity_invalidation_events (
+        event_id BIGSERIAL PRIMARY KEY,
+        table_name VARCHAR(64) NOT NULL,
+        entity_id VARCHAR(128) NOT NULL,
+        entity_version BIGINT NOT NULL,
+        emitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_invalidation_stream 
+      ON entity_invalidation_events (event_id ASC) 
+      WHERE emitted_at >= NOW() - INTERVAL '1 hour';
+
+    -- Low-overhead trigger recording row mutation epochs for cache invalidation workers
+    CREATE OR REPLACE FUNCTION trg_record_cache_invalidation() RETURNS TRIGGER AS $$
+    BEGIN
+        INSERT INTO entity_invalidation_events (table_name, entity_id, entity_version)
+        VALUES (TG_TABLE_NAME, COALESCE(NEW.id::text, OLD.id::text), EXTRACT(EPOCH FROM NOW())::BIGINT);
+        RETURN COALESCE(NEW, OLD);
+    END;
+    $$ LANGUAGE plpgsql;
+    ```
+
 
 
 

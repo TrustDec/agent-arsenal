@@ -2345,6 +2345,32 @@ alwaysApply: false
       return { isRedriving: readonly(isRedriving), circuitTripped: readonly(circuitTripped), triggerCanaryRedrive };
     }
     ```
+- **Nuxt Nitro Multi-Tier Read-Through Cache Driver & Client-Side Singleflight Composable**:
+  - ❌ **Anti-Pattern: Redundant Multi-Component `$fetch` Calls & Stampeding Nitro Handlers**: Having multiple sibling Vue components fire duplicate `$fetch` calls on mount without request deduplication, and letting Nitro server handlers execute un-coalesced upstream database requests on cache expiry.
+  - ✅ **Production Invariant**: Implement typed client singleflight composables (`useCoalescedFetch`) to share promises across the component tree, and leverage Nitro's `cachedEventHandler` with `swr: true` and decorrelated jitter:
+    ```typescript
+    // server/api/catalog/[id].ts - Nuxt 3 Nitro Resilient Cached Handler
+    export default defineCachedEventHandler(
+      async (event) => {
+        const id = getRouterParam(event, 'id');
+        const db = useDatabase();
+
+        const item = await db.query('SELECT * FROM catalog WHERE id = $1', [id]);
+        if (!item) {
+          throw createError({ statusCode: 404, statusMessage: 'Item not found' });
+        }
+        return item;
+      },
+      {
+        maxAge: 60 * 60,       // Cache 1 hour
+        swr: true,             // Stale-While-Revalidate background refresh
+        name: 'catalogItem',
+        getKey: (event) => `catalog:${getRouterParam(event, 'id')}`,
+        varies: ['Accept-Encoding']
+      }
+    );
+    ```
+
 
 
 

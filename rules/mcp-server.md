@@ -1369,6 +1369,47 @@ alwaysApply: false
       }
     });
     ```
+- **MCP Tool Memoization, Singleflight Request Coalescing & Invalidation Protocols**:
+  - ❌ **Anti-Pattern: Redundant Multi-Agent Tool Re-Execution & AST Thrashing**: Allowing parallel agent sub-tasks or swarms (Claude Code, Cursor Composer, Devin) to repeatedly execute identical read-only MCP tools (such as workspace file tree hashing, symbol graph queries, or git blame lookups), thrashing filesystem I/O and wasting seconds of wall-clock time.
+  - ✅ **Production Invariant**: Intercept idempotent read-only tool calls in a singleflight coalescing layer backed by an in-memory TTL cache, hashing tool arguments to reuse concurrent in-flight executions, while invalidating affected cache keys on mutating tool calls:
+    ```typescript
+    // Industrial MCP Tool Coalescing & Memoization Middleware
+    const inFlightTools = new Map<string, Promise<any>>();
+    const toolMemoCache = new Map<string, { result: any; expiresAt: number }>();
+
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      const { name, arguments: args } = request.params;
+      const isReadOnly = name.startsWith('read_') || name.startsWith('get_') || name.startsWith('search_');
+
+      if (!isReadOnly) {
+        // Mutating tool (write_*, edit_*, bash_*): clear memo cache to prevent stale reads
+        toolMemoCache.clear();
+        const outcome = await executeTool(name, args);
+        return { content: [{ type: 'text', text: JSON.stringify(outcome) }] };
+      }
+
+      const cacheKey = `${name}:${crypto.createHash('sha256').update(JSON.stringify(args ?? {})).digest('hex')}`;
+      const cached = toolMemoCache.get(cacheKey);
+      if (cached && Date.now() < cached.expiresAt) {
+        return { content: [{ type: 'text', text: JSON.stringify(cached.result) }] };
+      }
+
+      // Singleflight coalescing for concurrent read-only tool requests
+      if (!inFlightTools.has(cacheKey)) {
+        const executionPromise = executeTool(name, args).then((res) => {
+          toolMemoCache.set(cacheKey, { result: res, expiresAt: Date.now() + 30000 }); // 30s TTL
+          return res;
+        }).finally(() => {
+          inFlightTools.delete(cacheKey);
+        });
+        inFlightTools.set(cacheKey, executionPromise);
+      }
+
+      const result = await inFlightTools.get(cacheKey);
+      return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+    });
+    ```
+
 
 
 

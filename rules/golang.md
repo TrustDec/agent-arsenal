@@ -2697,6 +2697,47 @@ alwaysApply: false
         return nil
     }
     ```
+- **Singleflight Request Coalescing, DoChan Cancellation Isolation & Jittered Redis Read-Through**:
+  - ❌ **Anti-Pattern: Raw Uncoalesced Cache Miss Goroutine Floods**: Executing un-gated concurrent database queries on cache miss, or calling `singleflight.Group.Do` directly without wrapping in `DoChan`, causing client HTTP aborts to leave dangling goroutines or cancel upstream cache warming for other waiting callers.
+  - ✅ **Production Invariant**: Use `golang.org/x/sync/singleflight` with `DoChan` to coalesce duplicate in-flight requests while allowing callers with canceled contexts to detach cleanly, and enforce decorrelated TTL jitter on Redis writes:
+    ```go
+    // Industrial Go Singleflight Read-Through with Context Detachment
+    func (s *ReadThroughService) FetchEntity(ctx context.Context, id string) (*Entity, error) {
+        key := "entity:" + id
+        if cached, err := s.redis.Get(ctx, key).Bytes(); err == nil {
+            var e Entity
+            return &e, json.Unmarshal(cached, &e)
+        }
+
+        ch := s.sfGroup.DoChan(key, func() (interface{}, error) {
+            // Detached timeout context ensures cache population completes even if primary caller cancels
+            bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+            defer cancel()
+
+            entity, err := s.repo.FindByID(bgCtx, id)
+            if err != nil {
+                return nil, err
+            }
+
+            // Decorrelated jitter: base 3600s +/- 15%
+            jitter := time.Duration(rand.Intn(540)-270) * time.Second
+            payload, _ := json.Marshal(entity)
+            s.redis.Set(bgCtx, key, payload, time.Hour+jitter)
+            return entity, nil
+        })
+
+        select {
+        case <-ctx.Done():
+            return nil, ctx.Err() // Caller canceled, singleflight continues filling cache for peers
+        case res := <-ch:
+            if res.Err != nil {
+                return nil, res.Err
+            }
+            return res.Val.(*Entity), nil
+        }
+    }
+    ```
+
 
 
 
