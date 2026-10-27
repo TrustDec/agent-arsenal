@@ -1521,6 +1521,39 @@ alwaysApply: false
       throw new Error(`Exceeded max retries (${maxRetries}) under SERIALIZABLE isolation`);
     }
     ```
+- **High-Throughput Transactional Outbox Partitioning & Instant Deletion (`DROP TABLE`)**:
+  - ❌ **Anti-Pattern: Bulk Deleting Processed Outbox Events via `DELETE WHERE`**: Running periodic cron jobs `DELETE FROM outbox_events WHERE published_at < NOW() - INTERVAL '7 days'`. In high-throughput systems processing millions of events daily, bulk `DELETE` generates massive transaction log (WAL) bloat, leaves dead tuples requiring vacuuming, and induces table lock contention with concurrent workers.
+  - ✅ **Production Invariant**: Partition high-throughput outbox tables by range on `created_at` (`PARTITION BY RANGE (created_at)`). Prune historical processed partitions using `DROP TABLE` ($O(1)$ metadata operation with zero disk I/O and zero WAL generation):
+    ```sql
+    -- Declarative partitioned outbox table:
+    CREATE TABLE outbox_events (
+        id UUID NOT NULL DEFAULT gen_random_uuid(),
+        aggregate_type VARCHAR(128) NOT NULL,
+        aggregate_id VARCHAR(128) NOT NULL,
+        event_type VARCHAR(128) NOT NULL,
+        payload JSONB NOT NULL,
+        published_at TIMESTAMPTZ NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (created_at, id)
+    ) PARTITION BY RANGE (created_at);
+
+    -- Create weekly partition:
+    CREATE TABLE outbox_events_y2026w14 PARTITION OF outbox_events
+        FOR VALUES FROM ('2026-03-30 00:00:00+00') TO ('2026-04-06 00:00:00+00');
+
+    -- Instant O(1) zero-bloat retirement of old partition:
+    DROP TABLE outbox_events_y2026w13;
+    ```
+- **PostgreSQL Advisory Locks for In-Flight Distributed Mutation Coordination**:
+  - ❌ **Anti-Pattern: Polling with Application Sleep to Await Lock Release**: When a worker encounters an in-progress idempotency key, calling `sleep(1)` repeatedly in a loop while re-querying the database. This floods the connection pool and wastes database CPU.
+  - ✅ **Production Invariant**: Use PostgreSQL transaction-level advisory locks (`pg_try_advisory_xact_lock(hashtext(key))`) for fast atomic acquisition without row table lock overhead. If the lock cannot be acquired immediately, return HTTP `409 Conflict` with `Retry-After`:
+    ```sql
+    -- Attempt non-blocking transaction-scoped advisory lock by hashed key:
+    SELECT pg_try_advisory_xact_lock(hashtext('idemp_checkout_98765')) AS acquired;
+    -- Returns true if acquired immediately; false if held by another concurrent transaction.
+    -- Released automatically upon COMMIT or ROLLBACK of current transaction!
+    ```
+
 
 
 

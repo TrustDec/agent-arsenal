@@ -1202,6 +1202,44 @@ alwaysApply: false
       })
     );
     ```
+- **Idempotent MCP Tool Executions & Client Request Tokens (`idempotency_key`)**:
+  - ❌ **Anti-Pattern: Mutable Action Tools Without Deduplication Tokens**: Implementing mutating MCP tools (e.g. `create_database_migration`, `charge_customer`, `deploy_cluster`) without an optional or required `idempotency_key` parameter. When an autonomous agent loop experiences a client timeout or transient transport disconnection, it re-issues the tool call, triggering duplicate deployments or multiple billing charges.
+  - ✅ **Production Invariant**: Mutating tools MUST declare an `idempotency_key` argument in their input schema. Cache completed execution results in an ephemeral TTL store and return cached results with an indicator when identical keys are received:
+    ```typescript
+    const toolResultCache = new Map<string, { result: any; timestamp: number }>();
+
+    server.tool(
+      'provision_tenant_database',
+      'Provision a new isolated database for a SaaS tenant with idempotency',
+      z.object({
+        tenantId: z.string().uuid(),
+        databaseName: z.string().min(3),
+        idempotencyKey: z.string().uuid().describe('Client-provided unique key to prevent duplicate provisioning'),
+      }).strict().shape,
+      async (args) => {
+        const cached = toolResultCache.get(args.idempotencyKey);
+        if (cached) {
+          return {
+            content: [{
+              type: 'text',
+              text: `[IDEMPOTENT_REPLAY] Database already provisioned for tenant ${args.tenantId}: ${JSON.stringify(cached.result)}`,
+            }],
+          };
+        }
+
+        const provisionResult = await dbProvisioner.createDatabase(args.tenantId, args.databaseName);
+        toolResultCache.set(args.idempotencyKey, { result: provisionResult, timestamp: Date.now() });
+
+        return {
+          content: [{
+            type: 'text',
+            text: `Successfully provisioned database: ${JSON.stringify(provisionResult)}`,
+          }],
+        };
+      }
+    );
+    ```
+
 
 
 

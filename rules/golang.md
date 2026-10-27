@@ -2452,6 +2452,77 @@ alwaysApply: false
         return h.Proxied.RoundTrip(req)
     }
     ```
+- **Transactional Outbox Event Relay & Lock-Free Worker Processing (`SKIP LOCKED`)**:
+  - ❌ **Anti-Pattern: Naive Dual-Writing Outside Database Transactions**: Executing a SQL query to update an account balance and subsequently calling `kafkaProducer.Publish()` or `natsConn.Publish()` in separate operations. If the Go process panics, OOMs, or is terminated via `SIGKILL` between the database commit and the broker call, event publication is lost permanently with zero trace.
+  - ✅ **Production Invariant**: Insert domain mutations and outbox records in the same atomic `pgx.Tx`. Use worker background routines fetching batches via `SELECT ... FOR UPDATE SKIP LOCKED` to achieve lock-free horizontal scaling across multiple Go instances:
+    ```go
+    // Lock-free outbox worker polling in Go:
+    func (w *OutboxWorker) ProcessBatch(ctx context.Context, batchSize int) error {
+        tx, err := w.db.Begin(ctx)
+        if err != nil {
+            return err
+        }
+        defer tx.Rollback(ctx)
+
+        query := `
+            SELECT id, aggregate_id, event_type, payload
+            FROM outbox_events
+            WHERE published_at IS NULL
+            ORDER BY created_at ASC
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED;
+        `
+        rows, err := tx.Query(ctx, query, batchSize)
+        if err != nil {
+            return err
+        }
+        defer rows.Close()
+
+        var eventIDs []string
+        for rows.Next() {
+            var e OutboxEvent
+            if err := rows.Scan(&e.ID, &e.AggregateID, &e.EventType, &e.Payload); err != nil {
+                return err
+            }
+            if err := w.publisher.Publish(ctx, e.EventType, e.Payload); err != nil {
+                return fmt.Errorf("failed to publish outbox event %s: %w", e.ID, err)
+            }
+            eventIDs = append(eventIDs, e.ID)
+        }
+
+        if len(eventIDs) > 0 {
+            updateQuery := `UPDATE outbox_events SET published_at = NOW() WHERE id = ANY($1);`
+            if _, err := tx.Exec(ctx, updateQuery, eventIDs); err != nil {
+                return err
+            }
+        }
+
+        return tx.Commit(ctx)
+    }
+    ```
+- **Mutex Pass-by-Value & Lock Copying Prohibition (`go vet -copylocks`)**:
+  - ❌ **Anti-Pattern: Value Receiver on Structs Containing `sync.Mutex` or `sync.RWMutex`**: Defining methods with value receivers `func (s SafeCounter) Value() int` or passing a struct containing a mutex by value into helper functions. The lock state is copied by value, causing concurrent goroutines to lock separate mutex copies, leading to silent data races and corrupted shared memory.
+  - ✅ **Production Invariant**: Structs containing `sync.Mutex`, `sync.RWMutex`, or `sync.WaitGroup` MUST strictly define all methods on pointer receivers `func (s *SafeCounter) Value() int`. CI pipelines MUST enforce `go vet -copylocks ./...`:
+    ```go
+    type SafeCounter struct {
+        mu    sync.Mutex
+        count int
+    }
+
+    // ✅ Pointer receiver guarantees shared mutex state across all callers:
+    func (c *SafeCounter) Inc() {
+        c.mu.Lock()
+        defer c.mu.Unlock()
+        c.count++
+    }
+
+    func (c *SafeCounter) Value() int {
+        c.mu.Lock()
+        defer c.mu.Unlock()
+        return c.count
+    }
+    ```
+
 
 
 

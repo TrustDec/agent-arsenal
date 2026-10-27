@@ -2135,6 +2135,44 @@ alwaysApply: false
     );
     </script>
     ```
+- **Deterministic Frontend Idempotency Keys in Mutation Forms (`useIdempotencyKey`)**:
+  - ❌ **Anti-Pattern: Submitting Non-Idempotent POST Mutations on Button Click**: Triggering `$fetch('/api/v1/checkout', { method: 'POST', body })` without an `Idempotency-Key` header, or generating a brand-new UUID on every single retry attempt. When a user double-clicks the checkout button, or network retry fires after a 504 gateway timeout, multiple distinct orders are submitted to the server.
+  - ✅ **Production Invariant**: Encapsulate mutation lifecycle in an idempotency composable that binds a stable key per user action intent, disables form submission during in-flight mutations, and transmits the exact same key across retries:
+    ```typescript
+    // composables/useIdempotencyMutation.ts
+    export function useIdempotentMutation<TData, TResult>(
+      endpoint: string,
+      options: { method?: 'POST' | 'PUT' | 'PATCH' } = {}
+    ) {
+      const isSubmitting = ref(false);
+      const idempotencyKey = ref(crypto.randomUUID());
+
+      async function execute(data: TData): Promise<TResult> {
+        if (isSubmitting.value) {
+          throw new Error('A mutation is already in progress.');
+        }
+
+        isSubmitting.value = true;
+        try {
+          const response = await $fetch<TResult>(endpoint, {
+            method: options.method ?? 'POST',
+            body: data,
+            headers: {
+              'Idempotency-Key': idempotencyKey.value,
+            },
+          });
+          // Rotate key only after confirmed success to prepare for next distinct submission:
+          idempotencyKey.value = crypto.randomUUID();
+          return response;
+        } finally {
+          isSubmitting.value = false;
+        }
+      }
+
+      return { execute, isSubmitting, idempotencyKey: readonly(idempotencyKey) };
+    }
+    ```
+
 
 
 

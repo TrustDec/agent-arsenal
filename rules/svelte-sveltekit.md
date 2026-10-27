@@ -2480,6 +2480,47 @@ alwaysApply: false
       };
     };
     ```
+- **SvelteKit Progressive Enhancement Form Actions with Idempotency Keys (`use:enhance`)**:
+  - ❌ **Anti-Pattern: Double Form Submissions in `use:enhance` Without Idempotency Headers**: Using raw `<form method="POST">` or naive `use:enhance` without deduplication tokens. On slow 3G or mobile networks, impatient users click the submit button multiple times, firing multiple concurrent POST actions that create duplicate orders or double bank transfers.
+  - ✅ **Production Invariant**: Bind an ephemeral idempotency key to the form state using Svelte 5 runes, attach it to submission headers in `use:enhance`, and disable the submit trigger during flight:
+    ```svelte
+    <script lang="ts">
+    import { enhance } from '$app/forms';
+
+    let isSubmitting = $state(false);
+    let formIdempotencyKey = $state(crypto.randomUUID());
+    </script>
+
+    <form
+      method="POST"
+      action="?/createOrder"
+      use:enhance={({ cancel }) => {
+        if (isSubmitting) {
+          cancel();
+          return;
+        }
+        isSubmitting = true;
+
+        return async ({ update, result }) => {
+          try {
+            await update();
+            if (result.type === 'success') {
+              // Rotate idempotency key only after verified success:
+              formIdempotencyKey = crypto.randomUUID();
+            }
+          } finally {
+            isSubmitting = false;
+          }
+        };
+      }}
+    >
+      <input type="hidden" name="idempotencyKey" value={formIdempotencyKey} />
+      <button type="submit" disabled={isSubmitting}>
+        {isSubmitting ? 'Processing Order...' : 'Confirm Order'}
+      </button>
+    </form>
+    ```
+
 
 
 
