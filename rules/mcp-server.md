@@ -1934,4 +1934,87 @@ alwaysApply: false
         }
       }
     );
+
+    // Heavyweight Lock Contention, Deadlock & Unindexed FK Sentinel Tool
+    server.tool(
+      'audit_database_locks_and_deadlocks',
+      {
+        maxWaitSecondsAlert: z.number().default(2).describe('Alert threshold in seconds for queries waiting on contested locks'),
+      },
+      async ({ maxWaitSecondsAlert }) => {
+        const client = await dbPool.connect();
+        try {
+          // 1. Inspect Active Blocked Queries & Blocking PIDs
+          const lockRes = await client.query(`
+            SELECT
+              blocked_locks.pid AS blocked_pid,
+              blocked_activity.usename AS blocked_user,
+              blocking_locks.pid AS blocking_pid,
+              blocking_activity.usename AS blocking_user,
+              blocked_activity.query AS blocked_statement,
+              blocking_activity.query AS current_statement_in_blocking_process,
+              blocked_locks.locktype,
+              blocked_locks.mode AS requested_mode,
+              blocking_locks.mode AS held_mode,
+              ROUND(EXTRACT(EPOCH FROM (NOW() - blocked_activity.query_start))::numeric, 2) AS wait_seconds
+            FROM pg_catalog.pg_locks blocked_locks
+            JOIN pg_catalog.pg_stat_activity blocked_activity ON blocked_activity.pid = blocked_locks.pid
+            JOIN pg_catalog.pg_locks blocking_locks
+              ON blocking_locks.locktype = blocked_locks.locktype
+              AND blocking_locks.database IS NOT DISTINCT FROM blocked_locks.database
+              AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation
+              AND blocking_locks.page IS NOT DISTINCT FROM blocked_locks.page
+              AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple
+              AND blocking_locks.pid != blocked_locks.pid
+            JOIN pg_catalog.pg_stat_activity blocking_activity ON blocking_activity.pid = blocking_locks.pid
+            WHERE NOT blocked_locks.granted;
+          `);
+
+          // 2. Inspect Unindexed Foreign Keys (Lock Escalation Vulnerability)
+          const fkRes = await client.query(`
+            SELECT
+              c.conrelid::regclass::text AS child_table,
+              c.conname AS foreign_key_name,
+              ARRAY(
+                SELECT attname FROM pg_attribute
+                WHERE attrelid = c.conrelid AND attnum = ANY(c.conkey)
+              ) AS fk_columns,
+              c.confrelid::regclass::text AS parent_table
+            FROM pg_constraint c
+            WHERE c.contype = 'f'
+              AND NOT EXISTS (
+                SELECT 1 FROM pg_index i
+                WHERE i.indrelid = c.conrelid
+                  AND (i.indkey::smallint[])[0:cardinality(c.conkey)-1] = c.conkey
+              );
+          `);
+
+          // 3. Inspect Cluster Deadlocks Counter
+          const statRes = await client.query(`
+            SELECT datname, deadlocks, conflicts
+            FROM pg_stat_database
+            WHERE datname = current_database();
+          `);
+
+          const blockedQueries = lockRes.rows;
+          const criticalBlocks = blockedQueries.filter((b: any) => Number(b.wait_seconds) >= maxWaitSecondsAlert);
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                blockedQueriesCount: blockedQueries.length,
+                criticalBlocksCount: criticalBlocks.length,
+                blockedQueries,
+                unindexedForeignKeys: fkRes.rows,
+                databaseDeadlocks: statRes.rows[0]?.deadlocks ?? 0,
+                hasActiveLockContention: criticalBlocks.length > 0,
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
     ```

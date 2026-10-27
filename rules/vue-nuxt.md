@@ -2680,5 +2680,23 @@ alwaysApply: false
         refresh,
       };
     }
+
+    // Nuxt 3 Database Lock Contention & Deadlock Sentinel Composable
+    export function useDatabaseLockContentionSentinel() {
+      const { data: lockData, refresh } = useFetch('/api/admin/lock-contention');
+      const hasHeadOfLineContention = computed(() => {
+        return (lockData.value?.blockedQueries?.some((q: any) => q.wait_seconds > 2.0)) ?? false;
+      });
+      const unindexedFkRisk = computed(() => {
+        return lockData.value?.unindexedForeignKeys?.length ?? 0;
+      });
+
+      return {
+        lockData,
+        hasHeadOfLineContention,
+        unindexedFkRisk,
+        refresh,
+      };
+    }
     </script>
     ```

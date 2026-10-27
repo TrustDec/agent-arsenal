@@ -3268,4 +3268,133 @@ func (m *WALManager) AuditReplicationSlotRisk(ctx context.Context) ([]string, er
     }
     return atRiskSlots, nil
 }
+
+// Production Go Lock Manager, Canonical Total Ordering & Deadlock Retry Harness
+type DatabaseLockManager struct {
+    pool *pgxpool.Pool
+}
+
+func NewDatabaseLockManager(pool *pgxpool.Pool) *DatabaseLockManager {
+    return &DatabaseLockManager{pool: pool}
+}
+
+// ExecuteWithDeadlockRetry executes operations with exponential backoff and jitter for 40P01 and 55P03
+func (m *DatabaseLockManager) ExecuteWithDeadlockRetry(ctx context.Context, op func(ctx context.Context) error, maxAttempts int) error {
+    var err error
+    baseDelay := 40 * time.Millisecond
+    maxDelay := 800 * time.Millisecond
+
+    for attempt := 0; attempt < maxAttempts; attempt++ {
+        err = op(ctx)
+        if err == nil {
+            return nil
+        }
+
+        var pgErr *pgconn.PgError
+        if errors.As(err, &pgErr) {
+            // 40P01: deadlock_detected | 55P03: lock_not_available | 40001: serialization_failure
+            if pgErr.Code == "40P01" || pgErr.Code == "55P03" || pgErr.Code == "40001" {
+                limit := min(maxDelay, baseDelay*time.Duration(1<<attempt))
+                jitter := time.Duration(rand.Int63n(int64(limit)))
+
+                select {
+                case <-ctx.Done():
+                    return ctx.Err()
+                case <-time.After(jitter):
+                    continue
+                }
+            }
+        }
+        return err // Non-retryable error
+    }
+    return fmt.Errorf("exceeded max deadlock retry attempts (%d): %w", maxAttempts, err)
+}
+
+// TransferBalanceCanonical executes a dual-row balance update with strict canonical key sorting
+// Eliminates Wait-For Graph cycles, guaranteeing zero deadlocks across concurrent transfers
+func (m *DatabaseLockManager) TransferBalanceCanonical(ctx context.Context, fromID, toID int64, amount int64) error {
+    // Canonical total ordering: sort IDs ascending before acquiring locks
+    ids := []int64{fromID, toID}
+    sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+    return m.ExecuteWithDeadlockRetry(ctx, func(ctx context.Context) error {
+        tx, err := m.pool.Begin(ctx)
+        if err != nil {
+            return fmt.Errorf("begin tx: %w", err)
+        }
+        defer tx.Rollback(ctx)
+
+        // Arm Multi-Tier Timeout Ladder (fails fast on contention without pool starvation)
+        if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '1500ms'; SET LOCAL statement_timeout = '8000ms'"); err != nil {
+            return fmt.Errorf("set timeout ladder: %w", err)
+        }
+
+        const lockSQL = `
+            SELECT id, balance
+            FROM accounts
+            WHERE id = ANY($1)
+            ORDER BY id ASC
+            FOR UPDATE;
+        `
+        rows, err := tx.Query(ctx, lockSQL, ids)
+        if err != nil {
+            return fmt.Errorf("lock accounts: %w", err)
+        }
+        defer rows.Close()
+
+        balances := make(map[int64]int64)
+        for rows.Next() {
+            var id, bal int64
+            if err := rows.Scan(&id, &bal); err != nil {
+                return err
+            }
+            balances[id] = bal
+        }
+
+        if balances[fromID] < amount {
+            return fmt.Errorf("insufficient balance: current %d < required %d", balances[fromID], amount)
+        }
+
+        if _, err := tx.Exec(ctx, "UPDATE accounts SET balance = balance - $1 WHERE id = $2", amount, fromID); err != nil {
+            return fmt.Errorf("debit account: %w", err)
+        }
+        if _, err := tx.Exec(ctx, "UPDATE accounts SET balance = balance + $1 WHERE id = $2", amount, toID); err != nil {
+            return fmt.Errorf("credit account: %w", err)
+        }
+
+        return tx.Commit(ctx)
+    }, 5)
+}
+
+// AuditUnindexedForeignKeys detects foreign keys that lack supporting B-tree indexes
+func (m *DatabaseLockManager) AuditUnindexedForeignKeys(ctx context.Context) ([]string, error) {
+    ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+    defer cancel()
+
+    const sql = `
+        SELECT c.conrelid::regclass::text || '.' || c.conname
+        FROM pg_constraint c
+        WHERE c.contype = 'f'
+          AND NOT EXISTS (
+            SELECT 1 FROM pg_index i
+            WHERE i.indrelid = c.conrelid
+              AND (i.indkey::smallint[])[0:cardinality(c.conkey)-1] = c.conkey
+          );
+    `
+    rows, err := m.pool.Query(ctx, sql)
+    if err != nil {
+        return nil, fmt.Errorf("query unindexed fks: %w", err)
+    }
+    defer rows.Close()
+
+    var unindexed []string
+    for rows.Next() {
+        var name string
+        if err := rows.Scan(&name); err != nil {
+            return nil, err
+        }
+        unindexed = append(unindexed, name)
+    }
+    return unindexed, nil
+}
 ```

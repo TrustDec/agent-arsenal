@@ -2035,3 +2035,77 @@ alwaysApply: false
     INSERT INTO device_telemetry (device_id, payload, recorded_at) VALUES ('d-123', '{"val": 42}', NOW());
     COMMIT;
     ```
+
+- **Heavyweight Locks, Head-of-Line Blocking, Multi-Tier Timeout Ladders & Deadlock Prevention**:
+  - ❌ **Anti-Pattern: Un-timed DDL Freezing Pools, Non-Canonical Deadlocks & Leaked Advisory Locks**:
+    - Executing migrations, `ALTER TABLE`, or index drops with default `lock_timeout = 0`, queueing behind an active read and blocking all subsequent application reads in PostgreSQL's FIFO lock queue until connection pools exhaust.
+    - Updating multiple rows in random or client-provided order, creating circular dependencies in the wait-for graph and triggering `40P01 deadlock_detected`.
+    - Leaving `deadlock_timeout = 1000ms`, forcing mutually blocked worker threads to freeze for a full second before the cycle detector aborts one.
+    - Using session-level `pg_advisory_lock()` in connection-pooled environments (PgBouncer), leaking held locks across transactions to unrelated clients.
+    - Mutating parent rows without B-tree indexes on child foreign keys, triggering expensive child table scans and table-level lock contention.
+  - ✅ **Production Invariant**:
+    - Arm transactions with the Multi-Tier Timeout Ladder: `SET LOCAL lock_timeout = '1500ms'` and `SET LOCAL statement_timeout = '10000ms'`.
+    - Enforce Canonical Lexicographical Ordering: sort all primary keys ascending before acquiring locks via `SELECT ... WHERE id = ANY($1) ORDER BY id ASC FOR UPDATE`, mathematically proving an acyclic DAG.
+    - Tune `deadlock_timeout = 200ms` to slash deadlock detection latency by 80%.
+    - Use transaction-scoped advisory locks `pg_advisory_xact_lock()` or non-blocking `pg_try_advisory_xact_lock()`, auto-released on commit or rollback.
+    - Continuously audit and index 100% of foreign key columns to eliminate child table lock escalation.
+    ```sql
+    -- 1. Cluster-Wide Deadlock & Timeout Tuning
+    ALTER SYSTEM SET deadlock_timeout = '200ms';
+    ALTER SYSTEM SET lock_timeout = '2000ms';
+    ALTER SYSTEM SET statement_timeout = '10000ms';
+    ALTER SYSTEM SET idle_in_transaction_session_timeout = '5000ms';
+
+    -- 2. Audit Real-Time Contested Heavyweight Locks & Blocking PIDs
+    SELECT
+      blocked_locks.pid AS blocked_pid,
+      blocked_activity.usename AS blocked_user,
+      blocking_locks.pid AS blocking_pid,
+      blocking_activity.usename AS blocking_user,
+      blocked_activity.query AS blocked_statement,
+      blocking_activity.query AS current_statement_in_blocking_process,
+      blocked_locks.locktype,
+      blocked_locks.mode AS requested_mode,
+      blocking_locks.mode AS held_mode,
+      ROUND(EXTRACT(EPOCH FROM (NOW() - blocked_activity.query_start))::numeric, 2) AS wait_seconds
+    FROM pg_catalog.pg_locks blocked_locks
+    JOIN pg_catalog.pg_stat_activity blocked_activity ON blocked_activity.pid = blocked_locks.pid
+    JOIN pg_catalog.pg_locks blocking_locks
+      ON blocking_locks.locktype = blocked_locks.locktype
+      AND blocking_locks.database IS NOT DISTINCT FROM blocked_locks.database
+      AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation
+      AND blocking_locks.page IS NOT DISTINCT FROM blocked_locks.page
+      AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple
+      AND blocking_locks.pid != blocked_locks.pid
+    JOIN pg_catalog.pg_stat_activity blocking_activity ON blocking_activity.pid = blocking_locks.pid
+    WHERE NOT blocked_locks.granted;
+
+    -- 3. Audit Foreign Keys Lacking Supporting B-Tree Indexes
+    SELECT
+      c.conrelid::regclass AS child_table,
+      c.conname AS foreign_key_name,
+      ARRAY(
+        SELECT attname FROM pg_attribute
+        WHERE attrelid = c.conrelid AND attnum = ANY(c.conkey)
+      ) AS fk_columns,
+      c.confrelid::regclass AS parent_table
+    FROM pg_constraint c
+    WHERE c.contype = 'f'
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_index i
+        WHERE i.indrelid = c.conrelid
+          AND (i.indkey::smallint[])[0:cardinality(c.conkey)-1] = c.conkey
+      );
+
+    -- 4. Canonical Row-Level Locking with Timeout Ladder & Safe Advisory Lock
+    BEGIN;
+    SET LOCAL lock_timeout = '1500ms';
+    SET LOCAL statement_timeout = '5000ms';
+    -- Transaction-scoped advisory lock (safe in PgBouncer)
+    SELECT pg_advisory_xact_lock(hashtext('user-reconciliation-42'));
+    -- Canonical ascending lock acquisition eliminating wait-for cycles
+    SELECT id, balance FROM accounts WHERE id IN (10, 20) ORDER BY id ASC FOR UPDATE;
+    UPDATE accounts SET balance = balance - 100 WHERE id = 10;
+    UPDATE accounts SET balance = balance + 100 WHERE id = 20;
+    COMMIT;
+    ```

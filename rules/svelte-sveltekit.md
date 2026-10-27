@@ -3113,4 +3113,58 @@ alwaysApply: false
         {/each}
       </div>
     </div>
+
+    <!-- Svelte 5 Reactive Heavyweight Lock Contention & Deadlock Monitor -->
+    <script lang="ts">
+      interface BlockedQuery {
+        blockedPid: number;
+        blockedUser: string;
+        blockingPid: number;
+        blockingUser: string;
+        blockedStatement: string;
+        currentStatementInBlockingProcess: string;
+        waitSeconds: number;
+      }
+
+      interface LockContentionReport {
+        blockedQueries: BlockedQuery[];
+        deadlocksCount: number;
+        unindexedFksCount: number;
+      }
+
+      let { report }: { report: LockContentionReport } = $props();
+      let hasSevereContention = $derived(report.blockedQueries.some((q) => q.waitSeconds > 2.0));
+      let isClusterClean = $derived(report.blockedQueries.length === 0 && report.unindexedFksCount === 0);
+    </script>
+
+    <div class="lock-sentinel">
+      <header>
+        <h3>Database Lock Contention & Deadlock Sentinel</h3>
+        <span class={isClusterClean ? 'badge success' : 'badge warning'}>
+          Blocked Queries: {report.blockedQueries.length}
+        </span>
+      </header>
+
+      {#if hasSevereContention}
+        <div class="alert danger">
+          <strong>Head-of-Line Contention Alert:</strong> Queries waiting > 2s on contested table locks!
+        </div>
+      {/if}
+
+      {#if report.unindexedFksCount > 0}
+        <div class="alert warning">
+          <strong>Schema Warning:</strong> {report.unindexedFksCount} unindexed foreign keys risking lock escalation!
+        </div>
+      {/if}
+
+      <div class="blocks-list">
+        {#each report.blockedQueries as block (block.blockedPid)}
+          <div class="block-card">
+            <span class="pid">PID {block.blockedPid} blocked by PID {block.blockingPid}</span>
+            <span class="wait">{block.waitSeconds}s</span>
+            <p class="query">{block.blockedStatement}</p>
+          </div>
+        {/each}
+      </div>
+    </div>
     ```
