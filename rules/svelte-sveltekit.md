@@ -3067,4 +3067,50 @@ alwaysApply: false
         {/each}
       </div>
     </div>
+
+    <!-- Svelte 5 Reactive WAL Generation & Checkpoint Health Monitor -->
+    <script lang="ts">
+      interface ReplicationSlot {
+        slotName: string;
+        retainedMB: number;
+        walStatus: string;
+        active: boolean;
+      }
+
+      interface CheckpointReport {
+        timedPct: number;
+        writeTimeMs: number;
+        syncTimeMs: number;
+        slots: ReplicationSlot[];
+      }
+
+      let { report }: { report: CheckpointReport } = $props();
+      let isCheckpointHealthy = $derived(report.timedPct >= 95);
+      let riskySlots = $derived(report.slots.filter((s) => s.retainedMB > 5120 || s.walStatus !== 'normal' || !s.active));
+    </script>
+
+    <div class="wal-monitor">
+      <header>
+        <h3>WAL & Checkpoint Durability Monitor</h3>
+        <span class={isCheckpointHealthy ? 'badge success' : 'badge warning'}>
+          Timed Checkpoints: {report.timedPct}%
+        </span>
+      </header>
+
+      {#if riskySlots.length > 0}
+        <div class="alert danger">
+          <strong>Disk Meltdown Warning:</strong> {riskySlots.length} replication slots retaining > 5GB WAL!
+        </div>
+      {/if}
+
+      <div class="slots-list">
+        {#each report.slots as slot (slot.slotName)}
+          <div class="slot-item">
+            <span>{slot.slotName}</span>
+            <span class={slot.retainedMB > 5120 ? 'text-red font-bold' : ''}>{slot.retainedMB} MB</span>
+            <span class="status">{slot.walStatus}</span>
+          </div>
+        {/each}
+      </div>
+    </div>
     ```

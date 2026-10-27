@@ -1880,4 +1880,58 @@ alwaysApply: false
         }
       }
     );
+
+    // WAL, Checkpointing & Replication Slot Health Tool
+    server.tool(
+      'audit_database_wal_and_slots',
+      {
+        alertThresholdMB: z.number().default(5120).describe('Alert threshold in MB for retained WAL by replication slots'),
+      },
+      async ({ alertThresholdMB }) => {
+        const client = await dbPool.connect();
+        try {
+          // 1. Inspect Checkpoint Health (timed vs req)
+          const chkRes = await client.query(`
+            SELECT
+              checkpoints_timed,
+              checkpoints_req,
+              ROUND((checkpoints_timed::numeric / NULLIF(checkpoints_timed + checkpoints_req, 0)) * 100, 2) AS timed_pct,
+              checkpoint_write_time,
+              checkpoint_sync_time
+            FROM pg_stat_bgwriter;
+          `);
+
+          // 2. Inspect Replication Slots Retaining Excess WAL
+          const slotRes = await client.query(`
+            SELECT
+              slot_name,
+              plugin,
+              slot_type,
+              active,
+              COALESCE(wal_status, 'normal') AS wal_status,
+              ROUND((pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) / (1024.0 * 1024.0))::numeric, 2) AS retained_mb
+            FROM pg_replication_slots
+            ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) DESC;
+          `);
+
+          const slots = slotRes.rows;
+          const atRiskSlots = slots.filter((s: any) => Number(s.retained_mb) > alertThresholdMB || s.wal_status !== 'normal' || !s.active);
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                checkpointHealth: chkRes.rows[0] ?? {},
+                checkpointRatioAcceptable: Number(chkRes.rows[0]?.timed_pct ?? 100) >= 95,
+                replicationSlots: slots,
+                atRiskSlots,
+                hasDiskMeltdownRisk: atRiskSlots.length > 0,
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
     ```

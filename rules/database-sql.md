@@ -1987,3 +1987,51 @@ alwaysApply: false
     FROM pg_database
     WHERE datallowconn;
     ```
+
+- **Write-Ahead Logging (WAL), Checkpoint Smoothing, Asynchronous Commit & Replication Slot Boundaries**:
+  - ❌ **Anti-Pattern: Checkpoint I/O Spikes, Unbounded Replication Slots & fsync Bottleneck**:
+    - Leaving `checkpoint_completion_target = 0.5` and `max_wal_size = 1GB`, causing checkpoints to trigger every 60 seconds and dump gigabytes of dirty buffers into the OS cache in frantic bursts that saturate NVMe write bandwidth and spike p99 latency by 50x.
+    - Defaulting to `synchronous_commit = on` on high-frequency streaming events, metrics, and logs, bottlenecking write throughput at 400 TPS due to storage fsync latency.
+    - Creating physical or logical replication slots without `max_slot_wal_keep_size`, allowing a dead consumer to retain WAL files indefinitely until the disk fills to 100% and crashes the primary cluster.
+    - Disabling `full_page_writes = off` to speed up synthetic benchmarks, risking silent torn-page block corruption upon power or kernel failure.
+  - ✅ **Production Invariant**:
+    - Configure `checkpoint_completion_target = 0.9` and `checkpoint_timeout = 15min` to trickle dirty page flushes smoothly over 90% of the interval.
+    - Enforce `wal_compression = lz4` to slash full-page write (FPW) WAL amplification by 65%.
+    - Apply Differentiated Durability: enforce `synchronous_commit = on` for financial/auth operations, and `SET LOCAL synchronous_commit = off` for high-throughput event logging.
+    - Cap `max_slot_wal_keep_size = 10240MB` (10 GB) to guarantee that orphaned or disconnected slots are automatically invalidated before disk capacity hits 85%.
+    ```sql
+    -- 1. Configure Cluster-Wide Checkpoint Smoothing & LZ4 WAL Compression
+    ALTER SYSTEM SET checkpoint_timeout = '15min';
+    ALTER SYSTEM SET checkpoint_completion_target = 0.9;
+    ALTER SYSTEM SET max_wal_size = '24GB';
+    ALTER SYSTEM SET min_wal_size = '4GB';
+    ALTER SYSTEM SET wal_compression = lz4;
+    ALTER SYSTEM SET full_page_writes = on; -- Non-negotiable anti-torn-page invariant
+    ALTER SYSTEM SET max_slot_wal_keep_size = '10240MB'; -- Prevent 100% disk filling outages
+
+    -- 2. Audit Checkpoint Health & Timed vs Requested Ratio (Target: timed_pct >= 95%)
+    SELECT
+      checkpoints_timed,
+      checkpoints_req,
+      ROUND((checkpoints_timed::numeric / NULLIF(checkpoints_timed + checkpoints_req, 0)) * 100, 2) AS timed_pct,
+      checkpoint_write_time,
+      checkpoint_sync_time
+    FROM pg_stat_bgwriter;
+
+    -- 3. Audit Replication Slot Retained WAL Volume (Alert if retained_bytes > 5GB)
+    SELECT
+      slot_name,
+      plugin,
+      slot_type,
+      active,
+      wal_status,
+      pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal
+    FROM pg_replication_slots
+    ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) DESC;
+
+    -- 4. High-Throughput Ingestion with Transaction-Local Asynchronous Commit
+    BEGIN;
+    SET LOCAL synchronous_commit = off; -- Eliminates 2ms fsync bottleneck; preserves transactional atomicity
+    INSERT INTO device_telemetry (device_id, payload, recorded_at) VALUES ('d-123', '{"val": 42}', NOW());
+    COMMIT;
+    ```

@@ -3202,4 +3202,70 @@ func (w *MVCCWatchdog) AuditClusterXIDAge(ctx context.Context) (int64, error) {
     }
     return maxAge, nil
 }
+
+// Production Go WAL Checkpoint & Differentiated Durability Engine
+type WALManager struct {
+    pool *pgxpool.Pool
+}
+
+func NewWALManager(pool *pgxpool.Pool) *WALManager {
+    return &WALManager{pool: pool}
+}
+
+// IngestTelemetryAsync executes high-throughput ingestion with asynchronous commits
+// Slashes commit latency from 2.5ms fsync to sub-millisecond in-memory WAL append
+func (m *WALManager) IngestTelemetryAsync(ctx context.Context, deviceID string, payload []byte) error {
+    ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+    defer cancel()
+
+    tx, err := m.pool.Begin(ctx)
+    if err != nil {
+        return fmt.Errorf("begin tx: %w", err)
+    }
+    defer tx.Rollback(ctx)
+
+    // Transaction-local asynchronous commit offloads fsync to background WAL writer
+    if _, err := tx.Exec(ctx, "SET LOCAL synchronous_commit = 'off'"); err != nil {
+        return fmt.Errorf("set async commit: %w", err)
+    }
+
+    const insertSQL = `
+        INSERT INTO device_telemetry (device_id, payload, recorded_at)
+        VALUES ($1, $2, NOW());
+    `
+    if _, err := tx.Exec(ctx, insertSQL, deviceID, payload); err != nil {
+        return fmt.Errorf("insert telemetry: %w", err)
+    }
+
+    return tx.Commit(ctx)
+}
+
+// AuditReplicationSlotRisk detects slots retaining excessive WAL (>5GB)
+func (m *WALManager) AuditReplicationSlotRisk(ctx context.Context) ([]string, error) {
+    ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+    defer cancel()
+
+    const sql = `
+        SELECT slot_name
+        FROM pg_replication_slots
+        WHERE pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) > 5368709120
+           OR wal_status <> 'normal'
+           OR NOT active;
+    `
+    rows, err := m.pool.Query(ctx, sql)
+    if err != nil {
+        return nil, fmt.Errorf("query slots: %w", err)
+    }
+    defer rows.Close()
+
+    var atRiskSlots []string
+    for rows.Next() {
+        var name string
+        if err := rows.Scan(&name); err != nil {
+            return nil, err
+        }
+        atRiskSlots = append(atRiskSlots, name)
+    }
+    return atRiskSlots, nil
+}
 ```

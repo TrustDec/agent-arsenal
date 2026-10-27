@@ -2662,5 +2662,23 @@ alwaysApply: false
         refresh,
       };
     }
+
+    // Nuxt 3 WAL Health & Replication Slot Sentinel Composable
+    export function useDatabaseWALCheckpointWatchdog() {
+      const { data: walData, refresh } = useFetch('/api/admin/wal-health');
+      const isCheckpointRatioSuboptimal = computed(() => {
+        return (walData.value?.checkpointHealth?.timed_pct ?? 100) < 95;
+      });
+      const stalledReplicationSlots = computed(() => {
+        return walData.value?.replicationSlots?.filter((s: any) => s.retained_mb > 5120 || s.wal_status !== 'normal') ?? [];
+      });
+
+      return {
+        walData,
+        isCheckpointRatioSuboptimal,
+        stalledReplicationSlots,
+        refresh,
+      };
+    }
     </script>
     ```
