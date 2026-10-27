@@ -3621,4 +3621,62 @@ alwaysApply: false
         </div>
       {/if}
     </div>
+
+    <!-- Svelte 5 pgvector & HNSW Retrieval Sentinel Component -->
+    <script lang="ts">
+      interface VectorAuditSummary {
+        version: string;
+        uncompressedFp32Columns: string[];
+        lowEfIndexes: string[];
+        hasIterativeScanEnabled: boolean;
+      }
+
+      let { vectorSummary } = $props<{ vectorSummary: VectorAuditSummary }>();
+
+      let isVersionSupported = $derived(
+        parseFloat(vectorSummary.version.split('.').slice(0, 2).join('.')) >= 0.7
+      );
+      let hasMemoryWaste = $derived(vectorSummary.uncompressedFp32Columns.length > 0);
+      let isVectorHealthy = $derived(
+        isVersionSupported && !hasMemoryWaste && vectorSummary.lowEfIndexes.length === 0
+      );
+    </script>
+
+    <div class="vector-sentinel-card" class:warning={!isVectorHealthy}>
+      <header>
+        <h4>pgvector HNSW & Quantization Sentinel</h4>
+        <span class={`badge ${isVectorHealthy ? 'success' : 'danger'}`}>
+          {isVectorHealthy ? 'HEALTHY' : 'OPTIMIZATION NEEDED'}
+        </span>
+      </header>
+
+      {#if !isVersionSupported}
+        <div class="alert danger">
+          <strong>Outdated pgvector Version ({vectorSummary.version}):</strong>
+          <p>Upgrade to &gt;= 0.7.0 for halfvec and hnsw.iterative_scan support.</p>
+        </div>
+      {/if}
+
+      {#if hasMemoryWaste}
+        <div class="alert warning">
+          <strong>Uncompressed FP32 Embeddings (Memory Waste):</strong>
+          <ul>
+            {#each vectorSummary.uncompressedFp32Columns as col}
+              <li>{col} (Migrate to halfvec to cut RAM by 50%)</li>
+            {/each}
+          </ul>
+        </div>
+      {/if}
+
+      {#if vectorSummary.lowEfIndexes.length > 0}
+        <div class="alert warning">
+          <strong>Suboptimal HNSW Search Depth (ef_construction &lt; 64):</strong>
+          <ul>
+            {#each vectorSummary.lowEfIndexes as idx}
+              <li>{idx}</li>
+            {/each}
+          </ul>
+        </div>
+      {/if}
+    </div>
     ```

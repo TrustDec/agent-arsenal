@@ -4145,4 +4145,124 @@ func (s *MonotonicEventSink) BulkInsertMonotonic(ctx context.Context, table stri
 
     return nil
 }
+
+// ============================================================================
+// 14. PostgreSQL pgvector HNSW Vector Search, Unit Normalization & Iterative Scan
+// ============================================================================
+
+// UnitNormalizeVector normalizes a float32 slice to unit Euclidean length (||v|| = 1.0).
+// Invariant: Unlocks line-rate SIMD AVX-512 Inner Product operations without square roots.
+func UnitNormalizeVector(vec []float32) error {
+    var sumSquares float64
+    for _, val := range vec {
+        sumSquares += float64(val) * float64(val)
+    }
+
+    norm := math.Sqrt(sumSquares)
+    if norm == 0 || math.IsNaN(norm) || math.IsInf(norm, 0) {
+        return fmt.Errorf("invalid vector Euclidean norm: %f", norm)
+    }
+
+    invNorm := float32(1.0 / norm)
+    for i := range vec {
+        vec[i] *= invNorm
+    }
+    return nil
+}
+
+// FilteredVectorChunk represents a retrieved chunk with similarity score.
+type FilteredVectorChunk struct {
+    ID         uuid.UUID `json:"id"`
+    TenantID   uuid.UUID `json:"tenantId"`
+    DocumentID uuid.UUID `json:"documentId"`
+    Content    string    `json:"content"`
+    Similarity float64   `json:"similarity"`
+}
+
+// VectorRepository executes filtered vector retrieval with iterative scan safety.
+type VectorRepository struct {
+    pool *pgxpool.Pool
+}
+
+func NewVectorRepository(pool *pgxpool.Pool) *VectorRepository {
+    return &VectorRepository{pool: pool}
+}
+
+// SearchFilteredChunks executes filtered HNSW search with hnsw.iterative_scan = 'relaxed_order'.
+// Invariant: Prevents the 0-row discard catastrophe when filtering by tenant_id.
+func (r *VectorRepository) SearchFilteredChunks(
+    ctx context.Context,
+    tenantID uuid.UUID,
+    queryVec []float32,
+    efSearch int,
+    limit int,
+) ([]FilteredVectorChunk, error) {
+    if err := UnitNormalizeVector(queryVec); err != nil {
+        return nil, fmt.Errorf("normalize vector: %w", err)
+    }
+
+    // Format vector as string literal for pgvector halfvec/vector
+    var b strings.Builder
+    b.WriteString("[")
+    for i, v := range queryVec {
+        if i > 0 {
+            b.WriteString(",")
+        }
+        b.WriteString(fmt.Sprintf("%f", v))
+    }
+    b.WriteString("]")
+    vecStr := b.String()
+
+    tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+    if err != nil {
+        return nil, fmt.Errorf("begin vector search tx: %w", err)
+    }
+    defer tx.Rollback(ctx)
+
+    // Set transactional GUCs for iterative scanning and calibrated recall
+    if _, err := tx.Exec(ctx, "SET LOCAL hnsw.iterative_scan = 'relaxed_order'"); err != nil {
+        return nil, fmt.Errorf("activate iterative_scan: %w", err)
+    }
+    if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL hnsw.ef_search = %d", efSearch)); err != nil {
+        return nil, fmt.Errorf("configure ef_search: %w", err)
+    }
+
+    query := `
+        SELECT
+            id,
+            tenant_id,
+            document_id,
+            content,
+            1 - (embedding <=> $1::halfvec) AS score
+        FROM document_chunks
+        WHERE tenant_id = $2
+        ORDER BY embedding <=> $1::halfvec
+        LIMIT $3;
+    `
+
+    rows, err := tx.Query(ctx, query, vecStr, tenantID, limit)
+    if err != nil {
+        return nil, fmt.Errorf("execute vector query: %w", err)
+    }
+    defer rows.Close()
+
+    var chunks []FilteredVectorChunk
+    for rows.Next() {
+        var c FilteredVectorChunk
+        if err := rows.Scan(&c.ID, &c.TenantID, &c.DocumentID, &c.Content, &c.Similarity); err != nil {
+            return nil, fmt.Errorf("scan vector row: %w", err)
+        }
+        chunks = append(chunks, c)
+    }
+
+    if err := rows.Err(); err != nil {
+        return nil, fmt.Errorf("rows iteration: %w", err)
+    }
+
+    if err := tx.Commit(ctx); err != nil {
+        return nil, fmt.Errorf("commit vector search tx: %w", err)
+    }
+
+    return chunks, nil
+}
 ```

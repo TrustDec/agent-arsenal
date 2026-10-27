@@ -2511,3 +2511,57 @@ alwaysApply: false
     ORDER BY recorded_at ASC
     LIMIT 500;
     ```
+
+- **Database pgvector HNSW Indexing, Halfvec Quantization, Filtered Vector Recall & Memory Amplification Defense**:
+  - ❌ **Anti-Pattern: Filtered Vector 0-Row Under-Recall, Uncompressed FP32 Shared Buffers Eviction, Build Memory Starvation, and Operator Opclass Mismatch**:
+    - Executing filtered vector queries (`WHERE tenant_id = $1 ORDER BY embedding <=> $2 LIMIT 10`) without setting `hnsw.iterative_scan = 'relaxed_order'`, causing HNSW graph traversal to evaluate top-$K$ candidates globally, reject non-matching rows during post-filtering, and return 0 results even when relevant documents exist.
+    - Storing high-dimensional embeddings as raw `vector(1536)` (float32, 4 bytes/dim), consuming 6.1KB per row and dozens of gigabytes in RAM, evicting relational tables and B-tree indexes from `shared_buffers`.
+    - Creating HNSW indexes under default `maintenance_work_mem = 64MB`, triggering disk swap thrashing and turning a 4-minute index build into an 18-hour frozen database lockup.
+    - Creating indexes with `vector_cosine_ops` (`<=>`) but querying with Euclidean `<->` or inner product `<#>`, silently bypassing the HNSW index and running full-table sequential vector scans.
+  - ✅ **Production Invariant**:
+    - Migrate high-dimensional embeddings ($\ge 1024$ dims) to PostgreSQL pgvector 0.7.0+ `halfvec(1536)` (16-bit float) to cut memory usage by $50\%$ with $<0.05\%$ recall loss, or use Binary Quantization `bit(1536)` with Hamming distance `<~>` for two-phase candidate re-ranking.
+    - Always activate `SET LOCAL hnsw.iterative_scan = 'relaxed_order'` and calibrate `SET LOCAL hnsw.ef_search = 100` inside transactions executing filtered vector queries.
+    - Allocate `SET LOCAL maintenance_work_mem = '4GB'` and `SET LOCAL max_parallel_maintenance_workers = 4` before executing `CREATE INDEX CONCURRENTLY ... USING hnsw`.
+    - Enforce unit-length normalization ($\|\mathbf{v}\|_2 = 1.0$) at insertion time to unlock fused multiply-add SIMD AVX-512 Inner Product line-rate acceleration.
+    ```sql
+    -- 1. Table with Halfvec 16-Bit Quantized Embedding & Tenant Indexing
+    CREATE TABLE IF NOT EXISTS document_chunks (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL,
+      document_id UUID NOT NULL,
+      content TEXT NOT NULL,
+      embedding halfvec(1536) NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CLOCK_TIMESTAMP()
+    );
+
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chunks_tenant_created
+      ON document_chunks (tenant_id, created_at DESC);
+
+    -- 2. Parallel HNSW Index Build with Calibrated Session Memory
+    SET maintenance_work_mem = '4GB';
+    SET max_parallel_maintenance_workers = 4;
+
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chunks_embedding_hnsw
+      ON document_chunks
+      USING hnsw (embedding halfvec_cosine_ops)
+      WITH (m = 16, ef_construction = 128);
+
+    RESET maintenance_work_mem;
+    RESET max_parallel_maintenance_workers;
+
+    -- 3. Filtered Vector Retrieval with Transactional Iterative Scan Guardrail
+    BEGIN;
+    SET LOCAL hnsw.iterative_scan = 'relaxed_order';
+    SET LOCAL hnsw.ef_search = 100;
+
+    SELECT
+      id,
+      tenant_id,
+      content,
+      1 - (embedding <=> $1::halfvec(1536)) AS similarity
+    FROM document_chunks
+    WHERE tenant_id = $2::UUID
+    ORDER BY embedding <=> $1::halfvec(1536)
+    LIMIT 10;
+    COMMIT;
+    ```

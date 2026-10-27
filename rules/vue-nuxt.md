@@ -2907,5 +2907,34 @@ alwaysApply: false
         refresh,
       };
     }
+
+    // Nuxt 3 Database pgvector & HNSW Quantization Composable
+    // Monitors pgvector version, uncompressed FP32 columns, and HNSW graph parameters
+    export function useDatabaseVectorSentinel(schemaName: string = 'public') {
+      const { data: vectorData, refresh } = useFetch(`/api/admin/database-vector/${schemaName}`);
+
+      const isVersionSupported = computed(() => {
+        const ver = vectorData.value?.pgvectorVersion || '0.0.0';
+        const [major, minor] = ver.split('.').map(Number);
+        return major > 0 || minor >= 7;
+      });
+
+      const uncompressedColumns = computed(() => {
+        const cols = vectorData.value?.vectorColumns || [];
+        return cols.filter((c: any) => c.data_type === 'vector' && c.dimensions >= 1024);
+      });
+
+      const isVectorFleetOptimal = computed(() => {
+        return isVersionSupported.value && uncompressedColumns.value.length === 0;
+      });
+
+      return {
+        vectorData,
+        isVersionSupported,
+        uncompressedColumns,
+        isVectorFleetOptimal,
+        refresh,
+      };
+    }
     </script>
     ```

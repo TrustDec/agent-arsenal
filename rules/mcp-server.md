@@ -2699,4 +2699,103 @@ alwaysApply: false
         }
       }
     );
+
+    // Tool: audit_pgvector_hnsw_health
+    // Audits pgvector extension, HNSW parameters, Halfvec quantization, and filtered scan configuration
+    server.tool(
+      'audit_pgvector_hnsw_health',
+      'Audits PostgreSQL pgvector extension version, vector columns, halfvec quantization, HNSW graph parameters, and filtered recall settings.',
+      {
+        schemaName: z.string().default('public').describe('Schema name to inspect'),
+      },
+      async ({ schemaName }) => {
+        const client = await pool.connect();
+        try {
+          // 1. Check pgvector extension version
+          const extRes = await client.query(`
+            SELECT default_version, installed_version
+            FROM pg_available_extensions
+            WHERE name = 'vector';
+          `);
+
+          if (extRes.rowCount === 0 || !extRes.rows[0].installed_version) {
+            return {
+              isError: true,
+              content: [{ type: 'text', text: 'pgvector extension is not installed in the cluster.' }],
+            };
+          }
+
+          const version = extRes.rows[0].installed_version;
+
+          // 2. Discover vector columns & storage format
+          const colRes = await client.query(`
+            SELECT
+              c.relname AS table_name,
+              a.attname AS column_name,
+              t.typname AS data_type,
+              a.atttypmod AS dimensions,
+              pg_relation_size(c.oid) AS table_size_bytes
+            FROM pg_attribute a
+            JOIN pg_class c ON c.oid = a.attrelid
+            JOIN pg_type t ON t.oid = a.atttypid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = $1
+              AND t.typname IN ('vector', 'halfvec', 'bit')
+              AND a.attnum > 0
+              AND NOT a.attisdropped;
+          `, [schemaName]);
+
+          // 3. Inspect HNSW indexes
+          const idxRes = await client.query(`
+            SELECT
+              i.relname AS index_name,
+              t.relname AS table_name,
+              a.attname AS column_name,
+              opc.opcname AS opclass,
+              pg_relation_size(i.oid) AS index_size_bytes,
+              pg_get_indexdef(i.oid) AS index_def
+            FROM pg_index x
+            JOIN pg_class t ON t.oid = x.indrelid
+            JOIN pg_class i ON i.oid = x.indexrelid
+            JOIN pg_am am ON am.oid = i.relam
+            JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(x.indkey)
+            JOIN pg_opclass opc ON opc.oid = ANY(x.indclass)
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            WHERE am.amname = 'hnsw'
+              AND n.nspname = $1;
+          `, [schemaName]);
+
+          const warnings: string[] = [];
+          for (const col of colRes.rows) {
+            if (col.data_type === 'vector' && col.dimensions >= 1024) {
+              warnings.push(`Column ${col.table_name}.${col.column_name} uses FP32 vector(${col.dimensions}). Convert to halfvec(${col.dimensions}) to cut RAM footprint by 50%.`);
+            }
+          }
+
+          for (const idx of idxRes.rows) {
+            const efMatch = idx.index_def.match(/ef_construction\s*=\s*'(\d+)'/i) || idx.index_def.match(/ef_construction\s*=\s*(\d+)/i);
+            const ef = efMatch ? parseInt(efMatch[1], 10) : 64;
+            if (ef < 64) {
+              warnings.push(`HNSW index ${idx.index_name} has low ef_construction (${ef}). Recall and graph connectivity may be degraded!`);
+            }
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                pgvectorVersion: version,
+                vectorColumnsCount: colRes.rowCount,
+                vectorColumns: colRes.rows,
+                hnswIndexesCount: idxRes.rowCount,
+                hnswIndexes: idxRes.rows,
+                warnings,
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
     ```
