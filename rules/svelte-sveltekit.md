@@ -2795,6 +2795,75 @@ alwaysApply: false
     };
     ```
 
+- **SvelteKit Server Loaders Keyset Pagination & Anti-N+1 Batching**:
+  - ❌ **Anti-Pattern: `OFFSET` Pagination & N+1 Queries in `load` Functions**: Using `searchParams.get('page')` with `OFFSET` in `+page.server.ts` or fetching related records sequentially for each row inside the server loader.
+  - ✅ **Production Invariant**: Implement opaque keyset cursors via search params and batch fetch child relations in a single database query:
+    ```typescript
+    // src/routes/dashboard/orders/+page.server.ts
+    import type { PageServerLoad } from './$types';
+    import { pool } from '$lib/server/db';
+    import { error } from '@sveltejs/kit';
+
+    export const load: PageServerLoad = async ({ url, locals }) => {
+      const cursor = url.searchParams.get('cursor');
+      const limit = 20;
+
+      const client = await pool.connect();
+      try {
+        let query = `
+          SELECT id, tenant_id, status, total_amount, created_at
+          FROM orders
+          WHERE tenant_id = $1`;
+        const params: any[] = [locals.tenantId];
+
+        if (cursor) {
+          const [cursorTime, cursorId] = Buffer.from(cursor, 'base64url').toString().split('|');
+          query += ` AND (created_at, id) < ($2, $3)`;
+          params.push(cursorTime, cursorId);
+        }
+
+        query += ` ORDER BY created_at DESC, id DESC LIMIT $${params.length + 1}`;
+        params.push(limit);
+
+        const ordersRes = await client.query(query, params);
+        if (ordersRes.rows.length === 0) {
+          return { orders: [], nextCursor: null };
+        }
+
+        // Anti-N+1: Batch fetch items for all loaded orders in exactly ONE query
+        const orderIds = ordersRes.rows.map((r) => r.id);
+        const itemsRes = await client.query(
+          `SELECT order_id, product_id, quantity, unit_price FROM order_items WHERE order_id = ANY($1::UUID[])`,
+          [orderIds]
+        );
+
+        const itemsByOrderId = new Map<string, any[]>();
+        for (const item of itemsRes.rows) {
+          const list = itemsByOrderId.get(item.order_id) ?? [];
+          list.push(item);
+          itemsByOrderId.set(item.order_id, list);
+        }
+
+        const enriched = ordersRes.rows.map((order) => ({
+          ...order,
+          items: itemsByOrderId.get(order.id) ?? [],
+        }));
+
+        const last = enriched[enriched.length - 1];
+        const nextCursor = enriched.length === limit
+          ? Buffer.from(`${last.created_at.toISOString()}|${last.id}`).toString('base64url')
+          : null;
+
+        return { orders: enriched, nextCursor };
+      } catch (err: any) {
+        throw error(500, `Failed to load orders: ${err.message}`);
+      } finally {
+        client.release();
+      }
+    };
+    ```
+
+
 
 
 

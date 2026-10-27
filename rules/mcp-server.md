@@ -1507,6 +1507,81 @@ alwaysApply: false
     });
     ```
 
+- **MCP Database Query Tools Keyset Pagination & Anti-N+1 Batching**:
+  - ❌ **Anti-Pattern: Returning Massive Unbounded Lists or Using `OFFSET` in Agent Tools**: Exposing tool parameters like `page: number` with `OFFSET (page * limit)` or allowing agents to trigger N+1 tool invocations (one tool call per item).
+  - ✅ **Production Invariant**: Mandate keyset pagination via opaque cursor tokens in MCP tool schemas, batch fetch child associations within a single tool run, and cap maximum result sets:
+    ```typescript
+    // Industrial MCP Database Tool with Keyset Cursor Pagination & Batch Child Hydration
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      if (request.params.name !== 'list_orders') return;
+
+      const { tenantId, status, cursor, limit = 20 } = request.params.arguments as {
+        tenantId: string;
+        status: string;
+        cursor?: string;
+        limit?: number;
+      };
+
+      const boundedLimit = Math.min(Math.max(limit, 1), 50); // Cap tool result size
+      const client = await dbPool.connect();
+      try {
+        let sql = `
+          SELECT id, customer_id, status, total_amount, created_at
+          FROM orders
+          WHERE tenant_id = $1 AND status = $2`;
+        const params: any[] = [tenantId, status];
+
+        if (cursor) {
+          const [cursorTime, cursorId] = Buffer.from(cursor, 'base64url').toString().split('|');
+          sql += ` AND (created_at, id) < ($3, $4)`;
+          params.push(cursorTime, cursorId);
+        }
+
+        sql += ` ORDER BY created_at DESC, id DESC LIMIT $${params.length + 1}`;
+        params.push(boundedLimit);
+
+        const orderRes = await client.query(sql, params);
+        if (orderRes.rows.length === 0) {
+          return { content: [{ type: 'text', text: JSON.stringify({ orders: [], nextCursor: null }) }] };
+        }
+
+        // Single-roundtrip batch child hydration (prevents agent N+1 tool cascade)
+        const orderIds = orderRes.rows.map((r: any) => r.id);
+        const itemRes = await client.query(
+          `SELECT order_id, product_id, quantity, unit_price FROM order_items WHERE order_id = ANY($1::UUID[])`,
+          [orderIds]
+        );
+
+        const itemsByOrderId = new Map<string, any[]>();
+        for (const item of itemRes.rows) {
+          const list = itemsByOrderId.get(item.order_id) ?? [];
+          list.push(item);
+          itemsByOrderId.set(item.order_id, list);
+        }
+
+        const enriched = orderRes.rows.map((o: any) => ({
+          ...o,
+          items: itemsByOrderId.get(o.id) ?? [],
+        }));
+
+        const last = enriched[enriched.length - 1];
+        const nextCursor = enriched.length === boundedLimit
+          ? Buffer.from(`${last.created_at.toISOString()}|${last.id}`).toString('base64url')
+          : null;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ orders: enriched, nextCursor }),
+          }],
+        };
+      } finally {
+        client.release();
+      }
+    });
+    ```
+
+
 
 
 

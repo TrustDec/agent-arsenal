@@ -2828,6 +2828,71 @@ alwaysApply: false
     }
     ```
 
+- **PostgreSQL Keyset Cursor Pagination & Anti-N+1 Batch Loading in Go (`pgxpool`)**:
+  - ❌ **Anti-Pattern: In-Loop Queries & Deep `OFFSET` Pagination**: Querying child items inside a loop iterating over parent rows, or executing `LIMIT 20 OFFSET 10000` which forces PostgreSQL to scan and discard 10,000 rows on every page request.
+  - ✅ **Production Invariant**: Use tuple comparison keyset pagination `(created_at, id) < ($1, $2)` with covering composite indexes and batch fetch child associations in a single roundtrip via `= ANY($1)`:
+    ```go
+    // Industrial Keyset Cursor Pagination (O(1) Seek Time at Any Page Depth)
+    func (r *OrderRepo) ListOrdersKeyset(ctx context.Context, tenantID uuid.UUID, cursorTime time.Time, cursorID uuid.UUID, limit int) ([]Order, error) {
+        queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+        defer cancel()
+
+        query := `
+            SELECT id, tenant_id, status, total_amount, created_at
+            FROM orders
+            WHERE tenant_id = $1 AND (created_at, id) < ($2, $3)
+            ORDER BY created_at DESC, id DESC
+            LIMIT $4`
+
+        rows, err := r.pool.Query(queryCtx, query, tenantID, cursorTime, cursorID, limit)
+        if err != nil {
+            return nil, fmt.Errorf("list orders keyset: %w", err)
+        }
+        defer rows.Close()
+
+        var orders []Order
+        for rows.Next() {
+            var o Order
+            if err := rows.Scan(&o.ID, &o.TenantID, &o.Status, &o.TotalAmount, &o.CreatedAt); err != nil {
+                return nil, err
+            }
+            orders = append(orders, o)
+        }
+        return orders, rows.Err()
+    }
+
+    // Anti-N+1: Batch Fetch Child Items for All Orders in Exactly 1 Roundtrip
+    func (r *OrderRepo) BatchGetItems(ctx context.Context, orderIDs []uuid.UUID) (map[uuid.UUID][]Item, error) {
+        if len(orderIDs) == 0 {
+            return make(map[uuid.UUID][]Item), nil
+        }
+        queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+        defer cancel()
+
+        query := `
+            SELECT id, order_id, product_id, quantity, unit_price
+            FROM order_items
+            WHERE order_id = ANY($1::UUID[])`
+
+        rows, err := r.pool.Query(queryCtx, query, orderIDs)
+        if err != nil {
+            return nil, fmt.Errorf("batch get items: %w", err)
+        }
+        defer rows.Close()
+
+        itemMap := make(map[uuid.UUID][]Item, len(orderIDs))
+        for rows.Next() {
+            var item Item
+            if err := rows.Scan(&item.ID, &item.OrderID, &item.ProductID, &item.Quantity, &item.UnitPrice); err != nil {
+                return nil, err
+            }
+            itemMap[item.OrderID] = append(itemMap[item.OrderID], item)
+        }
+        return itemMap, rows.Err()
+    }
+    ```
+
+
 
 
 

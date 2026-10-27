@@ -2446,6 +2446,76 @@ alwaysApply: false
     });
     ```
 
+- **Nuxt 3 Nitro Server Routes Keyset Cursor Pagination & Anti-N+1 Batch Loading**:
+  - ❌ **Anti-Pattern: In-Loop Database Calls & Deep `OFFSET` in Nitro Event Handlers**: Iterating over parent rows and issuing individual child queries inside `server/api/`, or using `OFFSET` pagination that degrades exponentially with page depth.
+  - ✅ **Production Invariant**: Mandate keyset pagination via opaque cursor tokens and batch fetch all child relations in a single database roundtrip:
+    ```typescript
+    // server/api/orders/index.get.ts
+    import { defineEventHandler, getQuery, createError } from 'h3';
+    import { dbPool } from '~/server/utils/db';
+
+    export default defineEventHandler(async (event) => {
+      const query = getQuery(event);
+      const tenantId = event.context.auth?.tenantId;
+      const cursor = query.cursor as string | undefined;
+      const limit = Math.min(Math.max(Number(query.limit) || 20, 1), 50);
+
+      const client = await dbPool.connect();
+      try {
+        let sql = `
+          SELECT id, tenant_id, status, total_amount, created_at
+          FROM orders
+          WHERE tenant_id = $1`;
+        const params: any[] = [tenantId];
+
+        if (cursor) {
+          const [cursorTime, cursorId] = Buffer.from(cursor, 'base64url').toString().split('|');
+          sql += ` AND (created_at, id) < ($2, $3)`;
+          params.push(cursorTime, cursorId);
+        }
+
+        sql += ` ORDER BY created_at DESC, id DESC LIMIT $${params.length + 1}`;
+        params.push(limit);
+
+        const ordersRes = await client.query(sql, params);
+        if (ordersRes.rows.length === 0) {
+          return { items: [], nextCursor: null };
+        }
+
+        // Anti-N+1: Batch fetch all items in exactly 1 roundtrip
+        const orderIds = ordersRes.rows.map((r: any) => r.id);
+        const itemsRes = await client.query(
+          `SELECT order_id, product_id, quantity, unit_price FROM order_items WHERE order_id = ANY($1::UUID[])`,
+          [orderIds]
+        );
+
+        const itemsByOrderId = new Map<string, any[]>();
+        for (const item of itemsRes.rows) {
+          const list = itemsByOrderId.get(item.order_id) ?? [];
+          list.push(item);
+          itemsByOrderId.set(item.order_id, list);
+        }
+
+        const enriched = ordersRes.rows.map((order: any) => ({
+          ...order,
+          items: itemsByOrderId.get(order.id) ?? [],
+        }));
+
+        const last = enriched[enriched.length - 1];
+        const nextCursor = enriched.length === limit
+          ? Buffer.from(`${last.created_at.toISOString()}|${last.id}`).toString('base64url')
+          : null;
+
+        return { items: enriched, nextCursor };
+      } catch (err: any) {
+        throw createError({ statusCode: 500, message: `Failed to fetch orders: ${err.message}` });
+      } finally {
+        client.release();
+      }
+    });
+    ```
+
+
 
 
 

@@ -1758,6 +1758,32 @@ alwaysApply: false
       AND (NOW() - state_change) > INTERVAL '10 seconds';
     ```
 
+- **Query Indexing Physics, Leftmost Prefix Ordering & Anti-N+1 Batch Loading**:
+  - ❌ **Anti-Pattern: Unindexed Foreign Keys, Offset Pagination Cliffs & N+1 Iteration**: Leaving foreign keys unindexed, paginating large tables with `OFFSET 500000`, or querying child records within application iteration loops.
+  - ✅ **Production Invariant**: Mandate B-tree indexes on all foreign keys, enforce composite index leftmost prefix ordering `(Equality -> Range -> Sort)`, implement keyset cursor pagination `(created_at, id) < (:time, :id)`, and batch child lookups via `WHERE parent_id = ANY($1)`:
+    ```sql
+    -- Covering Composite Index: Leftmost Prefix Rule (tenant_id = ?) AND (status = ?) ORDER BY created_at DESC, id DESC
+    -- Using INCLUDE for Index-Only Scans avoiding table heap access
+    CREATE INDEX idx_orders_tenant_status_covering 
+    ON orders (tenant_id, status, created_at DESC, id DESC)
+    INCLUDE (total_amount);
+
+    -- Deterministic O(1) Keyset Cursor Pagination (No OFFSET)
+    SELECT id, tenant_id, status, total_amount, created_at
+    FROM orders
+    WHERE tenant_id = 'a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d'::UUID
+      AND status = 'completed'
+      AND (created_at, id) < ('2026-10-27T10:00:00.000Z'::TIMESTAMPTZ, '9f8e7d6c-5b4a-3210-fedc-ba9876543210'::UUID)
+    ORDER BY created_at DESC, id DESC
+    LIMIT 20;
+
+    -- Anti-N+1: Batch fetch all child records across 500 orders in ONE roundtrip
+    SELECT order_id, id AS item_id, product_id, quantity, unit_price
+    FROM order_items
+    WHERE order_id = ANY($1::UUID[]);
+    ```
+
+
 
 
 
