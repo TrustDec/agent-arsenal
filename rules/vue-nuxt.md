@@ -2698,5 +2698,23 @@ alwaysApply: false
         refresh,
       };
     }
+
+    // Nuxt 3 Database High Availability & Failover Sentinel Composable
+    export function useDatabaseHAClusterSentinel() {
+      const { data: haData, refresh } = useFetch('/api/admin/ha-topology');
+      const hasSevereReplicationLag = computed(() => {
+        return (haData.value?.standbys?.some((s: any) => s.lag_seconds > 5.0)) ?? false;
+      });
+      const isZeroRpoGuaranteed = computed(() => {
+        return haData.value?.hasZeroRpoSync ?? false;
+      });
+
+      return {
+        haData,
+        hasSevereReplicationLag,
+        isZeroRpoGuaranteed,
+        refresh,
+      };
+    }
     </script>
     ```

@@ -2017,4 +2017,66 @@ alwaysApply: false
         }
       }
     );
+
+    // Database High Availability, Standby Replication & Failover Readiness Sentinel Tool
+    server.tool(
+      'audit_database_ha_and_failover_topology',
+      {
+        maxAllowedLagSeconds: z.number().default(5).describe('Maximum tolerable standby replication lag in seconds before alerting'),
+      },
+      async ({ maxAllowedLagSeconds }) => {
+        const client = await dbPool.connect();
+        try {
+          // 1. Audit Primary vs Standby Node State
+          const roleRes = await client.query(`
+            SELECT
+              pg_is_in_recovery() AS is_in_recovery,
+              current_setting('transaction_read_only') AS is_read_only,
+              current_setting('synchronous_commit') AS synchronous_commit,
+              current_setting('synchronous_standby_names') AS synchronous_standby_names,
+              current_setting('wal_log_hints') AS wal_log_hints;
+          `);
+
+          // 2. Audit Streaming Standby Replicas & Sync Status
+          const repRes = await client.query(`
+            SELECT
+              client_addr::text AS standby_ip,
+              application_name,
+              sync_state,
+              state,
+              ROUND((pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) / (1024.0 * 1024.0))::numeric, 2) AS lag_mb,
+              ROUND(EXTRACT(EPOCH FROM (NOW() - reply_time))::numeric, 2) AS lag_seconds
+            FROM pg_stat_replication;
+          `);
+
+          const standbys = repRes.rows;
+          const nodeRole = roleRes.rows[0];
+          const laggingStandbys = standbys.filter((s: any) => Number(s.lag_seconds) > maxAllowedLagSeconds);
+          const hasZeroRpoSync = standbys.some((s: any) => s.sync_state === 'sync' || s.sync_state === 'quorum');
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                isPrimaryNode: !nodeRole?.is_in_recovery,
+                isReadOnly: nodeRole?.is_read_only === 'on',
+                synchronousCommitConfig: nodeRole?.synchronous_commit,
+                synchronousStandbyConfig: nodeRole?.synchronous_standby_names,
+                walLogHintsEnabled: nodeRole?.wal_log_hints === 'on',
+                connectedStandbysCount: standbys.length,
+                hasZeroRpoSync,
+                standbys,
+                laggingStandbys,
+                failoverReadiness: {
+                  isSafeForFailover: hasZeroRpoSync && laggingStandbys.length === 0,
+                  canUsePgRewind: nodeRole?.wal_log_hints === 'on',
+                },
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
     ```

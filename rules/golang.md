@@ -3397,4 +3397,72 @@ func (m *DatabaseLockManager) AuditUnindexedForeignKeys(ctx context.Context) ([]
     }
     return unindexed, nil
 }
+
+// ==============================================================================
+// 14. High Availability, Automated Failover & Multi-Host pgxpool Invariants
+// ==============================================================================
+
+// HAFailoverPool wraps pgxpool with multi-host failover and target_session_attrs verification
+type HAFailoverPool struct {
+    pool *pgxpool.Pool
+}
+
+// NewHAFailoverPool creates a resilient pool supporting multi-host PostgreSQL topologies
+// Example connString: "postgres://user:pass@node1:5432,node2:5432,node3:5432/db?target_session_attrs=read-write&sslmode=verify-full"
+func NewHAFailoverPool(ctx context.Context, connString string) (*HAFailoverPool, error) {
+    config, err := pgxpool.ParseConfig(connString)
+    if err != nil {
+        return nil, fmt.Errorf("parse multi-host conn string: %w", err)
+    }
+
+    // Handshake hook: ensure every newly checked out or established connection is a writable leader
+    config.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+        var isReadOnly string
+        if err := conn.QueryRow(ctx, "SHOW transaction_read_only").Scan(&isReadOnly); err != nil {
+            return fmt.Errorf("read-only handshake query failed: %w", err)
+        }
+        if isReadOnly == "on" {
+            return errors.New("connected to read-only replica: target_session_attrs=read-write violated")
+        }
+        return nil
+    }
+
+    pool, err := pgxpool.NewWithConfig(ctx, config)
+    if err != nil {
+        return nil, fmt.Errorf("init ha pgxpool: %w", err)
+    }
+
+    return &HAFailoverPool{pool: pool}, nil
+}
+
+// ExecuteWriteWithFailover executes an operation and transparently retries on failover disconnections
+func (p *HAFailoverPool) ExecuteWriteWithFailover(ctx context.Context, op func(ctx context.Context, tx pgx.Tx) error) error {
+    baseDelay := 50 * time.Millisecond
+    maxDelay := 2 * time.Second
+
+    for attempt := 0; attempt < 5; attempt++ {
+        err := pgx.BeginTxFunc(ctx, p.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, op)
+        if err == nil {
+            return nil
+        }
+
+        // Check if error is failover-related (e.g. read-only transaction 25006 or connection severed)
+        var pgErr *pgconn.PgError
+        var netErr net.Error
+        if (errors.As(err, &pgErr) && (pgErr.Code == "25006" || pgErr.Code == "57P01" || pgErr.Code == "57P03")) ||
+            errors.As(err, &netErr) {
+            limit := min(maxDelay, baseDelay*time.Duration(1<<attempt))
+            jitter := time.Duration(rand.Int63n(int64(limit)))
+
+            select {
+            case <-ctx.Done():
+                return ctx.Err()
+            case <-time.After(jitter):
+                continue
+            }
+        }
+        return err // Fatal non-failover error
+    }
+    return errors.New("transaction failed: maximum failover retry attempts exhausted")
+}
 ```

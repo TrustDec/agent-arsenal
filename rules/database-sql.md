@@ -2109,3 +2109,45 @@ alwaysApply: false
     UPDATE accounts SET balance = balance + 100 WHERE id = 20;
     COMMIT;
     ```
+
+- **High Availability, Automated Failover, Split-Brain Fencing & Client Reconnection Topology**:
+  - ❌ **Anti-Pattern: Single-Host DNS Caching, Read-Only Connection Landings & Split-Brain Divergence**:
+    - Configuring connection strings with a single DNS host relying on DNS TTL caching, causing application clients to hammer dead primaries during failovers.
+    - Specifying multi-host connection URIs without `target_session_attrs=read-write`, causing write pools to connect to read-only standbys and fail with `25006 cannot execute INSERT in a read-only transaction`.
+    - Relying on software-only ping health checks without hardware/software watchdog fencing (`/dev/watchdog`), allowing isolated primaries to accept rogue writes and create divergent WAL timelines (split-brain).
+    - Promoting asynchronous standbys with un-replayed WAL, violating Zero-RPO financial guarantees ($RPO > 0$).
+    - Wiping out entire data directories on demoted nodes and running multi-hour `pg_basebackup` clones instead of automated `pg_rewind` delta reconciliation.
+  - ✅ **Production Invariant**:
+    - Multi-host connection URI with explicit `target_session_attrs=read-write&load_balance_hosts=disable`, validating `SHOW transaction_read_only = off` at handshake.
+    - Zero-RPO Synchronous Quorum: configure `synchronous_commit = on` (or `remote_apply`) with `synchronous_standby_names = 'ANY 1 (node2, node3)'`.
+    - Distributed Consensus & Watchdog Fencing: enforce $T_{\text{watchdog}} < T_{\text{lease}} - T_{\text{loop\_wait}} - \Delta_{\text{skew}}$ via Patroni + etcd, guaranteeing hardware reboot before standby promotion.
+    - Always enable `wal_log_hints = on` to permit automated, sub-minute `pg_rewind` timeline resynchronization without destructive re-cloning.
+    ```sql
+    -- 1. Cluster Status & Role Auditing
+    SELECT
+      pg_is_in_recovery() AS is_standby,
+      current_setting('transaction_read_only') AS is_read_only,
+      pg_current_wal_lsn() AS primary_lsn,
+      pg_last_wal_receive_lsn() AS standby_receive_lsn,
+      pg_last_wal_replay_lsn() AS standby_replay_lsn;
+
+    -- 2. Synchronous Standby Replication & WAL Flush Health
+    SELECT
+      client_addr,
+      application_name,
+      sync_state,
+      sync_priority,
+      state,
+      sent_lsn,
+      write_lsn,
+      flush_lsn,
+      replay_lsn,
+      ROUND(EXTRACT(EPOCH FROM (NOW() - reply_time))::numeric, 2) AS lag_seconds
+    FROM pg_stat_replication;
+
+    -- 3. Zero-RPO Synchronous Commit Cluster Invariant
+    ALTER SYSTEM SET wal_log_hints = 'on';
+    ALTER SYSTEM SET synchronous_commit = 'on';
+    ALTER SYSTEM SET synchronous_standby_names = 'ANY 1 (pg-node-02, pg-node-03)';
+    SELECT pg_reload_conf();
+    ```

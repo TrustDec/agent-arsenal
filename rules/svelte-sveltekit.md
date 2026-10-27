@@ -3167,4 +3167,50 @@ alwaysApply: false
         {/each}
       </div>
     </div>
+
+    <!-- Svelte 5 Reactive High Availability Failover & Standby Health Monitor -->
+    <script lang="ts">
+      interface StandbyNode {
+        ip: string;
+        name: string;
+        syncState: 'sync' | 'quorum' | 'async' | 'potential';
+        lagMb: number;
+        lagSeconds: number;
+      }
+
+      interface HAClusterStatus {
+        isPrimary: boolean;
+        isReadOnly: boolean;
+        hasZeroRpoSync: boolean;
+        standbys: StandbyNode[];
+      }
+
+      let { cluster }: { cluster: HAClusterStatus } = $props();
+      let hasSevereLag = $derived(cluster.standbys.some((s) => s.lagSeconds > 5.0));
+      let isClusterHealthy = $derived(cluster.hasZeroRpoSync && !hasSevereLag);
+    </script>
+
+    <div class="ha-cluster-monitor">
+      <header>
+        <h3>Database High Availability Sentinel</h3>
+        <span class={isClusterHealthy ? 'badge success' : 'badge danger'}>
+          {cluster.isPrimary ? 'Leader Active' : 'Standby Node'} ({cluster.hasZeroRpoSync ? 'Zero-RPO' : 'Async'})
+        </span>
+      </header>
+
+      {#if !cluster.hasZeroRpoSync}
+        <div class="alert danger">
+          <strong>RPO Warning:</strong> Cluster lacks active synchronous standby! Data loss possible on un-fenced failover.
+        </div>
+      {/if}
+
+      <div class="standby-grid">
+        {#each cluster.standbys as standby (standby.ip)}
+          <div class="standby-card" class:lagging={standby.lagSeconds > 5.0}>
+            <span class="name">{standby.name} ({standby.syncState})</span>
+            <span class="lag">{standby.lagSeconds}s lag ({standby.lagMb} MB)</span>
+          </div>
+        {/each}
+      </div>
+    </div>
     ```
