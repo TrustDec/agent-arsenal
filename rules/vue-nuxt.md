@@ -2716,5 +2716,23 @@ alwaysApply: false
         refresh,
       };
     }
+
+    // Nuxt 3 Database Disaster Recovery & Continuous Archiving Sentinel Composable
+    export function useDatabaseDRSentinel() {
+      const { data: drData, refresh } = useFetch('/api/admin/dr-archival-status');
+      const isArchivalLagging = computed(() => {
+        return (drData.value?.archivalHealth?.secondsSinceLastArchive ?? 0) > 300;
+      });
+      const isPitrReady = computed(() => {
+        return (drData.value?.dataChecksumsEnabled ?? false) && !isArchivalLagging.value;
+      });
+
+      return {
+        drData,
+        isArchivalLagging,
+        isPitrReady,
+        refresh,
+      };
+    }
     </script>
     ```

@@ -2151,3 +2151,44 @@ alwaysApply: false
     ALTER SYSTEM SET synchronous_standby_names = 'ANY 1 (pg-node-02, pg-node-03)';
     SELECT pg_reload_conf();
     ```
+
+- **Disaster Recovery, Continuous WAL Archiving, Point-in-Time Recovery (PITR) & amcheck Integrity**:
+  - ❌ **Anti-Pattern: Monolithic Logical Dumps, Unverified Backups & Insecure S3 Repositories**:
+    - Relying exclusively on daily `pg_dump` cron jobs on databases $> 50\text{GB}$, which take hours, lock tables, exhaust memory, and provide zero Point-in-Time Recovery ($RPO > 12\text{h}$).
+    - Misconfiguring `archive_command` with synchronous shell commands without timeouts or error handling, causing PostgreSQL to hoard WAL segments until disk fills and engine triggers a `PANIC` crash.
+    - Executing PITR with `recovery_target_inclusive = true` and `recovery_target_action = 'promote'`, accidentally replaying past the destructive drop/truncate statement and triggering immediate promotion without verification.
+    - Running production without `data_checksums = on`, allowing silent NVMe/SAN bit rot to corrupt heap pages and persist undetected across months of backups.
+  - ✅ **Production Invariant**:
+    - Physical chunked basebackups via `pgBackRest` with multi-core ZSTD compression offloaded to standby nodes.
+    - Continuous asynchronous WAL archiving (`archive_timeout = 300`, `archive_mode = on`) pushing to WORM S3 Object Lock repositories in Compliance Mode.
+    - Surgical PITR invariant: `recovery_target_inclusive = false`, `recovery_target_action = 'pause'`, and `recovery_target_timeline = 'latest'`. Programmatic integrity checks MUST pass before issuing `SELECT pg_wal_replay_resume()`.
+    - Mandatory cluster checksums (`initdb -k`) and weekly read-only `amcheck` index structural verification.
+    ```sql
+    -- 1. Continuous Archiving & WAL Backlog Health Sentinel
+    SELECT
+      archived_count,
+      last_archived_wal,
+      last_archived_time,
+      failed_count,
+      last_failed_wal,
+      last_failed_time,
+      ROUND(EXTRACT(EPOCH FROM (NOW() - last_archived_time))::numeric, 2) AS seconds_since_last_archive
+    FROM pg_stat_archiver;
+
+    -- 2. Verify Page Checksums Active on Running Cluster
+    SHOW data_checksums;
+
+    -- 3. amcheck Structural B-Tree Index Corruption Verification (Non-Blocking)
+    CREATE EXTENSION IF NOT EXISTS amcheck;
+
+    SELECT
+      c.oid::regclass AS verified_index,
+      bt_index_parent_check(c.oid, true) AS is_structurally_valid
+    FROM pg_index i
+    JOIN pg_class c ON c.oid = i.indexrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relam = 403 -- B-Tree access method
+      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+      AND c.relpersistence = 'p'
+    LIMIT 100;
+    ```

@@ -3213,4 +3213,50 @@ alwaysApply: false
         {/each}
       </div>
     </div>
+
+    <!-- Svelte 5 Reactive Disaster Recovery & WAL Archiving SLA Monitor -->
+    <script lang="ts">
+      interface DRArchivalStatus {
+        archivedCount: number;
+        lastArchivedWal: string;
+        secondsSinceLastArchive: number;
+        isArchivalFailing: boolean;
+        pendingWalCount: number;
+        dataChecksumsEnabled: boolean;
+      }
+
+      let { drStatus }: { drStatus: DRArchivalStatus } = $props();
+      let isRpoAtRisk = $derived(drStatus.secondsSinceLastArchive > 300 || drStatus.isArchivalFailing);
+      let isPitrGuaranteed = $derived(drStatus.dataChecksumsEnabled && !isRpoAtRisk);
+    </script>
+
+    <div class="dr-sla-card" class:critical={isRpoAtRisk}>
+      <header>
+        <h4>Disaster Recovery & PITR Sentinel</h4>
+        <span class={isPitrGuaranteed ? 'badge success' : 'badge danger'}>
+          {isPitrGuaranteed ? 'PITR Protected' : 'RPO SLA Breached'}
+        </span>
+      </header>
+
+      {#if !drStatus.dataChecksumsEnabled}
+        <div class="alert danger">
+          <strong>Silent Bit Rot Risk:</strong> data_checksums is disabled! Backups may harbor undetected corrupt blocks.
+        </div>
+      {/if}
+
+      <div class="metrics-grid">
+        <div class="metric">
+          <label>WAL Archive Latency</label>
+          <span class="value">{drStatus.secondsSinceLastArchive}s</span>
+        </div>
+        <div class="metric">
+          <label>Pending Archival Queue</label>
+          <span class="value">{drStatus.pendingWalCount} segments</span>
+        </div>
+        <div class="metric">
+          <label>Total Archived Segments</label>
+          <span class="value">{drStatus.archivedCount}</span>
+        </div>
+      </div>
+    </div>
     ```

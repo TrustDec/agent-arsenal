@@ -2079,4 +2079,69 @@ alwaysApply: false
         }
       }
     );
+
+    // Database Disaster Recovery, WAL Archiving & Integrity Sentinel Tool
+    server.tool(
+      'audit_database_dr_and_wal_archiving',
+      {
+        maxAllowedArchiveAgeSec: z.number().default(600).describe('Max allowed seconds since last successful WAL archive push'),
+      },
+      async ({ maxAllowedArchiveAgeSec }) => {
+        const client = await dbPool.connect();
+        try {
+          // 1. Query pg_stat_archiver
+          const archiverRes = await client.query(`
+            SELECT
+              archived_count,
+              COALESCE(last_archived_wal, '') AS last_archived_wal,
+              last_archived_time,
+              failed_count,
+              COALESCE(last_failed_wal, '') AS last_failed_wal,
+              last_failed_time,
+              ROUND(EXTRACT(EPOCH FROM (NOW() - last_archived_time))::numeric, 2) AS seconds_since_last_archive
+            FROM pg_stat_archiver;
+          `);
+
+          // 2. Query data_checksums & pending WAL count
+          const checksumRes = await client.query(`SHOW data_checksums;`);
+          const pendingRes = await client.query(`
+            SELECT
+              (SELECT count(*) FROM pg_ls_waldir() WHERE name ~ '^[0-9A-F]{24}$') - 
+              (SELECT count(*) FROM pg_ls_archive_statusdir() WHERE name ~ '\\.done$') AS pending_wal_count;
+          `).catch(() => ({ rows: [{ pending_wal_count: 0 }] }));
+
+          const archiver = archiverRes.rows[0];
+          const checksumsOn = checksumRes.rows[0]?.data_checksums === 'on';
+          const archiveAgeSec = Number(archiver?.seconds_since_last_archive ?? 0);
+          const isArchivalLagging = archiveAgeSec > maxAllowedArchiveAgeSec;
+          const isArchivalFailing = archiver?.failed_count > 0 &&
+            archiver?.last_failed_time && archiver?.last_archived_time &&
+            new Date(archiver.last_failed_time) > new Date(archiver.last_archived_time);
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                dataChecksumsEnabled: checksumsOn,
+                archivalHealth: {
+                  isArchivalHealthy: !isArchivalFailing && !isArchivalLagging,
+                  isArchivalFailing,
+                  isArchivalLagging,
+                  secondsSinceLastArchive: archiveAgeSec,
+                  pendingWalCount: Number(pendingRes.rows[0]?.pending_wal_count ?? 0),
+                  lastArchivedWal: archiver?.last_archived_wal,
+                  lastFailedWal: archiver?.last_failed_wal,
+                },
+                slaCompliance: {
+                  pitrReady: checksumsOn && !isArchivalFailing,
+                  rpoWithinBounds: !isArchivalLagging,
+                },
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
     ```
