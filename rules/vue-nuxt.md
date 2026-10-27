@@ -2099,6 +2099,43 @@ alwaysApply: false
       </ClientOnly>
     </template>
     ```
+- **Vue 3.5 `shallowRef` & `markRaw` for Third-Party Non-DOM Instances**:
+  - ❌ **Anti-Pattern: Wrapping Heavy Third-Party Instances in Deep `ref()`**: Storing Three.js WebGL scenes, Monaco Editor instances, Leaflet/Mapbox maps, or Chart.js objects inside deep `ref()`. Vue recursively traverses thousands of internal methods and circular references to attach reactive proxies, causing severe CPU spikes, memory bloat, and broken internal library methods.
+  - ✅ **Production Invariant**: Use `shallowRef` or wrap external instances in `markRaw()` to bypass proxy wrapping completely. Mutate only the root reference or invoke class methods directly:
+    ```vue
+    <script setup lang="ts">
+    import { shallowRef, onMounted, onBeforeUnmount } from 'vue';
+    import * as THREE from 'three';
+
+    // shallowRef eliminates deep reactive proxy overhead on WebGL scene graph:
+    const renderer = shallowRef<THREE.WebGLRenderer | null>(null);
+
+    onMounted(() => {
+      renderer.value = new THREE.WebGLRenderer({ antialias: true });
+    });
+
+    onBeforeUnmount(() => {
+      renderer.value?.dispose();
+    });
+    </script>
+    ```
+- **Nuxt 3 Unique AsyncData Keys & Collision Avoidance (`useAsyncData`)**:
+  - ❌ **Anti-Pattern: Omitting Unique Keys in `useAsyncData` Across Dynamic Routes**: Relying on auto-generated keys or static keys when fetching data with dynamic route parameters or pagination. In SSR, cache collision across concurrent requests causes user A to receive cached data belonging to user B, or stale page data during route navigation.
+  - ✅ **Production Invariant**: Always provide an explicit, unique cache key incorporating all relevant reactive variables:
+    ```vue
+    <script setup lang="ts">
+    const route = useRoute();
+    const page = ref(1);
+
+    // Explicit parameterized key prevents SSR cache collision across pages:
+    const { data: posts, status } = await useAsyncData(
+      `posts-${route.params.category}-${page.value}`,
+      () => $fetch(`/api/posts/${route.params.category}`, { params: { page: page.value } }),
+      { watch: [page] }
+    );
+    </script>
+    ```
+
 
 
 

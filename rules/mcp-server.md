@@ -1163,6 +1163,46 @@ alwaysApply: false
       }
     });
     ```
+- **Strict Zod Input Schemas with `.strict()` Against Hallucinated Arguments**:
+  - ❌ **Anti-Pattern: Open Object Schemas Permitting Fictional LLM Parameters**: Defining tool parameters with open Zod objects (`z.object({ file: z.string() })`). Autonomous agents routinely hallucinate supplementary arguments (`force: true`, `dryRun: false`, `encoding: "utf8"`). These unvalidated properties bypass type checking and corrupt downstream execution logic.
+  - ✅ **Production Invariant**: Append `.strict()` to all MCP tool argument schemas. If an agent supplies unannounced keys, validation fails immediately at the JSON-RPC boundary with an explicit schema error:
+    ```typescript
+    const DeployToolInputSchema = z
+      .object({
+        environment: z.enum(['staging', 'production']),
+        commitSha: z.string().length(40),
+      })
+      .strict(); // Prohibits hallucinated extra arguments!
+
+    server.tool(
+      'deploy_service',
+      'Deploy service to targeted cloud environment',
+      DeployToolInputSchema.shape,
+      async (args) => {
+        // args is guaranteed strictly compliant with zero unknown properties
+        return { content: [{ type: 'text', text: `Deployed ${args.commitSha} to ${args.environment}` }] };
+      }
+    );
+    ```
+- **Architectural Segregation: MCP Tools vs Declarative Resources (`resources/read`)**:
+  - ❌ **Anti-Pattern: Converting Static Read-Only Context into Operational Tools**: Implementing read-only documentation, database schemas, or system configurations as tools (`get_architecture_docs`, `read_schema`). This wastes LLM action-planning turns and consumes precious tool invocation tokens.
+  - ✅ **Production Invariant**: Expose read-only contextual assets via MCP Resources (`resources/list` and `resources/read`) using explicit URI schemes (`schema://postgres/public`, `docs://architecture/overview`). Reserve MCP Tools exclusively for actions with parameters or side effects:
+    ```typescript
+    server.resource(
+      'system-architecture',
+      'docs://architecture/system',
+      async (uri) => ({
+        contents: [
+          {
+            uri: uri.href,
+            text: fs.readFileSync('./docs/architecture.md', 'utf-8'),
+            mimeType: 'text/markdown',
+          },
+        ],
+      })
+    );
+    ```
+
 
 
 

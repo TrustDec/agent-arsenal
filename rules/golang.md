@@ -2417,6 +2417,42 @@ alwaysApply: false
         telemetry.RecordRejectedOrder("invalid_address")
     }
     ```
+- **HTTP Response Body Draining & Keep-Alive Connection Reuse (`io.Discard`)**:
+  - ❌ **Anti-Pattern: Closing Response Bodies Without Full Drain**: Calling `resp.Body.Close()` without reading remaining bytes. In HTTP/1.1 and HTTP/2, if the client terminates the connection before reading to EOF, the transport aborts the socket via TCP RST instead of returning it to the idle connection pool. High-throughput services rapidly deplete ephemeral ports (`TIME_WAIT` saturation).
+  - ✅ **Production Invariant**: Always drain remaining bytes using `io.Copy(io.Discard, ...)` with a bounded reader before closing, guaranteeing connection reuse:
+    ```go
+    func SafeDrainAndClose(resp *http.Response) {
+        if resp != nil && resp.Body != nil {
+            // Drain up to 1MB of remaining body to allow connection reuse:
+            _, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+            _ = resp.Body.Close()
+        }
+    }
+
+    // Usage:
+    resp, err := client.Do(req)
+    if err != nil {
+        return err
+    }
+    defer SafeDrainAndClose(resp)
+    ```
+- **Hermetic HTTP Transport Blackholing in Test Suites (`http.RoundTripper`)**:
+  - ❌ **Anti-Pattern: Unconstrained HTTP Client Leaking Network Calls in Unit Tests**: Constructing `&http.Client{}` or using `http.DefaultClient` in tests without intercepting outbound traffic. If an external service URL is invoked, tests fail intermittently during offline builds or mutate real remote data.
+  - ✅ **Production Invariant**: In test setups, wrap the client's `Transport` with a hermetic `RoundTripper` that panics or returns an explicit error for any destination host other than the ephemeral `httptest.Server`:
+    ```go
+    type HermeticRoundTripper struct {
+        AllowedHost string
+        Proxied     http.RoundTripper
+    }
+
+    func (h *HermeticRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+        if req.URL.Host != h.AllowedHost {
+            return nil, fmt.Errorf("hermetic test violation: unhandled outbound egress to %s prohibited", req.URL.Host)
+        }
+        return h.Proxied.RoundTrip(req)
+    }
+    ```
+
 
 
 

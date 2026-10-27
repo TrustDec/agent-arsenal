@@ -2442,6 +2442,45 @@ alwaysApply: false
       <button type="submit" disabled={pending}>Save</button>
     </form>
     ```
+- **Svelte 5 `$derived.by` for Multi-Statement Computed Logic**:
+  - ❌ **Anti-Pattern: Using Side-Effectful `$effect` to Sync Derived State**: Mutating a `$state` variable inside `$effect(() => { total = subtotal - discount })`. This introduces unnecessary microtask latency, risks infinite reactivity loops, and exposes intermediate stale states to child components.
+  - ✅ **Production Invariant**: Use `$derived.by(() => { ... })` for any computed calculation that requires multiple statements, loops, or complex branch conditions. It executes synchronously and tracks fine-grained reactive dependencies with zero extra ticks:
+    ```svelte
+    <script lang="ts">
+    interface CartItem { id: string; price: number; quantity: number; }
+
+    let items = $state<CartItem[]>([]);
+    let couponRate = $state(0.1);
+
+    // Glitch-free synchronous multi-statement derived calculation:
+    const cartSummary = $derived.by(() => {
+      const subtotal = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
+      const discount = subtotal * couponRate;
+      const tax = (subtotal - discount) * 0.08;
+      const total = subtotal - discount + tax;
+
+      return { subtotal, discount, tax, total, count: items.length };
+    });
+    </script>
+    ```
+- **SvelteKit Server Route Cache Control & CDN Revalidation (`setHeaders`)**:
+  - ❌ **Anti-Pattern: Returning Raw Load Data Without Cache Directives**: Returning objects from `+page.server.ts` without declaring HTTP headers. Shared CDN edge nodes or intermediate proxies may accidentally cache authenticated user session responses, or conversely flood the origin server on high-traffic public catalog queries.
+  - ✅ **Production Invariant**: In `+page.server.ts` or `+server.ts`, explicitly control caching via `setHeaders`:
+    ```typescript
+    import type { PageServerLoad } from './$types';
+
+    export const load: PageServerLoad = async ({ setHeaders }) => {
+      // Edge CDN caches for 5 minutes; background revalidation for 24 hours:
+      setHeaders({
+        'cache-control': 'public, max-age=60, s-maxage=300, stale-while-revalidate=86400',
+      });
+
+      return {
+        catalog: await fetchCatalogItems(),
+      };
+    };
+    ```
+
 
 
 

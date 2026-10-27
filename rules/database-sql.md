@@ -1489,6 +1489,39 @@ alwaysApply: false
         FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE RESTRICT
     );
     ```
+- **PostgreSQL Serializable Isolation with Automated Retry Loops (`40001`)**:
+  - ❌ **Anti-Pattern: Relying on `READ COMMITTED` to Prevent Write Skew Anomalies**: Executing multi-row balance transfers or room-booking checks under default `READ COMMITTED`. Concurrent transactions read the same initial state, pass application validation, and perform concurrent inserts/updates, causing double bookings or negative balances without row-level lock contention.
+  - ✅ **Production Invariant**: For distributed multi-row state mutations, enforce `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` paired with an automated exponential-jitter retry harness intercepting SQLSTATE `40001` (`serialization_failure`):
+    ```typescript
+    async function executeSerializableWithRetry<T>(
+      pool: pg.Pool,
+      operation: (client: pg.PoolClient) => Promise<T>,
+      maxRetries = 5
+    ): Promise<T> {
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+          const result = await operation(client);
+          await client.query('COMMIT');
+          return result;
+        } catch (err: any) {
+          await client.query('ROLLBACK');
+          if (err.code === '40001' && attempt < maxRetries) {
+            // SQLSTATE 40001: serialization_failure; retry with exponential jitter
+            const backoffMs = Math.min(500, Math.pow(2, attempt) * 20 + Math.random() * 50);
+            await new Promise((r) => setTimeout(r, backoffMs));
+            continue;
+          }
+          throw err;
+        } finally {
+          client.release();
+        }
+      }
+      throw new Error(`Exceeded max retries (${maxRetries}) under SERIALIZABLE isolation`);
+    }
+    ```
+
 
 
 
