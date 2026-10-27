@@ -2994,25 +2994,42 @@ alwaysApply: false
     };
     ```
 
+- **SvelteKit 5 Time-Partitioned Keyset Pagination & Sargable Range Loaders**:
+  - ❌ **Anti-Pattern: Unbounded Timeseries Sweeps & Non-Sargable Date Filters**: Querying partitioned tables using `where(sql`DATE(created_at) = ${date}`)` or omitting time ranges, causing queries to hit every single child partition and stalling the server route.
+  - ✅ **Production Invariant**: In SvelteKit load functions, enforce sargable date bounds using ISO-8601 query parameters and pass explicit `gte(created_at, start)` and `lt(created_at, end)` to ensure $O(1)$ partition pruning:
+    ```svelte
+    <!-- src/routes/audit-logs/+page.svelte -->
+    <script lang="ts">
+      let { data } = $props();
+      let selectedRange = $state({
+        start: data.start,
+        end: data.end,
+      });
+    </script>
 
+    <div class="audit-dashboard">
+      <div class="filter-bar">
+        <span>Partitions Scanned: <strong>{data.prunedPartitionCount} (Pruned)</strong></span>
+        <span class="badge">Query Time: {data.executionTimeMs}ms</span>
+      </div>
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Event ID</th>
+            <th>Type</th>
+            <th>Timestamp (Partition Key)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each data.events as event (event.id)}
+            <tr>
+              <td><code>{event.id}</code></td>
+              <td>{event.eventType}</td>
+              <td>{new Date(event.createdAt).toISOString()}</td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    </div>
+    ```

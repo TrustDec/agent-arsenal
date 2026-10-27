@@ -2627,26 +2627,22 @@ alwaysApply: false
       });
     }
     </script>
+
+    <!-- Nuxt 3 Sargable Partitioned Range Query & Live Telemetry -->
+    <script setup lang="ts">
+    const route = useRoute();
+    const router = useRouter();
+
+    const range = reactive({
+      start: (route.query.start as string) || new Date(Date.now() - 7 * 86400000).toISOString(),
+      end: (route.query.end as string) || new Date().toISOString(),
+    });
+
+    // Server API executes sargable range query: WHERE created_at >= start AND created_at < end
+    // Triggering static partition pruning and skipping hundreds of older partitions
+    const { data: telemetry, pending, refresh } = await useFetch('/api/telemetry', {
+      query: computed(() => ({ start: range.start, end: range.end })),
+      watch: [() => range.start, () => range.end],
+    });
+    </script>
     ```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

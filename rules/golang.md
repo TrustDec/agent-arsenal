@@ -3085,25 +3085,69 @@ alwaysApply: false
     }
     ```
 
+- **Declarative Range Partitioning, Sargable Time-Bound Queries & Concurrent Detach Workers**:
+  - ❌ **Anti-Pattern: DATE_TRUNC Query Traps & In-Transaction Detachments**: Constructing queries with `DATE_TRUNC('month', created_at) = $1` which prevents PostgreSQL partition pruning and forces sequential scans over dozens of partitions, or executing `ALTER TABLE ... DETACH PARTITION` inside a Go transaction block which holds `ACCESS EXCLUSIVE` lock and deadlocks client connection pools.
+  - ✅ **Production Invariant**: Always provide direct, sargable range boundaries `created_at >= $1 AND created_at < $2`, ensure composite primary keys `PRIMARY KEY (id, created_at)` in DDL migrations, and use a dedicated standalone connection outside transactions with `SET lock_timeout = '2000ms'` for `ALTER TABLE ... DETACH PARTITION ... CONCURRENTLY`:
+    ```go
+    package db
 
+    import (
+        "context"
+        "fmt"
+        "time"
 
+        "github.com/jackc/pgx/v5"
+        "github.com/jackc/pgx/v5/pgxpool"
+    )
 
+    type PartitionLifecycleManager struct {
+        pool      *pgxpool.Pool
+        tableName string
+    }
 
+    func NewPartitionLifecycleManager(pool *pgxpool.Pool, tableName string) *PartitionLifecycleManager {
+        return &PartitionLifecycleManager{pool: pool, tableName: tableName}
+    }
 
+    // SargableRangeQuery guarantees static and dynamic partition pruning
+    func (m *PartitionLifecycleManager) QueryEventsByTimeWindow(
+        ctx context.Context,
+        tenantID [16]byte,
+        start, end time.Time,
+    ) (pgx.Rows, error) {
+        // Direct range comparison on partition key created_at ensures O(1) partition pruning
+        const query = `
+            SELECT id, tenant_id, event_type, payload, created_at
+            FROM telemetry_events
+            WHERE tenant_id = $1
+              AND created_at >= $2
+              AND created_at < $3
+            ORDER BY created_at DESC;
+        `
+        return m.pool.Query(ctx, query, tenantID, start, end)
+    }
 
+    // DetachConcurrentStandalone executes zero-downtime concurrent detachment on a single connection
+    func (m *PartitionLifecycleManager) DetachConcurrentStandalone(
+        ctx context.Context,
+        partitionName string,
+    ) error {
+        conn, err := m.pool.Acquire(ctx)
+        if err != nil {
+            return fmt.Errorf("acquire connection: %w", err)
+        }
+        defer conn.Release()
 
+        // Enforce tight lock timeout so we fail fast rather than stalling queue
+        if _, err := conn.Exec(ctx, "SET lock_timeout = '2000ms'"); err != nil {
+            return fmt.Errorf("set lock_timeout: %w", err)
+        }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        // MUST be executed outside any transaction block
+        detachDDL := fmt.Sprintf("ALTER TABLE %s DETACH PARTITION %s CONCURRENTLY;", m.tableName, partitionName)
+        if _, err := conn.Exec(ctx, detachDDL); err != nil {
+            return fmt.Errorf("detach partition concurrently failed: %w", err)
+        }
+        return nil
+    }
+    ```

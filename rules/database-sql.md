@@ -1887,26 +1887,47 @@ alwaysApply: false
     FOR EACH ROW EXECUTE FUNCTION prevent_audit_ledger_mutation();
     ```
 
+- **Declarative Range Partitioning, Sargable Pruning Invariants & Concurrent Detachment (`DETACH CONCURRENTLY`)**:
+  - ❌ **Anti-Pattern: Non-Sargable WHERE Predicates, Single-Column PKs & Transactional Detach**:
+    - Declaring `PRIMARY KEY (id)` on a table partitioned by `created_at` (causing migration failure `ERROR: 0A000: insufficient columns in PRIMARY KEY constraint definition`).
+    - Querying partitioned tables using `WHERE DATE_TRUNC('month', created_at) = '2026-03-01'` or casting `created_at::date`, which destroys static and run-time partition pruning and forces an exhaustive sequential table scan across all child partitions.
+    - Executing `ALTER TABLE events DETACH PARTITION child;` inside a multi-statement transaction, which escalates to an `ACCESS EXCLUSIVE` lock on the parent table and stalls all concurrent production read/write queries.
+  - ✅ **Production Invariant**:
+    - Declare composite primary keys `PRIMARY KEY (id, created_at)` containing the partitioning column.
+    - Guarantee sargable, type-aligned direct range comparisons `WHERE created_at >= $1 AND created_at < $2` to achieve $O(1)$ partition pruning.
+    - Execute partition detachment via `ALTER TABLE ... DETACH PARTITION ... CONCURRENTLY;` strictly outside any transaction block with an aggressive `SET lock_timeout = '2000ms'`:
+    ```sql
+    -- 1. Declarative Range Partitioning with Composite Primary Key
+    CREATE TABLE high_throughput_events (
+      id UUID NOT NULL,
+      tenant_id UUID NOT NULL,
+      event_type VARCHAR(64) NOT NULL,
+      payload JSONB NOT NULL DEFAULT '{}',
+      created_at TIMESTAMPTZ NOT NULL,
+      CONSTRAINT pk_high_throughput_events PRIMARY KEY (id, created_at)
+    ) PARTITION BY RANGE (created_at);
 
+    -- 2. Local Index on (tenant_id, created_at DESC)
+    CREATE INDEX idx_events_tenant_created
+    ON high_throughput_events (tenant_id, created_at DESC);
 
+    -- 3. Idempotent Monthly Partition Pre-Warming
+    CREATE TABLE IF NOT EXISTS high_throughput_events_y2026m04
+    PARTITION OF high_throughput_events
+    FOR VALUES FROM ('2026-04-01 00:00:00+00') TO ('2026-05-01 00:00:00+00');
 
+    -- 4. Sargable Query with Verified Partition Pruning
+    EXPLAIN (ANALYZE, BUFFERS)
+    SELECT id, event_type, created_at
+    FROM high_throughput_events
+    WHERE tenant_id = '018f3a52-9b24-7832-849a-7c9b0e9f1a23'::UUID
+      AND created_at >= '2026-04-01 00:00:00+00'
+      AND created_at < '2026-05-01 00:00:00+00';
 
+    -- 5. Zero-Downtime Concurrent Detach (MUST RUN OUTSIDE TRANSACTION BLOCK)
+    SET lock_timeout = '2000ms';
+    ALTER TABLE high_throughput_events DETACH PARTITION high_throughput_events_y2026m04 CONCURRENTLY;
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    -- 6. Lock-Free Isolated Drop (Zero parent table locks)
+    DROP TABLE IF EXISTS high_throughput_events_y2026m04;
+    ```

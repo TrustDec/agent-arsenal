@@ -1765,25 +1765,65 @@ alwaysApply: false
     });
     ```
 
+- **Partition Maintenance, Sargable Plan Inspection & Safe Concurrent Detach Tool**:
+  - ❌ **Anti-Pattern: Blind Multi-Partition Dropping & Unverified Pruning**: MCP tools that execute un-hedged `DROP TABLE` across production tables or query partitioned datasets without verifying that partition pruning is engaged, exhausting backend database CPU.
+  - ✅ **Production Invariant**: Provide structured MCP tools that verify query plan pruning using `EXPLAIN (FORMAT JSON)` and execute zero-downtime `DETACH PARTITION CONCURRENTLY` outside transactions with strict lock timeout safeguards:
+    ```typescript
+    server.tool(
+      'inspect_and_prune_partition',
+      {
+        parentTable: z.string().describe('Root partitioned table name'),
+        partitionName: z.string().describe('Target child partition table to detach'),
+        dryRun: z.boolean().default(true).describe('If true, only verifies state without executing DDL'),
+      },
+      async ({ parentTable, partitionName, dryRun }) => {
+        const client = await dbPool.connect();
+        try {
+          // 1. Verify child partition is currently part of the hierarchy
+          const checkRes = await client.query(
+            `SELECT COUNT(*) as count FROM pg_inherits
+             WHERE inhrelid = $1::regclass AND inhparent = $2::regclass;`,
+            [partitionName, parentTable]
+          );
 
+          if (parseInt(checkRes.rows[0].count, 10) === 0) {
+            return {
+              isError: true,
+              content: [{ type: 'text', text: `Partition ${partitionName} is not attached to ${parentTable}` }],
+            };
+          }
 
+          if (dryRun) {
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  status: 'VERIFIED',
+                  message: `Partition ${partitionName} is attached to ${parentTable} and ready for CONCURRENT detach.`,
+                  dryRun: true,
+                }),
+              }],
+            };
+          }
 
+          // 2. Execute zero-downtime CONCURRENT detach with lock timeout (Standalone outside TX)
+          await client.query("SET lock_timeout = '2000ms'");
+          await client.query(`ALTER TABLE ${parentTable} DETACH PARTITION ${partitionName} CONCURRENTLY;`);
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: true,
+                partitionName,
+                status: 'DETACHED_ISOLATED',
+                message: `Partition ${partitionName} safely detached concurrently without locking ${parentTable}.`,
+              }),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
+    ```
