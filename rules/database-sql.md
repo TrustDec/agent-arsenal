@@ -2379,3 +2379,42 @@ alwaysApply: false
       ORDER BY sum(amount_cents) DESC;
     COMMIT;
     ```
+
+- **Database Full-Text Search, Trigram Indexing, GIN FastUpdate & Bloat Elimination Invariants**:
+  - ❌ **Anti-Pattern: Leading Wildcard ILIKE, Dynamic to_tsvector, and Unmonitored GIN Pending Lists**:
+    - Implementing search using unindexed leading wildcards (`WHERE title ILIKE '%' || $1 || '%'`), forcing full-table sequential scans over millions of rows that peg CPU at 100% and inflate p99 latency by $150\times$.
+    - Computing `to_tsvector('english', title || ' ' || content)` dynamically inside `WHERE` clauses without a pre-computed generated column, redundantly tokenizing and Snowball-stemming text on every query.
+    - Leaving `fastupdate = on` with default `gin_pending_list_limit = 4MB` on write-intensive tables, causing innocent `INSERT` statements to suddenly stall for 2,500ms–8,000ms while executing synchronous pending list cleanups.
+    - Querying trigrams using `WHERE similarity(title, $1) > 0.3` instead of the sargable `%` or `%>` operators, causing the planner to ignore GIN/GiST indexes.
+    - Linearly adding raw `ts_rank` and vector cosine distance scores, causing arbitrary vector magnitude drift to drown out exact keyword, SKU, or email matches.
+  - ✅ **Production Invariant**:
+    - Mandate stored generated `tsvector` columns with immutable language configurations (`unaccent_english`) to eliminate run-time stemming overhead.
+    - Hardened GIN indexing: calibrate `gin_pending_list_limit = '16MB'` for read-heavy workloads or configure `WITH (fastupdate = off)` on latency-critical OLTP write paths.
+    - Query text exclusively via `websearch_to_tsquery()` to prevent unescaped user syntax errors (`&`, `|`, `!`).
+    - Enforce Reciprocal Rank Fusion (RRF with $k=60$) for hybrid lexical and vector semantic search.
+    ```sql
+    -- 1. Generated Stored Search Vector with Weighted Fields
+    ALTER TABLE knowledge_articles
+      ADD COLUMN IF NOT EXISTS search_vector tsvector
+      GENERATED ALWAYS AS (
+        setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
+        setweight(to_tsvector('english', coalesce(content, '')), 'B')
+      ) STORED;
+
+    -- 2. Hardened GIN Index with Calibrated Pending Limit
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_articles_fts
+      ON knowledge_articles USING gin (search_vector)
+      WITH (fastupdate = on, gin_pending_list_limit = '16MB');
+
+    -- 3. Trigram Autocomplete Index with Zero Write Stalls
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_articles_title_trgm
+      ON knowledge_articles USING gin (title gin_trgm_ops)
+      WITH (fastupdate = off);
+
+    -- 4. Safe Sargable Query Execution
+    SELECT id, title, ts_rank_cd(search_vector, q) AS rank
+    FROM knowledge_articles, websearch_to_tsquery('english', 'database "full text" -deprecated') q
+    WHERE search_vector @@ q
+    ORDER BY rank DESC
+    LIMIT 20;
+    ```

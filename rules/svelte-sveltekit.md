@@ -3472,4 +3472,63 @@ alwaysApply: false
         </div>
       </div>
     </div>
+
+    <!-- Svelte 5 Full-Text Search & GIN Index Sentinel Component -->
+    <script lang="ts">
+      interface GinIndexHealth {
+        indexName: string;
+        tableName: string;
+        indexSizePretty: string;
+        fastUpdateEnabled: boolean;
+        isBloated: boolean;
+      }
+
+      interface SearchSentinelAudit {
+        hasTrgmExtension: boolean;
+        hasUnaccentExtension: boolean;
+        ginIndexes: GinIndexHealth[];
+        isSearchOptimized: boolean;
+        violations: string[];
+      }
+
+      let { audit } = $props<{ audit: SearchSentinelAudit }>();
+
+      let isAtRisk = $derived(audit.violations.length > 0 || !audit.isSearchOptimized);
+      let statusText = $derived(audit.isSearchOptimized ? 'OPTIMIZED' : 'AT RISK');
+    </script>
+
+    <div class="search-sentinel-card" class:danger={isAtRisk}>
+      <header>
+        <h4>Database Full-Text Search & GIN Sentinel</h4>
+        <span class={`badge ${audit.isSearchOptimized ? 'success' : 'danger'}`}>
+          {statusText}
+        </span>
+      </header>
+
+      {#if isAtRisk}
+        <div class="alert danger">
+          <strong>Search / GIN Indexing Vulnerability:</strong>
+          <ul>
+            {#each audit.violations as violation}
+              <li>{violation}</li>
+            {/each}
+          </ul>
+        </div>
+      {/if}
+
+      <div class="metrics-grid">
+        <div class="metric">
+          <label>pg_trgm Extension</label>
+          <span class="value">{audit.hasTrgmExtension ? 'Active' : 'Missing'}</span>
+        </div>
+        <div class="metric">
+          <label>GIN Indexes Audited</label>
+          <span class="value">{audit.ginIndexes.length} relations</span>
+        </div>
+        <div class="metric">
+          <label>FastUpdate Health</label>
+          <span class="value">{audit.ginIndexes.filter(i => i.isBloated).length === 0 ? 'Normal' : 'Stalled'}</span>
+        </div>
+      </div>
+    </div>
     ```

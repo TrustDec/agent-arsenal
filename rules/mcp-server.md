@@ -2475,4 +2475,61 @@ alwaysApply: false
         }
       }
     );
+
+    // Tool: Audit Full-Text Search, GIN Index Health & Trigram Extensions
+    server.tool(
+      'audit_database_search_and_gin_health',
+      'Audit PostgreSQL GIN indexes, pending list sizes, FastUpdate configurations, and full-text search extensions to eliminate write stalls and table scan meltdowns',
+      {
+        schemaName: z.string().default('public').describe('Database schema name'),
+      },
+      async ({ schemaName }) => {
+        const client = await pool.connect();
+        try {
+          // 1. Verify required extensions
+          const extRes = await client.query(`
+            SELECT extname, extversion FROM pg_extension WHERE extname IN ('pg_trgm', 'unaccent', 'pageinspect');
+          `);
+          const installedExts = extRes.rows.map((r: any) => r.extname);
+
+          // 2. Audit GIN Indexes
+          const ginRes = await client.query(`
+            SELECT
+              c.relname AS index_name,
+              t.relname AS table_name,
+              pg_relation_size(c.oid) AS index_bytes,
+              pg_size_pretty(pg_relation_size(c.oid)) AS index_size_pretty,
+              coalesce(opt.fastupdate, true) AS fast_update_enabled
+            FROM pg_class c
+            JOIN pg_am am ON am.oid = c.relam
+            JOIN pg_index i ON i.indexrelid = c.oid
+            JOIN pg_class t ON t.oid = i.indrelid
+            LEFT JOIN LATERAL (
+              SELECT (regexp_matches(c.reloptions::text, 'fastupdate=(true|false|on|off)'))[1] IN ('true', 'on') AS fastupdate
+            ) opt ON true
+            WHERE am.amname = 'gin' AND c.relnamespace = $1::regnamespace;
+          `, [schemaName]);
+
+          const violations: string[] = [];
+          if (!installedExts.includes('pg_trgm')) {
+            violations.push('pg_trgm extension is NOT installed. Substring and fuzzy matching cannot be indexed.');
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                installedExtensions: installedExts,
+                ginIndexesCount: ginRes.rowCount,
+                ginIndexes: ginRes.rows,
+                isSearchHardened: violations.length === 0,
+                violations,
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
     ```

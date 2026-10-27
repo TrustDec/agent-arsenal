@@ -2831,5 +2831,28 @@ alwaysApply: false
         refresh,
       };
     }
+
+    // Nuxt 3 Database Full-Text Search & GIN Sentinel Composable
+    export function useDatabaseSearchSentinel(schemaName: string = 'public') {
+      const { data: searchData, refresh } = useFetch(`/api/admin/database-search/${schemaName}`);
+      const isTrgmInstalled = computed(() => {
+        return searchData.value?.installedExtensions?.includes('pg_trgm') === true;
+      });
+      const hasBloatedPendingLists = computed(() => {
+        const indexes = searchData.value?.ginIndexes || [];
+        return indexes.some((i: any) => i.isBloated === true);
+      });
+      const isSearchFleetHealthy = computed(() => {
+        return isTrgmInstalled.value && !hasBloatedPendingLists.value;
+      });
+
+      return {
+        searchData,
+        isTrgmInstalled,
+        hasBloatedPendingLists,
+        isSearchFleetHealthy,
+        refresh,
+      };
+    }
     </script>
     ```

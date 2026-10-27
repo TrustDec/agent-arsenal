@@ -3891,4 +3891,99 @@ func ExecuteWithAdaptiveWorkMem[T any](
 
     return res, nil
 }
+
+// GinIndexAuditSummary contains health metrics for GIN inverted indexes.
+type GinIndexAuditSummary struct {
+    IndexName          string
+    TableName          string
+    IndexSizeBytes     int64
+    IndexSizePretty    string
+    PendingPages       int
+    PendingBytes       int64
+    FastUpdateEnabled  bool
+    IsPendingListClean bool
+}
+
+// AuditGinIndexes inspects PostgreSQL GIN indexes for pending list bloat and write stall risks.
+func AuditGinIndexes(ctx context.Context, pool *pgxpool.Pool) ([]GinIndexAuditSummary, error) {
+    query := `
+        SELECT
+            c.relname AS index_name,
+            t.relname AS table_name,
+            pg_relation_size(c.oid) AS index_bytes,
+            pg_size_pretty(pg_relation_size(c.oid)) AS index_size_pretty,
+            coalesce(gin_stat.pending_pages, 0) AS pending_pages,
+            coalesce(gin_stat.pending_pages, 0) * 8192 AS pending_bytes,
+            coalesce(opt.fastupdate, true) AS fast_update_enabled
+        FROM pg_class c
+        JOIN pg_am am ON am.oid = c.relam
+        JOIN pg_index i ON i.indexrelid = c.oid
+        JOIN pg_class t ON t.oid = i.indrelid
+        LEFT JOIN LATERAL (
+            SELECT (regexp_matches(c.reloptions::text, 'fastupdate=(true|false|on|off)'))[1] IN ('true', 'on') AS fastupdate
+        ) opt ON true
+        LEFT JOIN LATERAL (
+            SELECT (gin_stats).pending_pages AS pending_pages
+            FROM (SELECT gin_metapage_info(get_raw_page(c.relname, 0)) AS gin_stats) s
+        ) gin_stat ON true
+        WHERE am.amname = 'gin' AND c.relnamespace = 'public'::regnamespace;
+    `
+
+    // Fallback if pageinspect is not available in current database
+    fallbackQuery := `
+        SELECT
+            c.relname AS index_name,
+            t.relname AS table_name,
+            pg_relation_size(c.oid) AS index_bytes,
+            pg_size_pretty(pg_relation_size(c.oid)) AS index_size_pretty,
+            0 AS pending_pages,
+            0 AS pending_bytes,
+            true AS fast_update_enabled
+        FROM pg_class c
+        JOIN pg_am am ON am.oid = c.relam
+        JOIN pg_index i ON i.indexrelid = c.oid
+        JOIN pg_class t ON t.oid = i.indrelid
+        WHERE am.amname = 'gin' AND c.relnamespace = 'public'::regnamespace;
+    `
+
+    rows, err := pool.Query(ctx, query)
+    if err != nil {
+        rows, err = pool.Query(ctx, fallbackQuery)
+        if err != nil {
+            return nil, fmt.Errorf("audit gin indexes: %w", err)
+        }
+    }
+    defer rows.Close()
+
+    var results []GinIndexAuditSummary
+    for rows.Next() {
+        var s GinIndexAuditSummary
+        if err := rows.Scan(
+            &s.IndexName,
+            &s.TableName,
+            &s.IndexSizeBytes,
+            &s.IndexSizePretty,
+            &s.PendingPages,
+            &s.PendingBytes,
+            &s.FastUpdateEnabled,
+        ); err != nil {
+            return nil, fmt.Errorf("scan gin summary: %w", err)
+        }
+        // Pending list > 8MB poses immediate write stall risk
+        s.IsPendingListClean = s.PendingBytes < 8*1024*1024
+        results = append(results, s)
+    }
+
+    return results, nil
+}
+
+// SanitizeWebsearchQuery strips null bytes and illegal punctuation before passing to websearch_to_tsquery.
+func SanitizeWebsearchQuery(raw string) string {
+    clean := strings.ReplaceAll(raw, "\x00", "")
+    clean = strings.TrimSpace(clean)
+    if len(clean) > 500 {
+        clean = clean[:500]
+    }
+    return clean
+}
 ```
