@@ -3032,4 +3032,39 @@ alwaysApply: false
         </tbody>
       </table>
     </div>
+
+    <!-- Svelte 5 Reactive MVCC Bloat & HOT Health Monitor -->
+    <script lang="ts">
+      interface TableHealth {
+        name: string;
+        deadRatioPct: number;
+        hotRatioPct: number;
+        totalBytes: number;
+      }
+
+      let { tables = [] }: { tables: TableHealth[] } = $props();
+      let bloatedTables = $derived(tables.filter((t) => t.deadRatioPct > 15));
+      let hotEfficiencyAlerts = $derived(tables.filter((t) => t.hotRatioPct < 85));
+    </script>
+
+    <div class="mvcc-monitor">
+      <header>
+        <h3>Database MVCC Bloat & HOT Health</h3>
+        {#if bloatedTables.length > 0}
+          <span class="badge danger">{bloatedTables.length} Bloated Tables</span>
+        {:else}
+          <span class="badge success">All Relations Clean</span>
+        {/if}
+      </header>
+
+      <div class="metrics-grid">
+        {#each tables as table (table.name)}
+          <div class="card">
+            <h4>{table.name}</h4>
+            <p>Dead Tuples: <strong>{table.deadRatioPct}%</strong></p>
+            <p>HOT Efficiency: <strong class={table.hotRatioPct >= 90 ? 'text-green' : 'text-red'}>{table.hotRatioPct}%</strong></p>
+          </div>
+        {/each}
+      </div>
+    </div>
     ```

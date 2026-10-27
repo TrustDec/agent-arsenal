@@ -1826,4 +1826,58 @@ alwaysApply: false
         }
       }
     );
+
+    // MVCC Bloat Diagnostics & Zero-Lock Reindexing Tool
+    server.tool(
+      'audit_database_mvcc_bloat',
+      {
+        schemaName: z.string().default('public').describe('Database schema to inspect'),
+        reindexBloatedTable: z.string().optional().describe('Optional table to REINDEX CONCURRENTLY if bloat > 20%'),
+      },
+      async ({ schemaName, reindexBloatedTable }) => {
+        const client = await dbPool.connect();
+        try {
+          // 1. Inspect dead tuples and HOT update ratios
+          const res = await client.query(`
+            SELECT
+              relname AS table_name,
+              n_live_tup AS live_tuples,
+              n_dead_tup AS dead_tuples,
+              ROUND((n_dead_tup::numeric / NULLIF(n_live_tup + n_dead_tup, 0)) * 100, 2) AS dead_ratio_pct,
+              ROUND((n_tup_hot_upd::numeric / NULLIF(n_tup_upd, 0)) * 100, 2) AS hot_ratio_pct,
+              pg_total_relation_size(c.oid) AS total_bytes
+            FROM pg_stat_user_tables s
+            JOIN pg_class c ON c.oid = s.relid
+            WHERE schemaname = $1
+            ORDER BY n_dead_tup DESC LIMIT 10;
+          `, [schemaName]);
+
+          // 2. Inspect XID wraparound age
+          const xidRes = await client.query(`
+            SELECT max(age(datfrozenxid)) AS oldest_xid_age FROM pg_database WHERE datallowconn;
+          `);
+
+          let reindexResult = null;
+          if (reindexBloatedTable) {
+            // REINDEX CONCURRENTLY outside transaction block
+            await client.query(`REINDEX TABLE CONCURRENTLY "${schemaName}"."${reindexBloatedTable}";`);
+            reindexResult = `Successfully reindexed ${schemaName}.${reindexBloatedTable} concurrently without table locks.`;
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                tables: res.rows,
+                oldestXidAge: Number(xidRes.rows[0].oldest_xid_age),
+                isXidCritical: Number(xidRes.rows[0].oldest_xid_age) > 150_000_000,
+                reindexResult,
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
     ```

@@ -2644,5 +2644,23 @@ alwaysApply: false
       query: computed(() => ({ start: range.start, end: range.end })),
       watch: [() => range.start, () => range.end],
     });
+
+    // Nuxt 3 MVCC Health & Stale Transaction Watchdog Composable
+    export function useDatabaseMVCCWatchdog() {
+      const { data: mvccData, refresh } = useFetch('/api/admin/mvcc-health');
+      const criticalBloat = computed(() => {
+        return mvccData.value?.tables?.filter((t: any) => t.dead_ratio_pct > 15) ?? [];
+      });
+      const isXidAtRisk = computed(() => {
+        return (mvccData.value?.oldest_xid_age ?? 0) > 100_000_000;
+      });
+
+      return {
+        mvccData,
+        criticalBloat,
+        isXidAtRisk,
+        refresh,
+      };
+    }
     </script>
     ```

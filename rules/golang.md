@@ -3150,4 +3150,56 @@ alwaysApply: false
         }
         return nil
     }
-    ```
+
+// Production Go MVCC HOT Updates, Statement Timeouts & Anti-Wraparound Sentinel
+type MVCCWatchdog struct {
+    pool *pgxpool.Pool
+}
+
+func NewMVCCWatchdog(pool *pgxpool.Pool) *MVCCWatchdog {
+    return &MVCCWatchdog{pool: pool}
+}
+
+// ExecuteHOTUpdate performs an atomic, HOT-friendly update on non-indexed columns with bounded timeout
+func (w *MVCCWatchdog) ExecuteHOTUpdate(ctx context.Context, sessionID string) error {
+    ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+    defer cancel()
+
+    conn, err := w.pool.Acquire(ctx)
+    if err != nil {
+        return fmt.Errorf("acquire conn: %w", err)
+    }
+    defer conn.Release()
+
+    // Enforce session timeout so stalled network cannot pin global xmin horizon
+    if _, err := conn.Exec(ctx, "SET LOCAL idle_in_transaction_session_timeout = '3000ms'"); err != nil {
+        return fmt.Errorf("set idle timeout: %w", err)
+    }
+
+    // Touch ONLY non-indexed columns (last_active_at, counter)
+    const sql = `
+        UPDATE user_sessions
+        SET last_active_at = NOW(),
+            heartbeat_count = heartbeat_count + 1
+        WHERE id = $1;
+    `
+    tag, err := conn.Exec(ctx, sql, sessionID)
+    if err != nil {
+        return fmt.Errorf("hot update exec: %w", err)
+    }
+    if tag.RowsAffected() == 0 {
+        return pgx.ErrNoRows
+    }
+    return nil
+}
+
+// AuditClusterXIDAge returns the oldest datfrozenxid age to prevent wraparound outages
+func (w *MVCCWatchdog) AuditClusterXIDAge(ctx context.Context) (int64, error) {
+    var maxAge int64
+    err := w.pool.QueryRow(ctx, "SELECT max(age(datfrozenxid)) FROM pg_database WHERE datallowconn").Scan(&maxAge)
+    if err != nil {
+        return 0, fmt.Errorf("audit xid age: %w", err)
+    }
+    return maxAge, nil
+}
+```

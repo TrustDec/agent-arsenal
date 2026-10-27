@@ -1931,3 +1931,59 @@ alwaysApply: false
     -- 6. Lock-Free Isolated Drop (Zero parent table locks)
     DROP TABLE IF EXISTS high_throughput_events_y2026m04;
     ```
+
+- **MVCC Bloat Elimination, Heap-Only Tuples (HOT) Invariance, Aggressive Autovacuum & Wraparound Defense**:
+  - ❌ **Anti-Pattern: Indexing Volatile Timestamp/Counter Columns, Running VACUUM FULL & Default 20% Scale Factors**:
+    - Adding secondary indexes on columns updated on every heartbeat or counter increment (e.g. `updated_at`, `ping_count`), forcing secondary index page writes on 100% of updates and destroying HOT updates.
+    - Running `VACUUM FULL table_name;` to reclaim disk space, which acquires an `ACCESS EXCLUSIVE` table lock and stalls all concurrent reads and writes for hours.
+    - Leaving default `autovacuum_vacuum_scale_factor = 0.20` and `autovacuum_vacuum_cost_limit = 200`, causing autovacuum to sleep while millions of dead rows accumulate on modern NVMe drives.
+  - ✅ **Production Invariant**:
+    - Set `fillfactor = 85` on update-heavy relations to reserve page headroom for HOT updates, ensuring $\eta_{\text{HOT}} \ge 0.90$.
+    - Configure aggressive per-table autovacuum (`scale_factor = 0.01`, `threshold = 1000`, `cost_limit = 3000`).
+    - Enforce `idle_in_transaction_session_timeout = '5s'` to prevent pinned $x_{\text{min}}$ transaction horizons.
+    - Reclaim bloat with zero downtime via `REINDEX TABLE CONCURRENTLY` and `pg_repack`.
+    ```sql
+    -- 1. Configure Table Storage Parameters for HOT Updates & Micro-Vacuums
+    ALTER TABLE user_sessions SET (
+      fillfactor = 85,
+      autovacuum_vacuum_scale_factor = 0.01,
+      autovacuum_vacuum_threshold = 1000,
+      autovacuum_analyze_scale_factor = 0.005,
+      autovacuum_vacuum_cost_limit = 3000,
+      autovacuum_vacuum_cost_delay = 2
+    );
+
+    -- 2. Audit HOT Update Efficiency (Target: hot_pct >= 90%)
+    SELECT
+      relname,
+      n_tup_upd,
+      n_tup_hot_upd,
+      ROUND((n_tup_hot_upd::numeric / NULLIF(n_tup_upd, 0)) * 100, 2) AS hot_pct,
+      n_dead_tup,
+      ROUND((n_dead_tup::numeric / NULLIF(n_live_tup + n_dead_tup, 0)) * 100, 2) AS dead_ratio_pct
+    FROM pg_stat_user_tables
+    WHERE relname = 'user_sessions';
+
+    -- 3. Detect Stale Transactions Pinning Global xmin Horizon
+    SELECT
+      pid,
+      usename,
+      state,
+      EXTRACT(EPOCH FROM (NOW() - xact_start))::int AS age_seconds,
+      query
+    FROM pg_stat_activity
+    WHERE backend_xmin IS NOT NULL
+      AND pid <> pg_backend_pid()
+      AND (NOW() - xact_start) > INTERVAL '30 seconds'
+    ORDER BY xact_start ASC;
+
+    -- 4. Reindex B-Tree Indexes Concurrently (Zero Table Read/Write Locks)
+    REINDEX TABLE CONCURRENTLY user_sessions;
+
+    -- 5. Audit Transaction ID (XID) Horizon to Prevent 2B Wraparound Shutdown
+    SELECT
+      max(age(datfrozenxid)) AS oldest_xid_age,
+      2000000000 - max(age(datfrozenxid)) AS xids_until_wraparound
+    FROM pg_database
+    WHERE datallowconn;
+    ```
