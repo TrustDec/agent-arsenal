@@ -1067,6 +1067,57 @@ alwaysApply: false
       };
     });
     ```
+- **MCP Tool Request Cancellation & AbortSignal Wiring (`request.signal`)**:
+  - ❌ **Anti-Pattern: Ignoring Client Disconnection & Orphaned Tool Execution**: Executing long-running queries or external API calls inside MCP tool handlers without checking for client cancellation. When an agent user presses "Stop Generating" or cancels a prompt in Claude Code/Cursor, the server continues wasting CPU and database resources.
+  - ✅ **Production Invariant**: Always extract and propagate the MCP request `AbortSignal` to all downstream network requests, database transactions, and subprocesses:
+    ```typescript
+    import { CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+
+    server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+      if (request.params.name === 'run_complex_query') {
+        const signal = extra.signal; // MCP SDK provided AbortSignal
+
+        // Propagate signal to fetch or database driver:
+        const response = await fetch('https://api.internal/analytics', {
+          signal,
+          method: 'POST',
+          body: JSON.stringify(request.params.arguments),
+        });
+
+        const data = await response.json();
+        return { content: [{ type: 'text', text: JSON.stringify(data) }] };
+      }
+      throw new Error(`Tool not found: ${request.params.name}`);
+    });
+    ```
+- **MCP Deterministic In-Memory Transport Harness for CI Testing**:
+  - ❌ **Anti-Pattern: Spawning Subprocesses with Fragile stdio Pipes in Unit Tests**: Starting live Node/Python CLI subprocesses in CI tests with `child_process.spawn` and hardcoded `sleep` delays to await stdio readiness. Pipe buffering and platform line-ending differences lead to flaky CI test failures.
+  - ✅ **Production Invariant**: Use `InMemoryTransport` from `@modelcontextprotocol/sdk` to test MCP servers deterministically in pure memory without I/O latency:
+    ```typescript
+    import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+    import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+    import { createServer } from './my-server.js';
+
+    test('executes tool deterministically via InMemoryTransport', async () => {
+      const server = createServer();
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+      await server.connect(serverTransport);
+      const client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
+      await client.connect(clientTransport);
+
+      const result = await client.callTool({
+        name: 'echo',
+        arguments: { message: 'hello world' },
+      });
+
+      expect(result.content[0].text).toBe('hello world');
+
+      await client.close();
+      await server.close();
+    });
+    ```
+
 
 
 

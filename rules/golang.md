@@ -2331,6 +2331,67 @@ alwaysApply: false
         c.store[key] = weak.Make(val)
     }
     ```
+- **Go 1.24+ Deterministic Concurrency Verification with `testing/synctest`**:
+  - ❌ **Anti-Pattern: Flaky `time.Sleep` Delays in Asynchronous Concurrency Tests**: Waiting for goroutines, channels, or timer debouncers using real wall-clock delays (`time.Sleep(100 * time.Millisecond)`). In multi-threaded CI pipelines under high CPU contention, these arbitrary delays expire prematurely, causing intermittent test failures.
+  - ✅ **Production Invariant**: In Go 1.24+, wrap concurrent asynchronous test suites in `synctest.Run(func() { ... })`. All goroutines launched inside the bubble operate on a virtualized clock. `time.Sleep` advances simulated time immediately without wall-clock delay, and `synctest.Wait()` pauses the calling test until every goroutine in the bubble reaches a blocked state:
+    ```go
+    import (
+        "testing"
+        "testing/synctest"
+        "time"
+    )
+
+    func TestDebouncedWorkerDeterministic(t *testing.T) {
+        synctest.Run(func() {
+            w := NewDebouncedWorker(500 * time.Millisecond)
+            w.Trigger()
+
+            // Time is 100% virtualized; advances instantly without sleeping in real time:
+            time.Sleep(200 * time.Millisecond)
+            synctest.Wait()
+            if w.Executed() {
+                t.Fatalf("expected worker NOT to execute before debounce threshold")
+            }
+
+            time.Sleep(350 * time.Millisecond) // Exceeds 500ms total
+            synctest.Wait()
+            if !w.Executed() {
+                t.Fatalf("expected worker to have executed after debounce threshold")
+            }
+        })
+    }
+    ```
+- **Goroutine Leak Sentinels in Integration Suites (`goleak.VerifyNone`)**:
+  - ❌ **Anti-Pattern: Dangling Goroutines Leaking Across Parallel Test Workers**: Spawning worker goroutines in test setups without bounded lifecycles or explicit cancellation. Leaked goroutines continue consuming CPU, hold mutexes, and write to closed channels in subsequent tests, causing baffling, non-reproducible CI crashes.
+  - ✅ **Production Invariant**: Enforce goroutine leak verification across all package test suites using `goleak.VerifyNone(t)` or `goleak.VerifyTestMain(m)` in `TestMain`:
+    ```go
+    import (
+        "testing"
+        "go.uber.org/goleak"
+    )
+
+    func TestMain(m *testing.M) {
+        // Fails test suite if any background goroutine outlives tests:
+        goleak.VerifyTestMain(m)
+    }
+    ```
+- **Context Cancellation Cause Propagation (`context.WithTimeoutCause`)**:
+  - ❌ **Anti-Pattern: Ambiguous `context.DeadlineExceeded` without Causal Attribution**: Using standard `context.WithTimeout(ctx, d)`. When the deadline expires, `ctx.Err()` returns generic `context.DeadlineExceeded`, obscuring whether the failure was an upstream network stall, slow database lock, or downstream gateway timeout.
+  - ✅ **Production Invariant**: In Go 1.20+, use `context.WithTimeoutCause` or `context.WithCancelCause` with typed sentinel errors. Extract root cause with `context.Cause(ctx)` to generate crisp telemetry without string matching:
+    ```go
+    var ErrDownstreamGatewayStall = errors.New("downstream payment gateway took >2.5s to respond")
+
+    ctx, cancel := context.WithTimeoutCause(parentCtx, 2500*time.Millisecond, ErrDownstreamGatewayStall)
+    defer cancel()
+
+    res, err := client.Charge(ctx, req)
+    if err != nil {
+        if errors.Is(context.Cause(ctx), ErrDownstreamGatewayStall) {
+            log.Error("charge failed due to downstream stall", "cause", context.Cause(ctx))
+        }
+    }
+    ```
+
 
 
 

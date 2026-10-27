@@ -1437,6 +1437,33 @@ alwaysApply: false
     -- Free memory and force clean parameter-specific plans upon transaction pool recycling:
     DISCARD PLANS;
     ```
+- **Hermetic Ephemeral Schema Isolation for Parallel Integration Tests (`search_path`)**:
+  - ❌ **Anti-Pattern: Shared Table Mutation & Database Collisions Across Parallel Test Workers**: Running parallel tests against a shared test database where multiple workers execute concurrent `INSERT`, `UPDATE`, or `TRUNCATE` operations on the same tables. This causes intermittent unique key collisions, serialization failures, and flaky test assertions.
+  - ✅ **Production Invariant**: Isolate each parallel test worker inside an ephemeral PostgreSQL schema. Set the connection's `search_path` to the worker schema, execute schema DDL once, and drop the schema on worker teardown:
+    ```sql
+    -- Setup in test worker:
+    CREATE SCHEMA test_worker_7c2b;
+    SET search_path TO test_worker_7c2b, public;
+
+    -- Worker executes all queries against its completely isolated private tables:
+    CREATE TABLE orders (id BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY, amount NUMERIC(12, 2));
+    INSERT INTO orders (amount) VALUES (150.00);
+
+    -- Teardown in test worker cleanup:
+    DROP SCHEMA test_worker_7c2b CASCADE;
+    ```
+- **Deterministic Relational Pagination Tie-Breakers & Explicit Null Invariants (`NULLS LAST`)**:
+  - ❌ **Anti-Pattern: Non-Deterministic Cursor / Offset Pagination without Unique Tie-Breakers**: Paginating queries via `LIMIT 20 OFFSET 40` or keyset `WHERE created_at < $1` without a unique secondary tie-breaker. When multiple rows share identical timestamps, PostgreSQL returns them in arbitrary order depending on disk heap page layout, causing skipped or duplicated records across page boundaries.
+  - ✅ **Production Invariant**: Every paginated or test-asserted query MUST include a deterministic unique column (such as the primary key `id`) and explicit NULL placement:
+    ```sql
+    -- ✅ Fully deterministic keyset cursor query with null safety:
+    SELECT id, created_at, status
+    FROM transactions
+    WHERE (created_at, id) < ($1, $2)
+    ORDER BY created_at DESC NULLS LAST, id DESC
+    LIMIT 20;
+    ```
+
 
 
 

@@ -2369,6 +2369,39 @@ alwaysApply: false
     });
     </script>
     ```
+- **Svelte 5 Deterministic State Batch Flushing in Unit Tests (`tick()`)**:
+  - ❌ **Anti-Pattern: Arbitrary Sleeps Waiting for Svelte 5 Signals to Flush**: Inserting `await new Promise(r => setTimeout(r, 20))` in Vitest or Playwright tests when asserting against `$state` mutations. Svelte batches reactive updates across microtasks; arbitrary sleeps fail intermittently in CI environments.
+  - ✅ **Production Invariant**: Always import and await `tick()` from `svelte` immediately following state mutations to ensure the pending microtask batch is completely applied to the DOM:
+    ```typescript
+    import { render, screen } from '@testing-library/svelte';
+    import { tick } from 'svelte';
+    import Counter from './Counter.svelte';
+
+    test('increments counter deterministically without wall-clock sleeps', async () => {
+      render(Counter);
+      const btn = screen.getByRole('button', { name: /increment/i });
+
+      btn.click();
+      // Flushes Svelte 5 reactive effect queue deterministically:
+      await tick();
+
+      expect(screen.getByTestId('count')).toHaveTextContent('1');
+    });
+    ```
+- **Svelte 5 `$inspect` & `$inspect().with(...)` for Zero-Overhead Production Logging**:
+  - ❌ **Anti-Pattern: Polluting `$effect` with `console.log` for State Tracing**: Using `$effect(() => console.log(state))` to debug reactive runes. This creates unnecessary subscription dependencies and leaves runtime overhead in production bundles.
+  - ✅ **Production Invariant**: Use Svelte 5's `$inspect(rune)`. The compiler guarantees that `$inspect` declarations are entirely eliminated during production builds (`mode: 'production'`), ensuring zero client overhead:
+    ```svelte
+    <script lang="ts">
+    let session = $state({ token: 'abc', authenticated: false });
+
+    // Stripped automatically in production builds:
+    $inspect(session).with((type, val) => {
+      console.debug(`[Rune Debug: ${type}]`, val);
+    });
+    </script>
+    ```
+
 
 
 

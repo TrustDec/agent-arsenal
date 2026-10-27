@@ -2031,6 +2031,43 @@ alwaysApply: false
       triggerRef(largeDataset);
     }
     ```
+- **Vue 3.5+ `onWatcherCleanup` for Deterministic Timer & AbortController Disposal**:
+  - ❌ **Anti-Pattern: Leaking Async Side-Effects & Manual Callback Tracking Across Watch Runs**: Manually maintaining local `let timeoutId` or `let abortController` variables outside a watcher. When reactive dependencies change rapidly, race conditions occur where responses from previous network requests resolve out of order and overwrite fresh state.
+  - ✅ **Production Invariant**: In Vue 3.5+, call `onWatcherCleanup` inside the watcher effect. Vue guarantees invocation immediately before the watcher re-evaluates and upon component unmount:
+    ```typescript
+    import { watch, onWatcherCleanup } from 'vue';
+
+    watch(searchQuery, (newQuery) => {
+      const controller = new AbortController();
+
+      // Vue 3.5+ idiomatic watcher cleanup:
+      onWatcherCleanup(() => {
+        controller.abort(); // Automatically aborts prior pending fetch on new keystroke
+      });
+
+      fetchSearchResults(newQuery, { signal: controller.signal });
+    });
+    ```
+- **Deterministic Test Microtask & Reactivity Flushing (`flushPromises` + `nextTick`)**:
+  - ❌ **Anti-Pattern: Arbitrary `setTimeout` Sleeps in Component Testing**: Writing `await new Promise(r => setTimeout(r, 50))` to wait for Vue components to complete asynchronous fetches and reactivity flushes in Vitest or Vue Test Utils. Under CI thread pressure, this causes intermittent failures.
+  - ✅ **Production Invariant**: Pair `flushPromises()` from `@vue/test-utils` (to drain pending Promise microtasks) with `nextTick()` (to flush Vue's DOM update queue deterministically):
+    ```typescript
+    import { mount, flushPromises } from '@vue/test-utils';
+    import { nextTick } from 'vue';
+
+    test('renders user profile after network fetch deterministically', async () => {
+      const wrapper = mount(UserProfileComponent);
+
+      // Drain all pending network/fetch microtasks:
+      await flushPromises();
+
+      // Flush Vue DOM reactivity queue:
+      await nextTick();
+
+      expect(wrapper.find('[data-testid="user-name"]').text()).toBe('Alice');
+    });
+    ```
+
 
 
 
