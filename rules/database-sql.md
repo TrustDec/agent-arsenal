@@ -2337,3 +2337,45 @@ alwaysApply: false
       FROM orders (tenant_id, status);
     ANALYZE orders;
     ```
+
+- **Database Memory Management, Temp Spillover Elimination & OOM Killer Defense Invariants**:
+  - ❌ **Anti-Pattern: Unbounded work_mem Sizing, Undersized Vacuum TID Buffers & Unmonitored Spills**:
+    - Sizing `work_mem` under the false assumption that it is allocated once per query or once per connection, unaware that each sort, hash join, and parallel worker allocates its own buffer, causing 50 concurrent queries with 6 execution nodes to exhaust host RAM and trigger Linux kernel OOM kills against the postmaster.
+    - Retaining default `work_mem = 4MB` on heavy analytics or aggregation workloads, forcing queries into multi-pass external merge sorts and multi-batch hash joins that write tens of gigabytes to temporary disk files.
+    - Leaving `log_temp_files = -1` and `temp_file_limit = -1`, allowing unmonitored queries and Cartesian products to silently consume storage until 100% disk exhaustion crashes the cluster.
+    - Sizing `maintenance_work_mem = 64MB`, capping autovacuum's dead tuple TID array at 11M items and forcing 5–10 repeated full index scans on large churned tables.
+  - ✅ **Production Invariant**:
+    - Enforce host-level Linux postmaster OOM immunity (`oom_score_adj = -1000`), ensuring the kernel terminates rogue query backends rather than the database postmaster.
+    - Configure hard storage fences: `ALTER SYSTEM SET temp_file_limit = '10GB';` and `ALTER SYSTEM SET log_temp_files = 0;`.
+    - Calibrate autovacuum memory: `ALTER SYSTEM SET maintenance_work_mem = '1GB';` and `ALTER SYSTEM SET autovacuum_work_mem = '256MB';` for single-pass TID collection on up to 45M dead rows.
+    - Execute heavy analytical reports strictly within transaction-scoped `SET LOCAL work_mem = '256MB';` envelopes, reverting automatically upon commit.
+    ```sql
+    -- 1. Cluster Memory & Temp File Safeguards
+    ALTER SYSTEM SET work_mem = '32MB';
+    ALTER SYSTEM SET hash_mem_multiplier = 2.0;
+    ALTER SYSTEM SET maintenance_work_mem = '1GB';
+    ALTER SYSTEM SET autovacuum_work_mem = '256MB';
+    ALTER SYSTEM SET temp_file_limit = '10GB';
+    ALTER SYSTEM SET log_temp_files = 0;
+    SELECT pg_reload_conf();
+
+    -- 2. Audit Database-Wide Disk Spill Volumes
+    SELECT
+      datname,
+      temp_files AS total_temp_files_created,
+      pg_size_pretty(temp_bytes) AS total_temp_bytes_spilled
+    FROM pg_stat_database
+    WHERE datname = current_database();
+
+    -- 3. Transaction-Scoped Adaptive Memory Execution
+    BEGIN;
+      SET LOCAL work_mem = '256MB';
+      SET LOCAL hash_mem_multiplier = 2.0;
+
+      SELECT tenant_id, count(*), sum(amount_cents)
+      FROM orders
+      WHERE created_at >= NOW() - INTERVAL '30 days'
+      GROUP BY tenant_id
+      ORDER BY sum(amount_cents) DESC;
+    COMMIT;
+    ```

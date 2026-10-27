@@ -3783,4 +3783,112 @@ func AuditQueryPlanPerformance(
 
     return summary, nil
 }
+
+// DatabaseMemoryGovernor audits PostgreSQL memory settings and executes analytical queries
+// within isolated transaction-scoped SET LOCAL work_mem envelopes.
+type DatabaseMemoryAuditSummary struct {
+    WorkMemBytes            int64    `json:"work_mem_bytes"`
+    SharedBuffersBytes      int64    `json:"shared_buffers_bytes"`
+    TempFileLimitBytes      int64    `json:"temp_file_limit_bytes"`
+    LogTempFiles            int      `json:"log_temp_files"`
+    TotalTempSpilledBytes   int64    `json:"total_temp_spilled_bytes"`
+    IsMemoryConfigHardened  bool     `json:"is_memory_config_hardened"`
+    Violations              []string `json:"violations"`
+}
+
+func AuditDatabaseMemoryConfiguration(ctx context.Context, pool *pgxpool.Pool) (*DatabaseMemoryAuditSummary, error) {
+    settingsSQL := `
+        SELECT name, setting, unit
+        FROM pg_settings
+        WHERE name IN ('work_mem', 'shared_buffers', 'temp_file_limit', 'log_temp_files', 'hash_mem_multiplier');
+    `
+    rows, err := pool.Query(ctx, settingsSQL)
+    if err != nil {
+        return nil, fmt.Errorf("query pg_settings: %w", err)
+    }
+    defer rows.Close()
+
+    settingsMap := make(map[string]string)
+    for rows.Next() {
+        var name, setting string
+        var unit *string
+        if err := rows.Scan(&name, &setting, &unit); err != nil {
+            return nil, fmt.Errorf("scan pg_settings: %w", err)
+        }
+        if unit != nil {
+            settingsMap[name] = setting + *unit
+        } else {
+            settingsMap[name] = setting
+        }
+    }
+
+    var tempBytes int64
+    var tempFiles int64
+    statSQL := "SELECT temp_files, temp_bytes FROM pg_stat_database WHERE datname = current_database();"
+    if err := pool.QueryRow(ctx, statSQL).Scan(&tempFiles, &tempBytes); err != nil {
+        return nil, fmt.Errorf("query pg_stat_database: %w", err)
+    }
+
+    summary := &DatabaseMemoryAuditSummary{
+        TotalTempSpilledBytes:  tempBytes,
+        IsMemoryConfigHardened: true,
+        Violations:             make([]string, 0),
+    }
+
+    if tempLimitStr, ok := settingsMap["temp_file_limit"]; ok {
+        var limitVal int64
+        fmt.Sscanf(tempLimitStr, "%d", &limitVal)
+        if limitVal == -1 {
+            summary.IsMemoryConfigHardened = false
+            summary.Violations = append(summary.Violations, "temp_file_limit is unlimited (-1); set to 10GB to protect disk")
+        } else {
+            summary.TempFileLimitBytes = limitVal * 1024
+        }
+    }
+
+    if logTemp, ok := settingsMap["log_temp_files"]; ok {
+        var logVal int
+        fmt.Sscanf(logTemp, "%d", &logVal)
+        summary.LogTempFiles = logVal
+        if logVal != 0 {
+            summary.IsMemoryConfigHardened = false
+            summary.Violations = append(summary.Violations, fmt.Sprintf("log_temp_files is %d; set to 0 to trace all spills", logVal))
+        }
+    }
+
+    return summary, nil
+}
+
+// ExecuteWithAdaptiveWorkMem runs fn inside a transaction with elevated work_mem, reverting at commit.
+func ExecuteWithAdaptiveWorkMem[T any](
+    ctx context.Context,
+    pool *pgxpool.Pool,
+    elevatedWorkMem string,
+    fn func(tx pgx.Tx) (T, error),
+) (T, error) {
+    var zero T
+    tx, err := pool.BeginTx(ctx, pgx.TxOptions{})
+    if err != nil {
+        return zero, fmt.Errorf("begin adaptive tx: %w", err)
+    }
+    defer tx.Rollback(ctx)
+
+    if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL work_mem = '%s'", elevatedWorkMem)); err != nil {
+        return zero, fmt.Errorf("set local work_mem: %w", err)
+    }
+    if _, err := tx.Exec(ctx, "SET LOCAL hash_mem_multiplier = 2.0"); err != nil {
+        return zero, fmt.Errorf("set local hash_mem_multiplier: %w", err)
+    }
+
+    res, err := fn(tx)
+    if err != nil {
+        return zero, err
+    }
+
+    if err := tx.Commit(ctx); err != nil {
+        return zero, fmt.Errorf("commit adaptive tx: %w", err)
+    }
+
+    return res, nil
+}
 ```

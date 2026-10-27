@@ -2809,5 +2809,27 @@ alwaysApply: false
         refresh,
       };
     }
+
+    // Nuxt 3 Database Memory & Temp Spill Sentinel Composable
+    export function useDatabaseMemorySentinel() {
+      const { data: memoryData, refresh } = useFetch('/api/admin/database-memory');
+      const isOOMHardened = computed(() => {
+        return memoryData.value?.isMemorySafe === true;
+      });
+      const hasUnboundedDiskRisk = computed(() => {
+        return memoryData.value?.settings?.temp_file_limit === '-1';
+      });
+      const hasUnloggedSpills = computed(() => {
+        return memoryData.value?.settings?.log_temp_files !== '0';
+      });
+
+      return {
+        memoryData,
+        isOOMHardened,
+        hasUnboundedDiskRisk,
+        hasUnloggedSpills,
+        refresh,
+      };
+    }
     </script>
     ```

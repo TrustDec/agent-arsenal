@@ -2406,4 +2406,73 @@ alwaysApply: false
         }
       }
     );
+
+    // Tool: Audit Database Memory Management, Temp Spills & OOM Safeguards
+    server.tool(
+      'audit_database_memory_and_temp_spills',
+      'Audits PostgreSQL memory allocation (work_mem, maintenance_work_mem), temporary disk file limits, log_temp_files, and cumulative temp_bytes spilled',
+      {},
+      async () => {
+        const client = await pool.connect();
+        try {
+          // 1. Audit Memory Settings
+          const settingsRes = await client.query(`
+            SELECT name, setting, unit
+            FROM pg_settings
+            WHERE name IN (
+              'work_mem',
+              'shared_buffers',
+              'maintenance_work_mem',
+              'autovacuum_work_mem',
+              'temp_file_limit',
+              'log_temp_files',
+              'hash_mem_multiplier'
+            );
+          `);
+
+          // 2. Query Database-Wide Temp Spill Telemetry
+          const statRes = await client.query(`
+            SELECT
+              datname,
+              temp_files,
+              temp_bytes,
+              pg_size_pretty(temp_bytes) AS temp_bytes_pretty
+            FROM pg_stat_database
+            WHERE datname = current_database();
+          `);
+
+          const settingsMap = Object.fromEntries(settingsRes.rows.map((r: any) => [r.name, r.setting + (r.unit || '')]));
+          const violations: string[] = [];
+
+          const tempLimit = parseInt(settingsMap['temp_file_limit'] || '-1', 10);
+          if (tempLimit === -1) {
+            violations.push('temp_file_limit is -1 (unlimited). Set to 10GB to protect disk storage.');
+          }
+
+          const logTemp = parseInt(settingsMap['log_temp_files'] || '-1', 10);
+          if (logTemp !== 0) {
+            violations.push(`log_temp_files is ${logTemp}. Set to 0 to log all temporary disk spills.`);
+          }
+
+          const autovacMem = parseInt(settingsMap['autovacuum_work_mem'] || '65536', 10);
+          if (autovacMem < 131072) {
+            violations.push(`autovacuum_work_mem is sized below 128MB. Sized too low for single-pass vacuuming.`);
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                settings: settingsMap,
+                databaseSpillTelemetry: statRes.rows[0] || {},
+                isMemorySafe: violations.length === 0,
+                violations,
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
     ```

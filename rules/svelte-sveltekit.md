@@ -3420,4 +3420,56 @@ alwaysApply: false
         </div>
       </div>
     </div>
+
+    <!-- Svelte 5 Database Memory & Disk Spill Sentinel Component -->
+    <script lang="ts">
+      interface MemorySentinelAudit {
+        workMem: string;
+        tempFileLimit: string;
+        logTempFiles: number;
+        totalTempSpilledFormatted: string;
+        isMemorySafe: boolean;
+        violations: string[];
+      }
+
+      let { audit } = $props<{ audit: MemorySentinelAudit }>();
+
+      let isSpillRisk = $derived(audit.violations.length > 0);
+      let statusText = $derived(audit.isMemorySafe ? 'PROTECTED' : 'AT RISK');
+    </script>
+
+    <div class="memory-sentinel-card" class:danger={isSpillRisk}>
+      <header>
+        <h4>Database Memory & Disk Spill Sentinel</h4>
+        <span class={`badge ${audit.isMemorySafe ? 'success' : 'danger'}`}>
+          {statusText}
+        </span>
+      </header>
+
+      {#if isSpillRisk}
+        <div class="alert danger">
+          <strong>Memory / Storage Vulnerability:</strong>
+          <ul>
+            {#each audit.violations as violation}
+              <li>{violation}</li>
+            {/each}
+          </ul>
+        </div>
+      {/if}
+
+      <div class="metrics-grid">
+        <div class="metric">
+          <label>Baseline work_mem</label>
+          <span class="value">{audit.workMem}</span>
+        </div>
+        <div class="metric">
+          <label>temp_file_limit</label>
+          <span class="value">{audit.tempFileLimit}</span>
+        </div>
+        <div class="metric">
+          <label>Cumulative Disk Spill</label>
+          <span class="value">{audit.totalTempSpilledFormatted}</span>
+        </div>
+      </div>
+    </div>
     ```
