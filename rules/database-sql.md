@@ -1592,6 +1592,24 @@ alwaysApply: false
     LIMIT 25
     FOR UPDATE SKIP LOCKED;
     ```
+- **Durable Saga Step State Machine Ledger & Lock-Free Execution Worker Polling**:
+  - ❌ **Anti-Pattern: Transient Workflow Execution or Mutating Workflow State Without Append-Only History**: Storing multi-step distributed operations in un-journaled status flags or updating rows in-place without write-ahead step logging. If a worker terminates, there is no way to audit what steps completed or calculate the reverse compensation stack.
+  - ✅ **Production Invariant**: Maintain dual tables `saga_instances` (instance state) and `saga_step_journal` (append-only events). Poll executable steps using `FOR UPDATE SKIP LOCKED` to prevent worker race conditions without table locks:
+    ```sql
+    -- Atomic Saga Step Journaling & Lock-Free Polling
+    INSERT INTO saga_step_journal (saga_id, step_sequence, step_name, event_type, payload)
+    VALUES (:saga_id, :step_seq, 'charge_customer', 'STEP_STARTED', :payload_json);
+
+    -- Lock-free worker polling for pending or compensating sagas:
+    SELECT id, workflow_name, status, current_step_sequence, execution_context
+    FROM saga_instances
+    WHERE status IN ('RUNNING', 'COMPENSATING')
+      AND next_retry_at <= NOW()
+    ORDER BY priority DESC, next_retry_at ASC
+    LIMIT 10
+    FOR UPDATE SKIP LOCKED;
+    ```
+
 
 
 

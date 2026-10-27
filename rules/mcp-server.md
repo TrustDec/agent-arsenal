@@ -1294,6 +1294,36 @@ alwaysApply: false
       return timingSafeEqual(computed, received);
     }
     ```
+- **Long-Running Durable Workflows & Asynchronous Polling Pattern in MCP Tools**:
+  - ❌ **Anti-Pattern: Blocking MCP Tool Call on Multi-Minute Workflows**: Wrapping multi-step distributed operations (e.g., database provisioning, large dataset compilation, or multi-service deployment) inside a single synchronous `server.tool()` handler. If execution exceeds 30–60 seconds, MCP clients (Claude Desktop, Cursor, Pi) time out the JSON-RPC call, leaving the workflow orphaned in the background.
+  - ✅ **Production Invariant**: Return an immediate asynchronous job token (`workflow_id`) with status `RUNNING` in $<500\text{ms}$. Expose separate query and signal tools (`poll_workflow_status`, `send_workflow_signal`) so agents inspect progress and deliver inputs across turn boundaries:
+    ```typescript
+    // Industrial Asynchronous Durable Workflow Pattern for MCP Tools
+    server.tool(
+      'start_cloud_provisioning',
+      'Initiates long-running cloud provisioning saga and returns immediate workflow token',
+      z.object({ tenantId: z.string(), plan: z.string() }).shape,
+      async (args) => {
+        const workflowId = `wf_prov_${Date.now()}_${randomUUID().slice(0, 8)}`;
+        await sagaEngine.start(workflowId, args);
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                workflowId,
+                status: 'RUNNING',
+                message: 'Provisioning initiated. Use `check_workflow_status` with this workflowId to poll progress.',
+                pollIntervalMs: 5000,
+              }),
+            },
+          ],
+        };
+      }
+    );
+    ```
+
 
 
 

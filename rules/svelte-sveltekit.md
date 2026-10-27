@@ -2592,6 +2592,38 @@ alwaysApply: false
       });
     };
     ```
+- **SvelteKit Durable Workflow Orchestration & Real-Time SSE Status Streaming**:
+  - ❌ **Anti-Pattern: Synchronously Awaiting Multi-Step Distributed Tasks in `+page.server.ts`**: Running multi-step provisioning or payment pipelines inside SvelteKit form actions using `await step1(); await step2();`. Serverless runtimes (Cloudflare, Vercel) terminate executions exceeding 10–15 seconds, killing the un-compensated task.
+  - ✅ **Production Invariant**: Trigger the saga via server action, return immediately with a durable `workflowId`, and expose an SSE endpoint in `src/routes/api/workflows/[id]/stream/+server.ts` streaming step-level journal updates to the Svelte 5 `$state` UI:
+    ```typescript
+    // src/routes/api/workflows/[id]/stream/+server.ts
+    import type { RequestHandler } from './$types';
+
+    export const GET: RequestHandler = async ({ params }) => {
+      const { id } = params;
+
+      const stream = new ReadableStream({
+        async start(controller) {
+          const encoder = new TextEncoder();
+          const unsubscribe = sagaJournalStore.subscribe(id, (record) => {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(record)}\n\n`));
+            if (record.eventType === 'STEP_COMPLETED' && record.isFinal) {
+              controller.close();
+            }
+          });
+        },
+      });
+
+      return new Response(stream, {
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+        },
+      });
+    };
+    ```
+
 
 
 

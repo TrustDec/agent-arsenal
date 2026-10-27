@@ -2247,6 +2247,50 @@ alwaysApply: false
       return { status: 'accepted' };
     });
     ```
+- **Nuxt 3 Nitro Durable Task Orchestration & Reactive Workflow Polling Composable**:
+  - ❌ **Anti-Pattern: Blocking Nitro Server Routes with Long-Running Sagas**: Executing multi-step distributed operations inside standard Nuxt 3 server event handlers. Gateway proxies (Cloudflare, Nginx) drop HTTP connections after 30 seconds with 504 Gateway Timeout, while the client has no way to track progress or trigger rollbacks.
+  - ✅ **Production Invariant**: Initiate durable workflows via Nitro event handler, persist initial execution state, return HTTP 202 with workflow ID, and provide a client-side Vue 3 composable `useDurableWorkflow` that handles backoff polling, abort signals, and reactive step progression:
+    ```typescript
+    // composables/useDurableWorkflow.ts
+    export function useDurableWorkflow(workflowId: Ref<string | null>) {
+      const status = ref<'IDLE' | 'RUNNING' | 'COMPLETED' | 'COMPENSATED' | 'FAILED_DLQ'>('IDLE');
+      const currentStep = ref<string>('');
+      const error = ref<string | null>(null);
+
+      let timer: ReturnType<typeof setTimeout> | null = null;
+
+      async function poll() {
+        if (!workflowId.value) return;
+        try {
+          const res = await $fetch<{ status: any; currentStep: string; error?: string }>(
+            `/api/workflows/${workflowId.value}`
+          );
+          status.value = res.status;
+          currentStep.value = res.currentStep;
+          if (res.status === 'RUNNING' || res.status === 'COMPENSATING') {
+            timer = setTimeout(poll, 2000);
+          }
+        } catch (err: any) {
+          error.value = err.message;
+        }
+      }
+
+      watch(workflowId, (newId) => {
+        if (timer) clearTimeout(timer);
+        if (newId) {
+          status.value = 'RUNNING';
+          poll();
+        }
+      }, { immediate: true });
+
+      onUnmounted(() => {
+        if (timer) clearTimeout(timer);
+      });
+
+      return { status: readonly(status), currentStep: readonly(currentStep), error: readonly(error) };
+    }
+    ```
+
 
 
 

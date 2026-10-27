@@ -2610,6 +2610,31 @@ alwaysApply: false
         h.workerPool.Enqueue(r.Context(), rawBody)
     }
     ```
+- **Durable Workflows, Saga Compensation Stacks & Replay Determinism (`workflow.NewDisconnectedContext`)**:
+  - ❌ **Anti-Pattern: In-Memory Multi-Step Chaining or Non-Deterministic Operations in Workflows**: Chaining distributed actions inside standard Go goroutines without event checkpointing, or calling `time.Now()`, `rand.Int()`, or direct network I/O inside Temporal/Cadence workflow definitions. Workflow replays diverge and panic, while partial failures abandon un-compensated cloud resources and locks.
+  - ✅ **Production Invariant**: Keep workflow definitions pure. Isolate all side-effects into Activities. Build reverse-order compensation stacks using `workflow.NewDisconnectedContext(ctx)` so that rollback activities execute successfully even when the parent workflow context is timed out or cancelled:
+    ```go
+    // Industrial Saga Compensation with DisconnectedContext in Go (Temporal / Durable Engine)
+    type ProvisioningSaga struct {
+        compensations []func(ctx workflow.Context) error
+    }
+
+    func (s *ProvisioningSaga) AddCompensation(fn func(ctx workflow.Context) error) {
+        s.compensations = append(s.compensations, fn)
+    }
+
+    func (s *ProvisioningSaga) Compensate(ctx workflow.Context) {
+        // NewDisconnectedContext ensures compensation execution even when parent ctx is cancelled
+        dCtx, _ := workflow.NewDisconnectedContext(ctx)
+        for i := len(s.compensations) - 1; i >= 0; i-- {
+            if err := s.compensations[i](dCtx); err != nil {
+                workflow.GetLogger(dCtx).Error("Compensation step failed, escalating to DLQ", "error", err)
+                _ = workflow.ExecuteActivity(dCtx, EscalateToDLQActivity, err.Error()).Get(dCtx, nil)
+            }
+        }
+    }
+    ```
+
 
 
 
