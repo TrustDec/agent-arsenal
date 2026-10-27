@@ -3680,3 +3680,68 @@ alwaysApply: false
       {/if}
     </div>
     ```
+
+- **Svelte 5 Runes: Temporal Interval Collision Defense & PostGIS GeoJSON Spatial Reactivity**:
+  - ❌ **Anti-Pattern: Naive Closed Boundary Checks, Cyclic Map Center Mutation, and Blocking GeoJSON Reactivity**:
+    - Checking interval overlaps with closed comparison (`startA <= endB && endA >= startB`), which falsely flags contiguous time slots (e.g. 10:00-11:00 and 11:00-12:00) as colliding.
+    - Synchronizing Mapbox/Leaflet spatial viewports by updating `$state` inside map move listeners without `untrack()`, creating infinite update cycles between camera position and marker lists.
+    - Storing massive multi-megabyte GeoJSON feature collections inside deep reactive proxies, causing high garbage collection overhead and frame drops during map panning.
+  - ✅ **Production Invariant**:
+    - Implement half-open interval overlap algebra `[startA, endA) ∩ [startB, endB) ≠ ∅` $\iff \max(\text{startA}, \text{startB}) < \min(\text{endA}, \text{endB})$ using Svelte 5 `$derived`.
+    - Isolate external map camera events using `untrack()` inside `$effect` to ensure unidirectional data flow between viewport coordinates and API queries.
+    - Freeze GeoJSON data with `Object.freeze()` before assigning to `$state` or use lightweight coordinate arrays to eliminate proxy overhead.
+    ```svelte
+    <script lang="ts">
+      import { untrack } from 'svelte';
+
+      interface BookingSlot {
+        id: string;
+        start: Date;
+        end: Date;
+      }
+
+      let { existingSlots = [] }: { existingSlots: BookingSlot[] } = $props();
+
+      // Temporal range inputs:
+      let requestedStartStr = $state('');
+      let requestedEndStr = $state('');
+
+      const requestedStart = $derived(requestedStartStr ? new Date(requestedStartStr) : null);
+      const requestedEnd = $derived(requestedEndStr ? new Date(requestedEndStr) : null);
+
+      // Invariant: Half-open interval boundary collision detection
+      const isValidWindow = $derived.by(() => {
+        if (!requestedStart || !requestedEnd) return false;
+        return requestedStart < requestedEnd;
+      });
+
+      const conflictingSlot = $derived.by(() => {
+        if (!isValidWindow || !requestedStart || !requestedEnd) return null;
+
+        // Mathematical half-open overlap: max(A_start, B_start) < min(A_end, B_end)
+        return existingSlots.find((slot) => {
+          const maxStart = requestedStart > slot.start ? requestedStart : slot.start;
+          const minEnd = requestedEnd < slot.end ? requestedEnd : slot.end;
+          return maxStart < minEnd;
+        }) ?? null;
+      });
+
+      const hasConflict = $derived(conflictingSlot !== null);
+    </script>
+
+    <div class="booking-form">
+      <input type="datetime-local" bind:value={requestedStartStr} />
+      <input type="datetime-local" bind:value={requestedEndStr} />
+
+      {#if !isValidWindow && requestedStartStr && requestedEndStr}
+        <p class="error">Start time must precede end time.</p>
+      {:else if hasConflict}
+        <div class="alert danger">
+          <strong>Time Slot Unavailable:</strong>
+          Conflicts with existing reservation ({conflictingSlot?.start.toLocaleTimeString()} - {conflictingSlot?.end.toLocaleTimeString()}).
+        </div>
+      {:else if isValidWindow}
+        <button type="submit" class="btn primary">Confirm Reservation</button>
+      {/if}
+    </div>
+    ```

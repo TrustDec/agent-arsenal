@@ -2799,3 +2799,80 @@ alwaysApply: false
       }
     );
     ```
+
+- **MCP Spatial Bounding Box & Temporal Interval Tool Contracts (GeoJSON RFC 7946 & `23P01` Defense)**:
+  - ❌ **Anti-Pattern: Untyped Spatial Coordinates, Missing GeoJSON Invariant Bounds, and Raw SQLSTATE 23P01 Leakage in MCP Tools**:
+    - Exposing tool inputs with loose floating-point numbers or arbitrary strings without validating coordinate ranges ($\text{lon} \in [-180, 180]$, $\text{lat} \in [-90, 90]$) or RFC 7946 bounding boxes ($x_{\min} \le x_{\max}$, $y_{\min} \le y_{\max}$).
+    - Permitting inverted temporal intervals (`start >= end`) into MCP tools, producing invalid SQL range types or crashing PostgreSQL with internal check exceptions.
+    - Allowing database exclusion constraint failures (`SQLSTATE 23P01`) to crash the MCP server process or return uninformative 500 error strings to the LLM agent, rather than returning structured, machine-actionable conflict guidance.
+  - ✅ **Production Invariant**:
+    - Validate all spatial inputs with strict Zod schemas enforcing RFC 7946 coordinate boundaries and canonical half-open ISO 8601 temporal intervals (`[start, end)`).
+    - Wrap booking and proximity database calls in structured exception handlers that detect `SQLSTATE 23P01` and return structured MCP tool response messages with `isError: true` and actionable collision details.
+    ```typescript
+    import { z } from 'zod';
+
+    // 1. Zod Invariant Schema for GeoJSON & Temporal Range MCP Tools
+    export const SpatialProximityToolSchema = z.object({
+      tenantId: z.string().uuid(),
+      longitude: z.number().min(-180.0).max(180.0),
+      latitude: z.number().min(-90.0).max(90.0),
+      radiusMeters: z.number().positive().max(100_000).default(5000), // Max 100km radius
+      limit: z.number().int().min(1).max(50).default(10),
+    });
+
+    export const TemporalBookingToolSchema = z.object({
+      tenantId: z.string().uuid(),
+      vehicleId: z.string().uuid(),
+      customerId: z.string().uuid(),
+      startTimeIso: z.string().datetime(),
+      endTimeIso: z.string().datetime(),
+    }).refine((data) => new Date(data.startTimeIso) < new Date(data.endTimeIso), {
+      message: 'startTime must strictly precede endTime',
+      path: ['endTimeIso'],
+    });
+
+    // 2. Safe MCP Tool Registration with Exclusion Conflict Handling
+    server.tool(
+      'schedule_vehicle_booking',
+      'Schedule a vehicle rental window with guaranteed collision prevention',
+      TemporalBookingToolSchema.shape,
+      async (args) => {
+        const client = await pool.connect();
+        try {
+          const res = await client.query(`
+            INSERT INTO vehicle_bookings (tenant_id, vehicle_id, customer_id, booking_period)
+            VALUES ($1, $2, $3, tstzrange($4, $5, '[)'))
+            RETURNING id, booking_period;
+          `, [args.tenantId, args.vehicleId, args.customerId, args.startTimeIso, args.endTimeIso]);
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                status: 'confirmed',
+                bookingId: res.rows[0].id,
+                period: res.rows[0].booking_period,
+              }, null, 2),
+            }],
+          };
+        } catch (err: any) {
+          if (err?.code === '23P01') {
+            // Graceful structured MCP error for exclusion constraint violation
+            return {
+              isError: true,
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  error: 'RESERVATION_CONFLICT',
+                  message: `Vehicle ${args.vehicleId} is already reserved for the requested window [${args.startTimeIso} to ${args.endTimeIso}). Please choose a disjoint time slot.`,
+                }, null, 2),
+              }],
+            };
+          }
+          throw err;
+        } finally {
+          client.release();
+        }
+      }
+    );
+    ```

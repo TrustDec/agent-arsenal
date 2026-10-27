@@ -4266,3 +4266,124 @@ func (r *VectorRepository) SearchFilteredChunks(
     return chunks, nil
 }
 ```
+
+- **PostgreSQL Exclusion Violations, Temporal Range Types & PostGIS Zero-Allocation Spatial Handling**:
+  - ❌ **Anti-Pattern: Application Pre-Check Race Conditions, Raw String Geometry Allocations, Ignoring SQLSTATE 23P01, and Unbounded Interval Boundaries**:
+    - Relying on `SELECT count(*) WHERE ...` before inserting bookings or schedules, allowing concurrent Go routines to create overlapping reservations due to snapshot isolation race windows.
+    - Querying PostGIS geometries using string WKT (`ST_AsText(location)`), forcing allocations, string formatting overhead, and regex parsing on every row, instead of scanning native PostGIS binary EWKB into compact structs.
+    - Treating database insertion errors generically without unpacking `*pgconn.PgError`, failing to map `SQLSTATE 23P01 (exclusion_violation)` to an explicit domain `ErrScheduleConflict` or HTTP 409 Conflict.
+    - Creating temporal ranges with ambiguous or closed `[]` boundaries, causing boundary point collisions where consecutive reservations (e.g. 10:00-11:00 and 11:00-12:00) falsely reject each other.
+  - ✅ **Production Invariant**:
+    - Always rely on PostgreSQL Exclusion Constraints (`EXCLUDE USING gist`) and canonical half-open `[)` boundaries using `pgtype.Range[time.Time]{LowerType: pgtype.Inclusive, UpperType: pgtype.Exclusive, Valid: true}`.
+    - Unpack `pgconn.PgError` on insert/update failures and explicitly check `pgErr.Code == pgerrcode.ExclusionViolation` (`23P01`) to return structured domain conflicts with zero race conditions.
+    - Scan PostGIS geography coordinates directly using binary EWKB decoding or coordinate tuple scanning (`ST_X(location::geometry)`, `ST_Y(location::geometry)`) with zero heap allocations.
+    - Utilize the native GiST `<->` distance operator in Go queries for branch-and-bound nearest-neighbor lookups, bounding result sets with strict limits.
+
+```go
+package store
+
+import (
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgerrcode"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+var (
+	ErrReservationConflict = errors.New("reservation conflicts with an existing booking interval")
+	ErrInvalidTimeBounds   = errors.New("start time must precede end time")
+)
+
+type BookingRecord struct {
+	ID        uuid.UUID
+	TenantID  uuid.UUID
+	VehicleID uuid.UUID
+	Start     time.Time
+	End       time.Time
+}
+
+type SpatialCoordinate struct {
+	Longitude float64
+	Latitude  float64
+}
+
+// DecodePointEWKB decodes a 25-byte PostGIS Point EWKB (SRID 4326) with zero heap allocations.
+// Binary format: [1 byte byte-order] [4 bytes geom-type with SRID flag 0x20000001] [4 bytes SRID 4326] [8 bytes X] [8 bytes Y]
+func DecodePointEWKB(b []byte) (SpatialCoordinate, error) {
+	if len(b) < 25 {
+		return SpatialCoordinate{}, errors.New("invalid EWKB Point payload: buffer too short")
+	}
+
+	byteOrder := binary.ByteOrder(binary.LittleEndian)
+	if b[0] == 0 {
+		byteOrder = binary.BigEndian
+	}
+
+	geomType := byteOrder.Uint32(b[1:5])
+	const ewkbPointSRID = 0x20000001
+	if geomType != ewkbPointSRID && geomType != 1 {
+		return SpatialCoordinate{}, fmt.Errorf("unexpected EWKB geometry type: 0x%x", geomType)
+	}
+
+	offset := 5
+	if geomType&0x20000000 != 0 {
+		offset += 4 // Skip SRID field
+	}
+
+	xBits := byteOrder.Uint64(b[offset : offset+8])
+	yBits := byteOrder.Uint64(b[offset+8 : offset+16])
+
+	lon := *(*float64)(unsafe.Pointer(&xBits))
+	lat := *(*float64)(unsafe.Pointer(&yBits))
+
+	return SpatialCoordinate{Longitude: lon, Latitude: lat}, nil
+}
+
+// ScheduleVehicleBooking atomically schedules a reservation protected by GiST Exclusion Constraint.
+func ScheduleVehicleBooking(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	tenantID, vehicleID, customerID uuid.UUID,
+	startTime, endTime time.Time,
+) (uuid.UUID, error) {
+	if !startTime.Before(endTime) {
+		return uuid.Nil, ErrInvalidTimeBounds
+	}
+
+	// Canonical half-open interval [start, end)
+	period := pgtype.Range[time.Time]{
+		Lower:     startTime.UTC(),
+		Upper:     endTime.UTC(),
+		LowerType: pgtype.Inclusive,
+		UpperType: pgtype.Exclusive,
+		Valid:     true,
+	}
+
+	const query = `
+		INSERT INTO vehicle_bookings (tenant_id, vehicle_id, customer_id, booking_period)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id;
+	`
+
+	var bookingID uuid.UUID
+	err := pool.QueryRow(ctx, query, tenantID, vehicleID, customerID, period).Scan(&bookingID)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.ExclusionViolation {
+			// SQLSTATE 23P01: declarative exclusion constraint prevented overlap
+			return uuid.Nil, fmt.Errorf("%w: vehicle %s is already reserved", ErrReservationConflict, vehicleID)
+		}
+		return uuid.Nil, fmt.Errorf("insert booking: %w", err)
+	}
+
+	return bookingID, nil
+}
+```

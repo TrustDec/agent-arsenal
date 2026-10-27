@@ -2565,3 +2565,63 @@ alwaysApply: false
     LIMIT 10;
     COMMIT;
     ```
+
+- **Database GiST & SP-GiST Indexing, Spatial Geometry, Temporal Range Exclusion & Collision Defense**:
+  - ❌ **Anti-Pattern: Application-Level Pre-Check Race Conditions, Angular Degree Distance Disasters, Runtime Cast Index Bypassing, and Proximity Full-Scan Sorting**:
+    - Checking for calendar or resource booking conflicts with application-level `SELECT COUNT(*) WHERE period && $1` before `INSERT`. Under concurrent transactions in `READ COMMITTED` or `REPEATABLE READ`, both transactions see zero conflicts and insert overlapping reservations, double-booking hotel rooms, conference halls, or fleet vehicles.
+    - Storing geographic coordinates in unprojected `GEOMETRY(Point, 4326)` in angular degrees, and querying with `ST_DWithin(geom, $1, 1000)` assuming meters, which actually evaluates 1,000 degrees ($\approx 111,000\text{ km}$), matching the entire Earth 14 times over.
+    - Casting indexed geometry columns to geography inside queries (`WHERE ST_DWithin(geom::geography, ...)`), which invalidates the GiST index and forces multi-second full-table sequential scans.
+    - Writing proximity queries as `ORDER BY ST_Distance(location, $1) LIMIT 10`, which calculates distance across millions of rows and performs an expensive external sort instead of utilizing the GiST `<->` distance operator.
+  - ✅ **Production Invariant**:
+    - Enforce non-overlapping temporal and resource reservations at the engine level using PostgreSQL Exclusion Constraints (`EXCLUDE USING gist`) with the `btree_gist` extension and canonical half-open bounds `[)`. Catch SQLSTATE `23P01` (`exclusion_violation`) in application layers and return clean HTTP 409 Conflict responses.
+    - Use native `GEOGRAPHY(Point, 4326)` for global spherical calculations in meters, or projected `GEOMETRY(Point, 3857)` for localized Euclidean math. Never perform runtime type casting on indexed spatial columns.
+    - Accelerate nearest-neighbor (k-NN) queries with the native GiST `<->` distance operator (`ORDER BY location <-> ST_SetSRID(ST_MakePoint(lon, lat), 4326)::geography LIMIT 10`), enabling index-driven branch-and-bound traversal in $<1\text{ms}$.
+    - Deploy Space-Partitioned GiST (`USING spgist`) Quadtrees for heavily clustered 2D spatial point datasets to eliminate bounding box overlaps and avoid multi-branch index descent penalties.
+    ```sql
+    -- 1. Extension Verification
+    CREATE EXTENSION IF NOT EXISTS btree_gist;
+    CREATE EXTENSION IF NOT EXISTS postgis;
+
+    -- 2. Declarative Exclusion Constraint on Multi-Tenant Temporal Reservations
+    CREATE TABLE IF NOT EXISTS vehicle_bookings (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL,
+      vehicle_id UUID NOT NULL,
+      booking_period TSTZRANGE NOT NULL,
+      status VARCHAR(32) NOT NULL DEFAULT 'confirmed',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CLOCK_TIMESTAMP(),
+      CONSTRAINT chk_booking_period_half_open CHECK (
+        NOT isempty(booking_period) AND
+        lower_inc(booking_period) AND
+        NOT upper_inc(booking_period)
+      ),
+      CONSTRAINT uq_vehicle_no_overlap EXCLUDE USING gist (
+        tenant_id WITH =,
+        vehicle_id WITH =,
+        booking_period WITH &&
+      ) WHERE (status <> 'cancelled')
+    );
+
+    -- 3. Native PostGIS Geography Fleet Tracking with GiST Indexing
+    CREATE TABLE IF NOT EXISTS fleet_telemetry (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id UUID NOT NULL,
+      driver_id UUID NOT NULL,
+      location GEOGRAPHY(Point, 4326) NOT NULL,
+      recorded_at TIMESTAMPTZ NOT NULL DEFAULT CLOCK_TIMESTAMP()
+    );
+
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_fleet_location_gist
+      ON fleet_telemetry USING gist (location)
+      WITH (fillfactor = 85);
+
+    -- 4. Sub-Millisecond k-NN Distance Operator Proximity Search
+    SELECT
+      driver_id,
+      ST_Distance(location, ST_SetSRID(ST_MakePoint(-73.9851, 40.7488), 4326)::geography) AS distance_meters
+    FROM fleet_telemetry
+    WHERE tenant_id = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::UUID
+      AND recorded_at >= NOW() - INTERVAL '5 minutes'
+    ORDER BY location <-> ST_SetSRID(ST_MakePoint(-73.9851, 40.7488), 4326)::geography
+    LIMIT 10;
+    ```

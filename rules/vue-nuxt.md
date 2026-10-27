@@ -2936,5 +2936,38 @@ alwaysApply: false
         refresh,
       };
     }
+
+    // Vue 3.5+ Spatial FeatureCollection & Temporal Scheduling Composable
+    // Uses shallowRef to avoid deep reactive proxy traversal on massive GeoJSON coordinate trees
+    export function useSpatialFleetViewer() {
+      // 1. shallowRef for GeoJSON FeatureCollections:
+      const geoJsonData = shallowRef<GeoJSON.FeatureCollection | null>(null);
+      const isOverlapping = ref(false);
+
+      // 2. Debounced spatial viewport bounding box watcher:
+      const viewportBbox = ref<[number, number, number, number] | null>(null);
+
+      // 3. Computed temporal reservation overlap check [start, end)
+      function checkIntervalOverlap(
+        reqStart: Date,
+        reqEnd: Date,
+        existingRanges: Array<{ start: Date; end: Date }>
+      ): boolean {
+        if (reqStart >= reqEnd) return true; // Invalid bounds treated as conflict
+
+        return existingRanges.some((range) => {
+          const maxStart = reqStart > range.start ? reqStart : range.start;
+          const minEnd = reqEnd < range.end ? reqEnd : range.end;
+          return maxStart < minEnd; // Half-open intersection
+        });
+      }
+
+      return {
+        geoJsonData,
+        viewportBbox,
+        isOverlapping,
+        checkIntervalOverlap,
+      };
+    }
     </script>
     ```
