@@ -1692,6 +1692,45 @@ alwaysApply: false
     END;
     $$ LANGUAGE plpgsql;
     ```
+- **PostgreSQL Connection Pool Bulkhead Isolation, Statement Timeout Circuits & Active Query Shedding**:
+  - ❌ **Anti-Pattern: Monolithic Shared Connection Pool Contention**: Allowing long-running batch or analytical reporting transactions to saturate database connections, starving sub-millisecond OLTP web endpoints and causing connection pool exhaustion timeouts.
+  - ✅ **Production Invariant**: Enforce distinct user role bulkheads with isolated `statement_timeout` and `lock_timeout` circuit limits, paired with automated query shedding monitors:
+    ```sql
+    -- Industrial PostgreSQL Workload Bulkheading & Circuit Protection
+    CREATE ROLE app_oltp_user WITH LOGIN PASSWORD 'prod_oltp_secret';
+    CREATE ROLE app_analytics_user WITH LOGIN PASSWORD 'prod_analytics_secret';
+
+    -- OLTP Bulkhead: 3s statement circuit, 1s lock acquisition boundary
+    ALTER ROLE app_oltp_user SET statement_timeout = '3000ms';
+    ALTER ROLE app_oltp_user SET lock_timeout = '1000ms';
+    ALTER ROLE app_oltp_user SET idle_in_transaction_session_timeout = '5000ms';
+
+    -- Analytics Bulkhead: 30s statement circuit, read-only enforcement
+    ALTER ROLE app_analytics_user SET statement_timeout = '30000ms';
+    ALTER ROLE app_analytics_user SET default_transaction_read_only = 'on';
+
+    -- Shed queries exceeding SLA threshold to protect database cluster health
+    CREATE OR REPLACE FUNCTION shed_excessive_active_queries(max_runtime_sec INT) RETURNS INT AS $$
+    DECLARE
+        killed_count INT;
+    BEGIN
+        SELECT COUNT(*) INTO killed_count
+        FROM pg_stat_activity
+        WHERE state = 'active'
+          AND query NOT ILIKE '%pg_stat_activity%'
+          AND (NOW() - query_start) > (max_runtime_sec || ' seconds')::INTERVAL;
+
+        PERFORM pg_terminate_backend(pid)
+        FROM pg_stat_activity
+        WHERE state = 'active'
+          AND query NOT ILIKE '%pg_stat_activity%'
+          AND (NOW() - query_start) > (max_runtime_sec || ' seconds')::INTERVAL;
+
+        RETURN killed_count;
+    END;
+    $$ LANGUAGE plpgsql;
+    ```
+
 
 
 

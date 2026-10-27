@@ -2706,6 +2706,53 @@ alwaysApply: false
       return json(product);
     };
     ```
+- **SvelteKit Server Load Circuit Breakers, AbortSignal Budgets & Degraded SSR Fallbacks**:
+  - ❌ **Anti-Pattern: Cascading SSR 500 Outage on External Dependency Failure**: Letting a downstream third-party service failure or slow response crash the entire SvelteKit `load` function and render an unstyled 500 server error page.
+  - ✅ **Production Invariant**: Wrap downstream data queries in server-side circuit breakers with timeout budgets and deterministic fallback props, keeping the page renderable in degraded mode:
+    ```typescript
+    // src/routes/dashboard/+page.server.ts - SvelteKit Resilient Load with Fallback
+    import type { PageServerLoad } from './$types';
+
+    let failureCount = 0;
+    let circuitOpenUntil = 0;
+
+    export const load: PageServerLoad = async ({ fetch }) => {
+      const now = Date.now();
+
+      // Fast-fail if circuit is OPEN
+      if (now < circuitOpenUntil) {
+        return {
+          stats: { visits: 0, conversions: 0 },
+          isDegraded: true,
+          notice: 'Live stats temporarily unavailable.',
+        };
+      }
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 2000); // 2s budget
+
+      try {
+        const res = await fetch('https://metrics.internal/v1/stats', { signal: controller.signal });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const stats = await res.json();
+        failureCount = 0;
+        return { stats, isDegraded: false };
+      } catch (err) {
+        failureCount++;
+        if (failureCount >= 5) {
+          circuitOpenUntil = now + 15000; // Open circuit for 15s
+        }
+        return {
+          stats: { visits: 0, conversions: 0 },
+          isDegraded: true,
+          notice: 'Live stats temporarily unavailable.',
+        };
+      } finally {
+        clearTimeout(timeout);
+      }
+    };
+    ```
+
 
 
 

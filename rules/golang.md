@@ -2737,6 +2737,49 @@ alwaysApply: false
         }
     }
     ```
+- **Circuit Breaker, Weighted Semaphore Bulkhead & Adaptive Ingress Load Shedding**:
+  - ❌ **Anti-Pattern: Unbounded Goroutine Outbound Flooding & Leaked Client Connections**: Firing concurrent HTTP requests or remote RPCs without circuit breakers, allowing downstream latency spikes to exhaust all goroutine stacks, file descriptors, and worker memory until K8s probes fail.
+  - ✅ **Production Invariant**: Couple `sony/gobreaker` with `golang.org/x/sync/semaphore` to enforce isolated concurrency bulkheads, single-canary `HALF_OPEN` recovery, and fast 0ms failure rejection with fallback:
+    ```go
+    // Industrial Go Resilient Outbound Client with Bulkhead & Circuit Breaker
+    type ResilientCaller struct {
+        breaker  *gobreaker.CircuitBreaker
+        bulkhead *semaphore.Weighted
+        timeout  time.Duration
+    }
+
+    func NewResilientCaller(maxConcurrent int64, timeout time.Duration) *ResilientCaller {
+        return &ResilientCaller{
+            bulkhead: semaphore.NewWeighted(maxConcurrent),
+            timeout:  timeout,
+            breaker: gobreaker.NewCircuitBreaker(gobreaker.Settings{
+                Name:        "downstream-client",
+                MaxRequests: 1, // Strictly 1 canary probe in HALF_OPEN
+                Interval:    10 * time.Second,
+                Timeout:     15 * time.Second, // Cool-down in OPEN
+                ReadyToTrip: func(counts gobreaker.Counts) bool {
+                    ratio := float64(counts.TotalFailures) / float64(counts.Requests)
+                    return counts.Requests >= 10 && ratio >= 0.50
+                },
+            }),
+        }
+    }
+
+    func (r *ResilientCaller) Call(ctx context.Context, fn func(ctx context.Context) error) error {
+        if !r.bulkhead.TryAcquire(1) {
+            return errors.New("bulkhead capacity saturated: shedding load")
+        }
+        defer r.bulkhead.Release(1)
+
+        _, err := r.breaker.Execute(func() (interface{}, error) {
+            callCtx, cancel := context.WithTimeout(ctx, r.timeout)
+            defer cancel()
+            return nil, fn(callCtx)
+        })
+        return err
+    }
+    ```
+
 
 
 

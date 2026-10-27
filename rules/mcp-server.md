@@ -1409,6 +1409,62 @@ alwaysApply: false
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     });
     ```
+- **MCP Server Tool-Call Bulkheading, Timeout Deadlines & Circuit Breaker Degradation**:
+  - ❌ **Anti-Pattern: Unbounded Subprocess Execution & Event-Loop Freezing**: Permitting external CLI, LSP, or database tools to run without timeouts or concurrency limits, causing a hung subprocess to deadlock the MCP JSON-RPC transport and freeze the agent harness (Claude Code, Cursor).
+  - ✅ **Production Invariant**: Isolate each tool within a dedicated concurrency bulkhead, apply a hard `AbortSignal` deadline, and return a degraded fallback status when the circuit is open:
+    ```typescript
+    // Industrial MCP Tool Bulkhead & Resilient Execution Guard
+    const toolSemaphores = new Map<string, { active: number; limit: number }>();
+
+    function getToolSemaphore(toolName: string) {
+      if (!toolSemaphores.has(toolName)) {
+        toolSemaphores.set(toolName, { active: 0, limit: 5 }); // Max 5 parallel subprocesses
+      }
+      return toolSemaphores.get(toolName)!;
+    }
+
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      const { name, arguments: args } = request.params;
+      const sem = getToolSemaphore(name);
+
+      if (sem.active >= sem.limit) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              error: `Tool [${name}] bulkhead capacity exceeded (${sem.active}/${sem.limit}). Load shed.`,
+              isDegraded: true,
+            })
+          }],
+          isError: true,
+        };
+      }
+
+      sem.active++;
+      const ac = new AbortController();
+      const timeout = setTimeout(() => ac.abort(), 10000); // 10s hard deadline
+
+      try {
+        const result = await executeToolWithSignal(name, args, ac.signal);
+        return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+      } catch (err: any) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              error: `Tool execution failed or timed out: ${err.message}`,
+              fallbackData: getFallbackMetadata(name),
+            })
+          }],
+          isError: true,
+        };
+      } finally {
+        clearTimeout(timeout);
+        sem.active = Math.max(0, sem.active - 1);
+      }
+    });
+    ```
+
 
 
 

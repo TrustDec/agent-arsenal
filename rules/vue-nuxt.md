@@ -2370,6 +2370,43 @@ alwaysApply: false
       }
     );
     ```
+- **Vue 3 / Nuxt 3 Resilient Composables, Request Timeout Budgets & Degraded State UI**:
+  - ❌ **Anti-Pattern: Indefinite Suspense Hanging & Unhandled Boundary Crashes**: Calling raw `$fetch` in component setup or `useAsyncData` without timeout protection, causing the entire Vue tree or Nuxt route transition to hang indefinitely during upstream network degradation.
+  - ✅ **Production Invariant**: Encapsulate async data fetching in a resilient composable with explicit `AbortController` timeouts, circuit trip detection, and degraded state rendering:
+    ```typescript
+    // composables/useResilientFetch.ts - Nuxt 3 Resilient Data Fetching
+    export function useResilientFetch<T>(
+      key: string,
+      endpoint: string,
+      fallbackData: T,
+      timeoutMs: number = 3000
+    ) {
+      const isDegraded = ref(false);
+
+      const asyncData = useAsyncData<T>(key, async () => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+        try {
+          const res = await $fetch<T>(endpoint, { signal: controller.signal });
+          isDegraded.value = false;
+          return res;
+        } catch (err: any) {
+          // Fall back gracefully instead of bubbling fatal error to Nuxt error boundary
+          isDegraded.value = true;
+          return fallbackData;
+        } finally {
+          clearTimeout(timer);
+        }
+      });
+
+      return {
+        ...asyncData,
+        isDegraded: readonly(isDegraded),
+      };
+    }
+    ```
+
 
 
 
