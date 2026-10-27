@@ -2215,6 +2215,39 @@ alwaysApply: false
       return { trigger, data: readonly(data), isLoading: readonly(isLoading) };
     }
     ```
+- **Nuxt 3 Nitro Webhook Handlers: Raw Body Preservation & Constant-Time Validation**:
+  - ❌ **Anti-Pattern: Using `readBody(event)` for Webhook Signature Verification**: In Nitro server handlers (`server/api/webhooks/...`), calling `readBody(event)` parses the incoming payload into a JavaScript object. Calculating an HMAC over `JSON.stringify(body)` produces false signature mismatches in production due to key ordering and whitespace mutations.
+  - ✅ **Production Invariant**: Always call `await readRawBody(event)` to extract the unmutated Buffer/string, verify using `crypto.timingSafeEqual`, respond immediately with status 202, and delegate tasks asynchronously:
+    ```typescript
+    // server/api/webhooks/stripe.post.ts
+    import crypto from 'node:crypto';
+
+    export default defineEventHandler(async (event) => {
+      const rawBody = await readRawBody(event);
+      if (!rawBody) {
+        throw createError({ statusCode: 400, message: 'Missing request body' });
+      }
+
+      const sigHeader = getHeader(event, 'stripe-signature');
+      if (!sigHeader) {
+        throw createError({ statusCode: 401, message: 'Missing signature header' });
+      }
+
+      const secret = useRuntimeConfig().stripeWebhookSecret;
+      const expected = crypto.createHmac('sha256', secret).update(rawBody).digest();
+      const received = Buffer.from(sigHeader, 'hex');
+
+      if (expected.length !== received.length || !crypto.timingSafeEqual(expected, received)) {
+        throw createError({ statusCode: 401, message: 'Invalid signature' });
+      }
+
+      // Return 202 immediately to satisfy upstream provider timeout SLA (<10s)
+      setResponseStatus(event, 202);
+      // Defer execution via Nitro task or worker queue
+      return { status: 'accepted' };
+    });
+    ```
+
 
 
 

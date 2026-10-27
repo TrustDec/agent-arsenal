@@ -1574,6 +1574,25 @@ alwaysApply: false
     FROM unnest(ARRAY['account_001', 'account_002', 'order_999']) AS resource_key
     ORDER BY hashtext(resource_key) ASC;
     ```
+- **Inbound Webhook Idempotent Ingestion Ledger & Outbound Delivery Outbox Schema**:
+  - ❌ **Anti-Pattern: Processing Webhooks Directly Without Unique Constraint Inbox or Transactional Outbox**: Ingesting webhooks directly without a deduplication table, or dispatching external HTTP webhooks directly within database transactions. If an uncommitted transaction rolls back, external subscribers receive phantom webhooks that never existed in the database.
+  - ✅ **Production Invariant**: Ingest inbound events into `webhook_inbound_events` with `UNIQUE (source, event_id)` using `INSERT ... ON CONFLICT DO NOTHING`. For outbound webhooks, insert into `webhook_outbound_deliveries` in the same database transaction as domain mutations, and poll using `FOR UPDATE SKIP LOCKED`:
+    ```sql
+    -- Atomic Inbound Webhook Ingestion Reservation
+    INSERT INTO webhook_inbound_events (source, event_id, raw_payload, status)
+    VALUES ('stripe', 'evt_123456789', :raw_json, 'pending')
+    ON CONFLICT (source, event_id) DO NOTHING;
+
+    -- Lock-free worker polling for outbound webhook delivery:
+    SELECT id, target_url, payload, secret_key_id, attempt_count
+    FROM webhook_outbound_deliveries
+    WHERE status IN ('pending', 'failed')
+      AND next_retry_at <= NOW()
+    ORDER BY next_retry_at ASC
+    LIMIT 25
+    FOR UPDATE SKIP LOCKED;
+    ```
+
 
 
 

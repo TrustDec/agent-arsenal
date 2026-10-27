@@ -1277,6 +1277,24 @@ alwaysApply: false
       }
     );
     ```
+- **Webhook Ingestion & Push Notification Decoupling in MCP Servers**:
+  - ❌ **Anti-Pattern: Blocking MCP Server Transport with Synchronous Webhook Processing**: Executing heavy webhook ingestion or external API push notifications synchronously on the same thread/process managing MCP stdio or SSE transport. This blocks incoming MCP JSON-RPC messages and triggers client tool-call timeout errors (`tool execution timed out after 30000ms`).
+  - ✅ **Production Invariant**: Verify inbound webhook signatures over raw buffers, acknowledge receipt immediately with HTTP 202, and decouple external event notifications from the MCP RPC event loop using an internal asynchronous event queue or worker:
+    ```typescript
+    import { createHmac, timingSafeEqual } from 'node:crypto';
+
+    export function verifyMcpWebhook(
+      rawBody: Buffer,
+      signatureHeader: string,
+      secret: string
+    ): boolean {
+      const computed = createHmac('sha256', secret).update(rawBody).digest();
+      const received = Buffer.from(signatureHeader.replace('sha256=', ''), 'hex');
+      if (computed.length !== received.length) return false;
+      return timingSafeEqual(computed, received);
+    }
+    ```
+
 
 
 

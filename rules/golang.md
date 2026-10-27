@@ -2571,6 +2571,46 @@ alwaysApply: false
         return m.executeTransfer(ctx, fromID, toID, amount)
     }
     ```
+- **Webhook Raw-Body Preservation & Constant-Time Verification (`hmac.Equal`)**:
+  - ❌ **Anti-Pattern: JSON Decoding Before Signature Verification**: Decoding `json.NewDecoder(r.Body).Decode(&payload)` directly and then trying to re-encode `json.Marshal(payload)` to compute HMAC, or using `stringA == stringB` for signature comparison. Re-encoding fails due to JSON formatting mutations, and `==` is vulnerable to timing attacks.
+  - ✅ **Production Invariant**: Read raw bytes using `io.LimitReader(r.Body, MaxBytes)`, compute HMAC with `hmac.New(sha256.New, secret)`, verify using `hmac.Equal(macA, macB)`, check timestamp skew $|t_{\text{now}} - t_{\text{hook}}| \le 300\text{s}$, and respond with immediate HTTP 202 before offloading processing to a worker channel or task queue:
+    ```go
+    // Industrial webhook verification with raw body preservation in Go:
+    func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodPost {
+            http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+            return
+        }
+
+        // 1. Enforce bounded read (prevent memory exhaustion attacks)
+        rawBody, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1MB upper bound
+        if err != nil {
+            http.Error(w, "Failed reading body", http.StatusBadRequest)
+            return
+        }
+
+        // 2. Parse signature & timestamp header (e.g., Stripe or GitHub)
+        sigHeader := r.Header.Get("X-Hub-Signature-256")
+        expectedSig, err := hex.DecodeString(strings.TrimPrefix(sigHeader, "sha256="))
+        if err != nil {
+            http.Error(w, "Invalid signature encoding", http.StatusUnauthorized)
+            return
+        }
+
+        // 3. Constant-time comparison across active signing keys
+        mac := hmac.New(sha256.New, []byte(h.signingSecret))
+        mac.Write(rawBody)
+        if !hmac.Equal(mac.Sum(nil), expectedSig) {
+            http.Error(w, "Signature mismatch", http.StatusUnauthorized)
+            return
+        }
+
+        // 4. Return immediate 202 Accepted; never block the connection on business logic
+        w.WriteHeader(http.StatusAccepted)
+        h.workerPool.Enqueue(r.Context(), rawBody)
+    }
+    ```
+
 
 
 

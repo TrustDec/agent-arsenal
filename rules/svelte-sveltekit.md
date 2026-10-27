@@ -2559,6 +2559,40 @@ alwaysApply: false
     }
     </script>
     ```
+- **SvelteKit `+server.ts` Webhook Endpoints & Raw ArrayBuffer Verification**:
+  - ❌ **Anti-Pattern: Calling `await request.json()` Prior to Webhook Signature Check**: In SvelteKit API endpoints (`src/routes/api/webhooks/+server.ts`), calling `request.json()` parses the stream into memory. Re-stringifying with `JSON.stringify()` fails HMAC validation against Stripe, GitHub, or Shopify signatures.
+  - ✅ **Production Invariant**: Read raw bytes via `await request.arrayBuffer()` or `await request.text()`, calculate HMAC-SHA256 with Web Crypto API (`crypto.subtle`), perform constant-time comparison, return `new Response(null, { status: 202 })`, and pass the verified event to a background job queue:
+    ```typescript
+    // src/routes/api/webhooks/+server.ts
+    import type { RequestHandler } from './$types';
+    import crypto from 'node:crypto';
+
+    export const POST: RequestHandler = async ({ request }) => {
+      // 1. Read unmutated raw text/buffer
+      const rawBody = await request.text();
+      const signature = request.headers.get('stripe-signature');
+
+      if (!signature) {
+        return new Response('Missing signature', { status: 401 });
+      }
+
+      const secret = process.env.STRIPE_WEBHOOK_SECRET!;
+      const expected = crypto.createHmac('sha256', secret).update(rawBody, 'utf8').digest();
+      const received = Buffer.from(signature, 'hex');
+
+      if (expected.length !== received.length || !crypto.timingSafeEqual(expected, received)) {
+        return new Response('Invalid signature', { status: 401 });
+      }
+
+      // 2. Immediate 202 response to avoid provider timeouts
+      // Offload to background worker or durable queue
+      return new Response(JSON.stringify({ received: true }), {
+        status: 202,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    };
+    ```
+
 
 
 
