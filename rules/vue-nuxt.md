@@ -2786,5 +2786,28 @@ alwaysApply: false
         refresh,
       };
     }
+
+    // Nuxt 3 Database Query Planner & Statistics Sentinel Composable
+    export function useDatabaseStatisticsSentinel(schemaName: string = 'public') {
+      const { data: statsData, refresh } = useFetch(`/api/admin/database-stats/${schemaName}`);
+      const isRandomCostCalibrated = computed(() => {
+        const val = parseFloat(statsData.value?.settings?.random_page_cost || '4.0');
+        return val <= 1.2;
+      });
+      const isJitSafeForOLTP = computed(() => {
+        return statsData.value?.settings?.jit === 'off';
+      });
+      const isPlannerOptimized = computed(() => {
+        return isRandomCostCalibrated.value && isJitSafeForOLTP.value;
+      });
+
+      return {
+        statsData,
+        isRandomCostCalibrated,
+        isJitSafeForOLTP,
+        isPlannerOptimized,
+        refresh,
+      };
+    }
     </script>
     ```

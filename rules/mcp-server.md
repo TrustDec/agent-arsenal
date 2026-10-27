@@ -2343,4 +2343,67 @@ alwaysApply: false
         }
       }
     );
+
+    // Tool: Audit Query Planner Statistics & NVMe Cost Settings
+    server.tool(
+      'audit_database_query_plans_and_statistics',
+      'Audits PostgreSQL query planner statistics, NVMe cost calibration (random_page_cost), JIT settings, and extended statistics (CREATE STATISTICS)',
+      {
+        schemaName: z.string().default('public').describe('Schema name to inspect'),
+      },
+      async ({ schemaName }) => {
+        const client = await pool.connect();
+        try {
+          // 1. Audit Planner Settings
+          const settingsRes = await client.query(`
+            SELECT name, setting, unit, boot_val, reset_val
+            FROM pg_settings
+            WHERE name IN ('random_page_cost', 'seq_page_cost', 'effective_io_concurrency', 'work_mem', 'jit');
+          `);
+
+          // 2. Audit Extended Statistics
+          const extStatsRes = await client.query(`
+            SELECT
+              s.stxname AS statistics_name,
+              c.relname AS table_name,
+              s.stxkind AS kinds,
+              ARRAY(
+                SELECT attname FROM pg_attribute
+                WHERE attrelid = c.oid AND attnum = ANY(s.stxkeys)
+              ) AS columns
+            FROM pg_statistic_ext s
+            JOIN pg_class c ON c.oid = s.stxrelid
+            WHERE c.relnamespace = $1::regnamespace;
+          `, [schemaName]);
+
+          const settingsMap = Object.fromEntries(settingsRes.rows.map((r: any) => [r.name, r.setting]));
+          const violations: string[] = [];
+
+          const randomCost = parseFloat(settingsMap['random_page_cost'] || '4.0');
+          if (randomCost > 1.5) {
+            violations.push(`random_page_cost is ${randomCost}; default 4.0 penalizes SSD B-tree scans. Set to 1.1.`);
+          }
+
+          if (settingsMap['jit'] === 'on') {
+            violations.push(`jit is enabled; adds 30ms-150ms LLVM compilation overhead in OLTP. Set to off.`);
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                schema: schemaName,
+                settings: settingsMap,
+                extendedStatisticsCount: extStatsRes.rowCount,
+                extendedStatistics: extStatsRes.rows,
+                isPlannerCalibrated: violations.length === 0,
+                violations,
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
     ```

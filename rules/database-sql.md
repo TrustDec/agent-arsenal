@@ -2296,3 +2296,44 @@ alwaysApply: false
 
     CREATE INDEX idx_documents_tenant_created ON documents (tenant_id, created_at DESC);
     ```
+
+- **Database Statistics, Extended Statistics (`CREATE STATISTICS`) & Query Planner Calibration Invariants**:
+  - ❌ **Anti-Pattern: Correlated Predicate Underestimation, NVMe Random Cost Penalty & Stale Stats Spills**:
+    - Relying on default independent column statistics when queries filter on correlated attributes (`WHERE country = 'US' AND state = 'CA'`), causing the planner to multiply probabilities, underestimate row count by orders of magnitude, and select disastrous Nested Loop joins.
+    - Retaining default 1990s HDD storage parameters (`random_page_cost = 4.0`), penalizing B-tree index scans on modern NVMe SSDs and triggering unnecessary full sequential table scans.
+    - Leaving JIT compilation enabled (`jit = on`) in low-latency OLTP services, adding 30ms–150ms of synchronous LLVM compilation overhead to queries that execute in 1.5ms.
+    - Failing to execute `ANALYZE` after large batch ingestions, causing stale `pg_statistic` data to allocate undersized `work_mem` hash buckets that spill gigabytes to temporary disk files.
+  - ✅ **Production Invariant**:
+    - Calibrate storage cost parameters for NVMe SSDs: `random_page_cost = 1.1`, `seq_page_cost = 1.0`, and `effective_io_concurrency = 200`.
+    - Turn off JIT for OLTP workloads (`jit = off`).
+    - Create multivariate extended statistics on correlated multi-predicate queries: `CREATE STATISTICS <name> (dependencies, ndistinct, mcv) ON col_a, col_b FROM <table>;`.
+    - Set granular column sample targets: `ALTER TABLE <table> ALTER COLUMN <col> SET STATISTICS 1000;` on high-skew attributes.
+    - Proactively trigger `ANALYZE` post-batch operations and tune `autovacuum_analyze_scale_factor = 0.02`.
+    ```sql
+    -- 1. Query Extended Statistics Audit
+    SELECT
+      stxname AS statistics_name,
+      stxnamespace::regnamespace AS schema_name,
+      c.relname AS table_name,
+      stxkind AS statistics_kinds,
+      ARRAY(
+        SELECT attname FROM pg_attribute
+        WHERE attrelid = c.oid AND attnum = ANY(s.stxkeys)
+      ) AS columns
+    FROM pg_statistic_ext s
+    JOIN pg_class c ON c.oid = s.stxrelid
+    WHERE c.relnamespace = 'public'::regnamespace;
+
+    -- 2. Hardware Planner Cost Alignment (NVMe SSDs)
+    ALTER SYSTEM SET random_page_cost = 1.1;
+    ALTER SYSTEM SET seq_page_cost = 1.0;
+    ALTER SYSTEM SET effective_io_concurrency = 200;
+    ALTER SYSTEM SET jit = off;
+    SELECT pg_reload_conf();
+
+    -- 3. Production Extended Statistics Creation
+    CREATE STATISTICS IF NOT EXISTS stat_orders_tenant_status
+      ON (dependencies, ndistinct, mcv)
+      FROM orders (tenant_id, status);
+    ANALYZE orders;
+    ```

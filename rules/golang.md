@@ -3709,4 +3709,78 @@ func AuditRLSCompliance(ctx context.Context, pool *pgxpool.Pool, schema string) 
 
     return reports, nil
 }
+
+// DatabaseQueryPlanSentinel audits EXPLAIN (ANALYZE, BUFFERS) execution outputs
+// to detect cardinality misestimations, NVMe cost drift, and temporary disk buffer spills.
+type QueryPlanAuditSummary struct {
+    MaxDivergenceRatio float64  `json:"max_divergence_ratio"`
+    TotalTempSpillKB   int64    `json:"total_temp_spill_kb"`
+    ExecutionTimeMs    float64  `json:"execution_time_ms"`
+    IsCompliant        bool     `json:"is_compliant"`
+    Violations         []string `json:"violations"`
+}
+
+func AuditQueryPlanPerformance(
+    ctx context.Context,
+    pool *pgxpool.Pool,
+    query string,
+    maxVariance float64,
+    args ...any,
+) (*QueryPlanAuditSummary, error) {
+    explainSQL := fmt.Sprintf("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) %s", query)
+
+    var rawJSON []byte
+    if err := pool.QueryRow(ctx, explainSQL, args...).Scan(&rawJSON); err != nil {
+        return nil, fmt.Errorf("execute explain analyze: %w", err)
+    }
+
+    var plans []struct {
+        Plan struct {
+            NodeType          string  `json:"Node Type"`
+            ActualRows        float64 `json:"Actual Rows"`
+            PlanRows          float64 `json:"Plan Rows"`
+            TempWrittenBlocks int64   `json:"Temp Written Blocks"`
+            Plans             []any   `json:"Plans,omitempty"`
+        } `json:"Plan"`
+        ExecutionTime float64 `json:"Execution Time"`
+    }
+
+    if err := json.Unmarshal(rawJSON, &plans); err != nil {
+        return nil, fmt.Errorf("unmarshal explain json: %w", err)
+    }
+
+    if len(plans) == 0 {
+        return nil, fmt.Errorf("empty explain plan returned")
+    }
+
+    summary := &QueryPlanAuditSummary{
+        MaxDivergenceRatio: 1.0,
+        ExecutionTimeMs:    plans[0].ExecutionTime,
+        IsCompliant:        true,
+        Violations:         make([]string, 0),
+    }
+
+    rootNode := plans[0].Plan
+    if rootNode.TempWrittenBlocks > 0 {
+        summary.TotalTempSpillKB = rootNode.TempWrittenBlocks * 8
+        summary.IsCompliant = false
+        summary.Violations = append(summary.Violations,
+            fmt.Sprintf("Disk spill detected: %d KB written to temporary files", summary.TotalTempSpillKB))
+    }
+
+    if rootNode.PlanRows > 0 && rootNode.ActualRows > 0 {
+        ratio := rootNode.ActualRows / rootNode.PlanRows
+        if ratio < 1.0 {
+            ratio = 1.0 / ratio
+        }
+        summary.MaxDivergenceRatio = ratio
+        if ratio > maxVariance {
+            summary.IsCompliant = false
+            summary.Violations = append(summary.Violations,
+                fmt.Sprintf("Cardinality divergence: %.2fx exceeds maximum allowed threshold %.2fx", ratio, maxVariance))
+        }
+    }
+
+    return summary, nil
+}
 ```

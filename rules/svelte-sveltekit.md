@@ -3367,4 +3367,57 @@ alwaysApply: false
         </div>
       </div>
     </div>
+
+    <!-- Svelte 5 Query Plan & Extended Statistics Sentinel Component -->
+    <script lang="ts">
+      interface PlannerAudit {
+        randomPageCost: number;
+        jitEnabled: boolean;
+        extendedStatisticsCount: number;
+        isPlannerCalibrated: boolean;
+        violations: string[];
+      }
+
+      let { audit } = $props<{ audit: PlannerAudit }>();
+
+      let isHighRandomCost = $derived(audit.randomPageCost > 1.5);
+      let isJitRisk = $derived(audit.jitEnabled);
+      let statusBadge = $derived(audit.isPlannerCalibrated ? 'OPTIMIZED' : 'NEEDS CALIBRATION');
+    </script>
+
+    <div class="planner-sentinel-card" class:warning={!audit.isPlannerCalibrated}>
+      <header>
+        <h4>Query Planner & Cost Model Sentinel</h4>
+        <span class={`badge ${audit.isPlannerCalibrated ? 'success' : 'warning'}`}>
+          {statusBadge}
+        </span>
+      </header>
+
+      {#if isHighRandomCost}
+        <div class="alert warning">
+          <strong>Storage Cost Mismatch:</strong> random_page_cost is {audit.randomPageCost}. On NVMe SSDs, calibrate to 1.1 to prevent index scan avoidance.
+        </div>
+      {/if}
+
+      {#if isJitRisk}
+        <div class="alert warning">
+          <strong>OLTP Latency Risk:</strong> JIT compilation is enabled. Turn off to avoid 30ms-150ms LLVM compilation spikes.
+        </div>
+      {/if}
+
+      <div class="metrics-grid">
+        <div class="metric">
+          <label>random_page_cost</label>
+          <span class="value">{audit.randomPageCost}</span>
+        </div>
+        <div class="metric">
+          <label>OLTP JIT Status</label>
+          <span class="value">{audit.jitEnabled ? 'ENABLED (Risk)' : 'OFF (Safe)'}</span>
+        </div>
+        <div class="metric">
+          <label>Extended Statistics</label>
+          <span class="value">{audit.extendedStatisticsCount} relations</span>
+        </div>
+      </div>
+    </div>
     ```
