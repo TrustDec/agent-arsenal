@@ -2614,4 +2614,89 @@ alwaysApply: false
         }
       }
     );
+
+    // Tool: Audit BRIN Indexes, Physical Heap Correlation & Autosummarize
+    server.tool(
+      'audit_database_brin_indexes_and_correlation',
+      'Audit PostgreSQL BRIN index health, physical disk correlation in pg_stats, pages_per_range calibration, and detect missing autosummarize or outlier-prone default minmax_ops',
+      {
+        schemaName: z.string().default('public').describe('Database schema name'),
+      },
+      async ({ schemaName }) => {
+        const client = await pool.connect();
+        try {
+          // 1. Audit BRIN indexes and index options
+          const brinRes = await client.query(`
+            SELECT
+              t.relname AS table_name,
+              i.relname AS index_name,
+              a.attname AS column_name,
+              opc.opcname AS opclass_name,
+              pg_size_pretty(pg_relation_size(i.oid)) AS index_size,
+              pg_size_pretty(pg_relation_size(t.oid)) AS table_size,
+              pg_relation_size(i.oid) AS index_bytes,
+              pg_relation_size(t.oid) AS table_bytes,
+              COALESCE(
+                (SELECT (regexp_matches(pg_get_indexdef(i.oid), 'pages_per_range = (\\d+)'))[1])::int,
+                128
+              ) AS pages_per_range,
+              (pg_get_indexdef(i.oid) ILIKE '%autosummarize = on%') AS autosummarize
+            FROM pg_index x
+            JOIN pg_class t ON t.oid = x.indrelid
+            JOIN pg_class i ON i.oid = x.indexrelid
+            JOIN pg_am am ON am.oid = i.relam
+            JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(x.indkey)
+            JOIN pg_opclass opc ON opc.oid = ANY(x.indclass)
+            WHERE am.amname = 'brin'
+              AND t.relnamespace = $1::regnamespace
+            ORDER BY pg_relation_size(t.oid) DESC;
+          `, [schemaName]);
+
+          // 2. Audit correlation in pg_stats
+          const corrRes = await client.query(`
+            SELECT
+              s.tablename AS table_name,
+              s.attname AS column_name,
+              COALESCE(s.correlation, 0.0) AS correlation
+            FROM pg_stats s
+            JOIN pg_index x ON x.indrelid = (s.schemaname || '.' || s.tablename)::regclass
+            JOIN pg_class i ON i.oid = x.indexrelid
+            JOIN pg_am am ON am.oid = i.relam
+            JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = ANY(x.indkey) AND a.attname = s.attname
+            WHERE am.amname = 'brin'
+              AND s.schemaname = $1;
+          `, [schemaName]);
+
+          const warnings: string[] = [];
+          for (const idx of brinRes.rows) {
+            if (!idx.autosummarize) {
+              warnings.push(`BRIN index ${idx.index_name} is missing 'autosummarize = on'. Appended head pages will not be summarized automatically!`);
+            }
+            if (idx.opclass_name.endsWith('_minmax_ops')) {
+              warnings.push(`BRIN index ${idx.index_name} uses default minmax_ops. Consider minmax_multi_ops (PostgreSQL 14+) to isolate outliers.`);
+            }
+          }
+          for (const c of corrRes.rows) {
+            const corrVal = Math.abs(parseFloat(c.correlation));
+            if (corrVal < 0.95) {
+              warnings.push(`Table ${c.table_name} column ${c.column_name} has degraded correlation (${c.correlation}). BRIN block skipping is severely impaired! Re-cluster with pg_repack.`);
+            }
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                brinIndexesCount: brinRes.rowCount,
+                brinIndexes: brinRes.rows,
+                correlationStats: corrRes.rows,
+                warnings,
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
     ```

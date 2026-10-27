@@ -2879,5 +2879,33 @@ alwaysApply: false
         refresh,
       };
     }
+
+    // Nuxt 3 Database BRIN Index & Physical Heap Correlation Composable
+    // Monitors BRIN compression ratio, unsummarized blocks, and pg_stats.correlation
+    export function useDatabaseBrinSentinel(schemaName: string = 'public') {
+      const { data: brinData, refresh } = useFetch(`/api/admin/database-brin/${schemaName}`);
+
+      const hasDegradedCorrelation = computed(() => {
+        const stats = brinData.value?.correlationStats || [];
+        return stats.some((s: any) => Math.abs(parseFloat(s.correlation)) < 0.95);
+      });
+
+      const missingAutosummarizeIndexes = computed(() => {
+        const indexes = brinData.value?.brinIndexes || [];
+        return indexes.filter((idx: any) => !idx.autosummarize);
+      });
+
+      const isBrinFleetHealthy = computed(() => {
+        return !hasDegradedCorrelation.value && missingAutosummarizeIndexes.value.length === 0;
+      });
+
+      return {
+        brinData,
+        hasDegradedCorrelation,
+        missingAutosummarizeIndexes,
+        isBrinFleetHealthy,
+        refresh,
+      };
+    }
     </script>
     ```

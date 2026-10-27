@@ -2465,3 +2465,49 @@ alwaysApply: false
     ORDER BY created_at DESC
     LIMIT 50;
     ```
+
+- **Database BRIN Indexing, Append-Only Time-Series Ingestion, Physical Heap Correlation & Space Amplification Defense**:
+  - ❌ **Anti-Pattern: B-Tree Space Bloat on Append-Only Logs, Missing `autosummarize`, Out-of-Order Correlation Decay, and Default `minmax_ops` Outlier Poisoning**:
+    - Creating standard B-Tree indexes on `created_at` or `timestamp` across 100M+ append-only telemetry/log rows, consuming 3GB–5GB of disk space per index and evicting hot OLTP working sets from `shared_buffers`.
+    - Omitting `autosummarize = on` when creating BRIN indexes, causing newly appended heap pages at the table head to remain unsummarized and forcing real-time queries into sequential scans over gigabytes of heap data.
+    - Creating BRIN indexes on random UUIDv4 or cryptographic hashes where physical disk correlation $|\text{correlation}| \approx 0$, resulting in 100% false-positive block hits and running slower than a sequential scan.
+    - Using default `minmax_ops` vulnerable to single-record outlier poisoning (e.g. an erroneous future timestamp), permanently expanding range envelopes cluster-wide.
+  - ✅ **Production Invariant**:
+    - Deploy Block Range Indexes (BRIN) on naturally monotonic, append-only time columns, achieving $\ge 99\%$ index space reduction compared to B-Tree.
+    - Always specify `WITH (autosummarize = on, pages_per_range = 32)` (or 64) to ensure background autovacuum summarization of newly appended pages.
+    - Use PostgreSQL 14+ `minmax_multi_ops` (`recorded_at timestamptz_minmax_multi_ops`) to store non-overlapping interval ranges and isolate stray outliers.
+    - Enforce monotonic primary keys (UUIDv7 or BigSerial) to guarantee physical disk correlation $|\text{correlation}| \ge 0.95$ in `pg_stats`.
+    - Never wrap BRIN columns in non-sargable functions (`DATE_TRUNC`, `DATE()`, `CAST()`) in `WHERE` clauses.
+    ```sql
+    -- 1. Append-Only Telemetry Partition with Monotonic Timestamp Ordering
+    CREATE TABLE IF NOT EXISTS telemetry_events_partition (
+      id UUID NOT NULL,
+      tenant_id UUID NOT NULL,
+      metric_name VARCHAR(128) NOT NULL,
+      value DOUBLE PRECISION NOT NULL,
+      recorded_at TIMESTAMPTZ NOT NULL DEFAULT CLOCK_TIMESTAMP(),
+      payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      CONSTRAINT pk_telemetry_partition PRIMARY KEY (id, recorded_at)
+    );
+
+    -- 2. Compact BRIN Index with minmax_multi_ops & autosummarize = on
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_telemetry_recorded_at_brin
+      ON telemetry_events_partition
+      USING brin (recorded_at timestamptz_minmax_multi_ops)
+      WITH (pages_per_range = 32, autosummarize = on);
+
+    -- 3. Categorical Bloom Filter BRIN Index for Semi-Clustered Tenant Lookups
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_telemetry_tenant_bloom_brin
+      ON telemetry_events_partition
+      USING brin (tenant_id uuid_bloom_ops)
+      WITH (pages_per_range = 64, autosummarize = on);
+
+    -- 4. Sargable Direct Range Predicate (Bypass Date Functions)
+    SELECT id, tenant_id, metric_name, value, recorded_at
+    FROM telemetry_events_partition
+    WHERE tenant_id = 'b0000000-0000-0000-0000-000000000002'::uuid
+      AND recorded_at >= '2026-10-28 00:00:00+00'::timestamptz
+      AND recorded_at < '2026-10-28 01:00:00+00'::timestamptz
+    ORDER BY recorded_at ASC
+    LIMIT 500;
+    ```

@@ -4062,4 +4062,87 @@ func QueryEventsByContainment[T any](
 
     return results, rows.Err()
 }
+
+// ============================================================================
+// 13. PostgreSQL BRIN Indexing, Time-Series Ingestion & Monotonic UUIDv7 Micro-Batching
+// ============================================================================
+
+// MonotonicUUIDv7 generates a time-ordered UUIDv7 matching RFC 9562.
+// Invariant: Guarantees strict physical heap correlation for BRIN indexing (|corr| >= 0.95).
+func MonotonicUUIDv7(ts time.Time) (uuid.UUID, error) {
+    var id uuid.UUID
+    ms := uint64(ts.UnixMilli())
+
+    // 48-bit timestamp in big-endian order
+    id[0] = byte(ms >> 40)
+    id[1] = byte(ms >> 32)
+    id[2] = byte(ms >> 24)
+    id[3] = byte(ms >> 16)
+    id[4] = byte(ms >> 8)
+    id[5] = byte(ms)
+
+    // Random entropy bits
+    if _, err := io.ReadFull(rand.Reader, id[6:]); err != nil {
+        return uuid.Nil, fmt.Errorf("generate entropy: %w", err)
+    }
+
+    // Version 7 (0111) in bits 48..51
+    id[6] = (id[6] & 0x0f) | 0x70
+    // Variant 1 (10) in bits 64..65
+    id[8] = (id[8] & 0x3f) | 0x80
+
+    return id, nil
+}
+
+// MonotonicEventSink flushes time-series records into PostgreSQL using COPY protocol.
+// Invariant: Always sorts batch by RecordedAt before COPY to maintain physical disk correlation.
+type MonotonicEventSink struct {
+    pool *pgxpool.Pool
+}
+
+func NewMonotonicEventSink(pool *pgxpool.Pool) *MonotonicEventSink {
+    return &MonotonicEventSink{pool: pool}
+}
+
+type StreamEvent struct {
+    ID         uuid.UUID
+    TenantID   uuid.UUID
+    MetricName string
+    Value      float64
+    RecordedAt time.Time
+}
+
+func (s *MonotonicEventSink) BulkInsertMonotonic(ctx context.Context, table string, events []StreamEvent) error {
+    if len(events) == 0 {
+        return nil
+    }
+
+    // Sort in-memory batch by RecordedAt ascending to ensure physical heap page monotonicity
+    sort.Slice(events, func(i, j int) bool {
+        return events[i].RecordedAt.Before(events[j].RecordedAt)
+    })
+
+    rows := make([][]interface{}, len(events))
+    for i, e := range events {
+        rows[i] = []interface{}{e.ID, e.TenantID, e.MetricName, e.Value, e.RecordedAt}
+    }
+
+    conn, err := s.pool.Acquire(ctx)
+    if err != nil {
+        return fmt.Errorf("acquire connection: %w", err)
+    }
+    defer conn.Release()
+
+    _, err = conn.CopyFrom(
+        ctx,
+        pgx.Identifier{table},
+        []string{"id", "tenant_id", "metric_name", "value", "recorded_at"},
+        pgx.CopyFromRows(rows),
+    )
+    if err != nil {
+        return fmt.Errorf("copy from rows: %w", err)
+    }
+
+    return nil
+}
 ```

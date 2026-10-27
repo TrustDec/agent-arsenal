@@ -3572,4 +3572,53 @@ alwaysApply: false
         </div>
       {/if}
     </div>
+
+    <!-- Svelte 5 BRIN Index & Heap Correlation Sentinel Component -->
+    <!-- Invariant: Uses $derived for real-time correlation evaluation and warning display -->
+    <script lang="ts">
+      interface BrinAuditSummary {
+        totalBrinIndexes: number;
+        spaceSavedBytes: number;
+        degradedCorrelations: Array<{ table: string; column: string; correlation: number }>;
+        missingAutosummarize: string[];
+      }
+
+      let { brinSummary } = $props<{ brinSummary: BrinAuditSummary }>();
+
+      let hasDegradedCorr = $derived(brinSummary.degradedCorrelations.length > 0);
+      let hasMissingAutosummarize = $derived(brinSummary.missingAutosummarize.length > 0);
+      let isBrinOptimal = $derived(!hasDegradedCorr && !hasMissingAutosummarize);
+    </script>
+
+    <div class="brin-sentinel-card" class:warning={!isBrinOptimal}>
+      <header>
+        <h4>Database BRIN Index & Correlation Sentinel</h4>
+        <span class={`badge ${isBrinOptimal ? 'success' : 'danger'}`}>
+          {isBrinOptimal ? 'OPTIMAL' : 'CORRELATION DEGRADED'}
+        </span>
+      </header>
+
+      {#if hasDegradedCorr}
+        <div class="alert danger">
+          <strong>Degraded Physical Disk Correlation (|corr| &lt; 0.95):</strong>
+          <ul>
+            {#each brinSummary.degradedCorrelations as item}
+              <li>{item.table}.{item.column}: corr = {item.correlation.toFixed(3)} (Re-cluster required)</li>
+            {/each}
+          </ul>
+        </div>
+      {/if}
+
+      {#if hasMissingAutosummarize}
+        <div class="alert warning">
+          <strong>Missing autosummarize = on:</strong>
+          <p>The following indexes are vulnerable to hot-head sequential scans:</p>
+          <ul>
+            {#each brinSummary.missingAutosummarize as idx}
+              <li>{idx}</li>
+            {/each}
+          </ul>
+        </div>
+      {/if}
+    </div>
     ```
