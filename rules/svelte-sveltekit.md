@@ -2401,6 +2401,48 @@ alwaysApply: false
     });
     </script>
     ```
+- **Svelte 5 `$state.raw` for Large Datasets & Proxy Memory Optimization**:
+  - ❌ **Anti-Pattern: Deep Proxying Large Lists or GeoJSON with `$state`**: Wrapping arrays with thousands of items in `$state([...])`. Svelte 5 creates reactive proxies for every nested object, consuming excessive memory and slowing down garbage collection.
+  - ✅ **Production Invariant**: Use `$state.raw` for immutable objects or large collections that are replaced wholesale. Only reassignment triggers updates, incurring zero proxy overhead:
+    ```svelte
+    <script lang="ts">
+    interface HeavyMetric { id: string; val: number; ts: number; }
+
+    // Bypasses recursive proxying for large datasets:
+    let metrics = $state.raw<HeavyMetric[]>([]);
+
+    function refreshMetrics(batch: HeavyMetric[]) {
+      // Reassignment notifies dependents efficiently:
+      metrics = batch;
+    }
+    </script>
+    ```
+- **SvelteKit Progressive Form Enhancement & Deterministic Mutation (`use:enhance`)**:
+  - ❌ **Anti-Pattern: Ad-Hoc `fetch` in Forms Bypassing SvelteKit Form Actions**: Manually attaching `on:submit` with custom `fetch` handlers. This breaks progressive enhancement, loses automatic CSRF validation, and complicates error handling.
+  - ✅ **Production Invariant**: Always pair SvelteKit `<form method="POST">` with `use:enhance` from `$app/forms` for seamless optimistic updates and automatic invalidation:
+    ```svelte
+    <script lang="ts">
+    import { enhance } from '$app/forms';
+
+    let pending = $state(false);
+    </script>
+
+    <form
+      method="POST"
+      action="?/save"
+      use:enhance={() => {
+        pending = true;
+        return async ({ update }) => {
+          pending = false;
+          await update();
+        };
+      }}
+    >
+      <input name="title" required />
+      <button type="submit" disabled={pending}>Save</button>
+    </form>
+    ```
+
 
 
 

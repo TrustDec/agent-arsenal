@@ -2067,6 +2067,39 @@ alwaysApply: false
       expect(wrapper.find('[data-testid="user-name"]').text()).toBe('Alice');
     });
     ```
+- **Vue 3.5+ Type-Safe Template Refs with `useTemplateRef`**:
+  - ❌ **Anti-Pattern: Magic String Variable Coupling with `ref<HTMLElement | null>(null)`**: Relying on variable identifier names matching template `ref="id"` strings. Refactoring renames break template connections silently at runtime without compiler warnings.
+  - ✅ **Production Invariant**: In Vue 3.5+, use `useTemplateRef<T>('refName')`. The compiler verifies ref target types and keeps script definitions decoupled from variable names:
+    ```vue
+    <script setup lang="ts">
+    import { useTemplateRef, onMounted } from 'vue';
+
+    // Type-safe ref resolution in Vue 3.5+:
+    const searchInput = useTemplateRef<HTMLInputElement>('searchInput');
+
+    onMounted(() => {
+      searchInput.value?.focus();
+    });
+    </script>
+
+    <template>
+      <input ref="searchInput" type="text" placeholder="Search..." />
+    </template>
+    ```
+- **Nuxt 3 Deterministic SSR Hydration Defense (`<ClientOnly>`)**:
+  - ❌ **Anti-Pattern: Rendering Browser-Dependent State in SSR Templates**: Accessing `window`, `localStorage`, or timezone-dependent formatting directly inside `<template>`. When the client hydrates the server-rendered HTML, mismatches cause DOM reconciliation errors, lost input focus, or layout shifts.
+  - ✅ **Production Invariant**: Wrap non-deterministic browser-specific components in `<ClientOnly>` with deterministic skeleton fallback templates:
+    ```vue
+    <template>
+      <ClientOnly>
+        <TimezoneClock :client-time="Date.now()" />
+        <template #fallback>
+          <span class="inline-block w-20 h-4 bg-gray-200 animate-pulse rounded" />
+        </template>
+      </ClientOnly>
+    </template>
+    ```
+
 
 
 

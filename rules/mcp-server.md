@@ -1117,6 +1117,53 @@ alwaysApply: false
       await server.close();
     });
     ```
+- **MCP Tool Output Size Budgeting & Dual-Buffer Head/Tail Truncation**:
+  - ❌ **Anti-Pattern: Unbounded Tool Output Exhausting Context Windows**: Returning 10MB of raw git diffs, build outputs, or database query records directly in `content[0].text`. This blows past the agent harness context window and triggers abrupt session termination.
+  - ✅ **Production Invariant**: Enforce a strict tool payload ceiling (e.g. 50KB / 1,500 lines). When output exceeds the limit, write the full uncompressed stream to a local scratchpad file and return a preserved head + tail excerpt:
+    ```typescript
+    import * as fs from 'node:fs';
+    import * as os from 'node:os';
+    import * as path from 'node:path';
+
+    function formatToolOutput(raw: string, maxBytes = 50 * 1024): { type: 'text'; text: string } {
+      if (Buffer.byteLength(raw, 'utf-8') <= maxBytes) {
+        return { type: 'text', text: raw };
+      }
+
+      const tempFile = path.join(os.tmpdir(), `mcp_spillover_${Date.now()}.log`);
+      fs.writeFileSync(tempFile, raw, 'utf-8');
+
+      const lines = raw.split('\n');
+      const head = lines.slice(0, 300).join('\n');
+      const tail = lines.slice(-200).join('\n');
+      const summary = `\n... [TRUNCATED: ${lines.length - 500} lines (${raw.length} bytes) omitted. Full log saved to ${tempFile}] ...\n`;
+
+      return { type: 'text', text: `${head}\n${summary}\n${tail}` };
+    }
+    ```
+- **Structured Error Handling with `isError: true` vs Process Abort**:
+  - ❌ **Anti-Pattern: Uncaught Exceptions Severing JSON-RPC Transport**: Throwing raw errors inside `CallToolRequestSchema` handler or calling `process.exit(1)`. The stdio pipe closes abruptly, breaking the client session with `ConnectionClosed`.
+  - ✅ **Production Invariant**: Catch all operational exceptions within the tool boundary and return standard MCP error payloads with `isError: true`, allowing autonomous agents to observe the failure and self-correct:
+    ```typescript
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      try {
+        const result = await executeToolAction(request.params.name, request.params.arguments);
+        return { content: [{ type: 'text', text: result }] };
+      } catch (err: any) {
+        // Return gracefully without crashing the MCP JSON-RPC connection:
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: `Tool execution failed: ${err.message || String(err)}\nCheck parameters and retry.`,
+            },
+          ],
+        };
+      }
+    });
+    ```
+
 
 
 

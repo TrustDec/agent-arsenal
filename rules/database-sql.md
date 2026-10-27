@@ -1463,6 +1463,33 @@ alwaysApply: false
     ORDER BY created_at DESC NULLS LAST, id DESC
     LIMIT 20;
     ```
+- **PR Migration Lock Auditing & Safe DDL Gating (`lock_timeout`)**:
+  - ❌ **Anti-Pattern: Unvetted DDL in Pull Requests Acquiring Production Table Locks**: Opening PRs with raw `ALTER TABLE ... ADD CONSTRAINT` or synchronous column additions without timeout guards. During deployment, the migration blocks waiting for concurrent queries, causing incoming connections to pile up and exhaust the pool.
+  - ✅ **Production Invariant**: In CI PR verification, execute automated migration linters (`squawk` or `atlas migrate lint`) and mandate `lock_timeout` in every migration script. Adding foreign keys MUST follow the two-phase `NOT VALID` pattern:
+    ```sql
+    -- Step 1 in PR: Add constraint without scanning existing rows (instant):
+    SET LOCAL lock_timeout = '2s';
+    ALTER TABLE orders ADD CONSTRAINT fk_orders_user_id
+      FOREIGN KEY (user_id) REFERENCES users(id) NOT VALID;
+
+    -- Step 2 in PR: Validate existing rows in background with SHARE UPDATE EXCLUSIVE lock (non-blocking):
+    ALTER TABLE orders VALIDATE CONSTRAINT fk_orders_user_id;
+    ```
+- **Explicit Foreign Key Cascades & Ledger Safety (`ON DELETE RESTRICT`)**:
+  - ❌ **Anti-Pattern: Indiscriminate `ON DELETE CASCADE` on Financial & Audit Entities**: Applying `ON DELETE CASCADE` to invoices, audit entries, or transaction records. Deleting a parent customer or organization record triggers a silent recursive purge across all dependent tables, destroying financial compliance records.
+  - ✅ **Production Invariant**: Always enforce `ON DELETE RESTRICT` (or `ON DELETE NO ACTION`) on immutable ledgers, invoices, payments, and audit tables. Cascades are strictly limited to ephemeral child data (such as temporary cache entries or session tokens):
+    ```sql
+    CREATE TABLE invoices (
+      id BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+      account_id BIGINT NOT NULL,
+      amount NUMERIC(14, 2) NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      -- Prohibits deletion of account while historical invoices exist:
+      CONSTRAINT fk_invoices_account
+        FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE RESTRICT
+    );
+    ```
+
 
 
 

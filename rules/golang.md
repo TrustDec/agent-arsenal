@@ -2391,6 +2391,33 @@ alwaysApply: false
         }
     }
     ```
+- **Go PR Commit Hygiene & Bisect Invariance (`git rebase --exec`)**:
+  - ❌ **Anti-Pattern: Megacommit Dumps and Broken Intermediate Commits in PRs**: Grouping 30 files into a single commit or creating intermediate broken commits where tests fail. When a regression is introduced, `git bisect` lands on an un-compilable commit, paralyzing automated root-cause isolation.
+  - ✅ **Production Invariant**: Enforce that every single commit on a PR branch compiles cleanly and passes all unit and race tests independently prior to opening or updating a PR:
+    ```bash
+    # Run against target base branch before pushing PR:
+    git rebase origin/main -i --exec "go test -race ./... && go vet ./..."
+    ```
+- **Structured Multi-Error Aggregation with `errors.Join` in Batch Workflows**:
+  - ❌ **Anti-Pattern: String Concatenation or Swallowing Errors in Fan-Out Tasks**: Formatting multiple errors into a string (`fmt.Sprintf("err1: %v, err2: %v", err1, err2)`). This strips underlying error types, preventing callers from inspecting sentinel errors via `errors.Is` or extracting typed context with `errors.As`.
+  - ✅ **Production Invariant**: In Go 1.20+, use `errors.Join(errs...)` to collect errors from concurrent worker pools or multi-step batch tasks. The joined error retains full tree traversal compatibility:
+    ```go
+    func ValidateOrderBatch(orders []Order) error {
+        var errs []error
+        for _, o := range orders {
+            if err := o.Validate(); err != nil {
+                errs = append(errs, err)
+            }
+        }
+        return errors.Join(errs...)
+    }
+
+    // Caller can inspect specific sentinel error across all joined failures:
+    if errors.Is(err, ErrInvalidBillingAddress) {
+        telemetry.RecordRejectedOrder("invalid_address")
+    }
+    ```
+
 
 
 
