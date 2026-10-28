@@ -4249,5 +4249,32 @@ alwaysApply: false
           throw err;
         }
       },
+
+      // Bulk import action: Bounded discrete chunks without nested savepoints
+      bulkImport: async ({ request, locals }) => {
+        const formData = await request.formData();
+        const rawJson = formData.get('itemsJson') as string;
+        const items = JSON.parse(rawJson || '[]');
+
+        const CHUNK_SIZE = 250;
+        let importedCount = 0;
+
+        for (let i = 0; i < items.length; i += CHUNK_SIZE) {
+          const chunk = items.slice(i, i + CHUNK_SIZE);
+          // Invariant: Top-level discrete transaction per chunk; ZERO savepoints created!
+          await locals.db.tx(async (client: any) => {
+            await client.query('SET LOCAL lock_timeout = 2000');
+            const res = await client.query(
+              `INSERT INTO organization_tags (org_id, tag_name, created_at)
+               SELECT $1, unnest($2::text[]), clock_timestamp()
+               ON CONFLICT (org_id, tag_name) DO NOTHING;`,
+              [locals.tenantId, chunk.map((c: any) => c.name.toLowerCase().trim())]
+            );
+            importedCount += res.rowCount || 0;
+          });
+        }
+
+        return { success: true, count: importedCount };
+      },
     };
     ```

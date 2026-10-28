@@ -5197,4 +5197,42 @@ func UpsertTenantConfigsCanonical(ctx context.Context, pool *pgxpool.Pool, confi
 
 	return tx.Commit(ctx)
 }
+
+// IngestBoundedDiscreteBatches processes a large slice of records in discrete top-level
+// transactions without creating any SAVEPOINT or subtransactions, completely preventing
+// PostgreSQL 64-subxid cache overflows (PGPROC.subxids) and SubtransSLRULock contention.
+func IngestBoundedDiscreteBatches[T any](
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	items []T,
+	chunkSize int,
+	fn func(ctx context.Context, tx pgx.Tx, chunk []T) error,
+) error {
+	if len(items) == 0 {
+		return nil
+	}
+	if chunkSize <= 0 || chunkSize > 500 {
+		chunkSize = 500
+	}
+
+	for i := 0; i < len(items); i += chunkSize {
+		end := i + chunkSize
+		if end > len(items) {
+			end = len(items)
+		}
+		chunk := items[i:end]
+
+		// Execute each chunk in an independent, clean top-level transaction. Zero savepoints!
+		if err := pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
+			// Enforce defensive statement and lock timeouts
+			if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '2000ms'; SET LOCAL statement_timeout = '5000ms'"); err != nil {
+				return fmt.Errorf("failed to configure chunk timeouts: %w", err)
+			}
+			return fn(ctx, tx, chunk)
+		}); err != nil {
+			return fmt.Errorf("discrete batch chunk [%d:%d] failed: %w", i, end, err)
+		}
+	}
+	return nil
+}
 ```

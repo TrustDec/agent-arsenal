@@ -3311,4 +3311,30 @@ alwaysApply: false
         throw err;
       }
     });
+
+    // server/api/organizations/[id]/bulk-tags.post.ts
+    // Invariant: Bounded chunked transactions with ZERO savepoints (eliminates pg_subtrans SLRU lockup)
+    export const bulkTagHandler = defineEventHandler(async (event) => {
+      const orgId = getRouterParam(event, 'id');
+      const { tags } = await readBody<{ tags: string[] }>(event);
+
+      const CHUNK_SIZE = 250;
+      let inserted = 0;
+
+      for (let i = 0; i < tags.length; i += CHUNK_SIZE) {
+        const chunk = tags.slice(i, i + CHUNK_SIZE).map((t) => t.trim().toLowerCase());
+        await useDatabase().transaction(async (tx) => {
+          await tx.query("SET LOCAL lock_timeout = '2000ms'");
+          const result = await tx.query(
+            `INSERT INTO tags (org_id, name, created_at)
+             SELECT $1, unnest($2::text[]), clock_timestamp()
+             ON CONFLICT (org_id, name) DO NOTHING`,
+            [orgId, chunk]
+          );
+          inserted += result.rowCount || 0;
+        });
+      }
+
+      return { success: true, count: inserted };
+    });
     ```

@@ -3511,5 +3511,66 @@ alwaysApply: false
           }
         }
       );
+
+      // Tool: Audit PostgreSQL SubtransSLRU Lock Contention & Subxid Overflows
+      server.tool(
+        'check_subtransaction_slru_contention',
+        'Inspects PostgreSQL for active SubtransSLRU lock contention and backends exceeding the 64-subxid cache',
+        {},
+        async () => {
+          const client = await pool.connect();
+          try {
+            // Check 1: Active backends waiting on SubtransSLRU Lightweight Locks
+            const waitQuery = `
+              SELECT
+                pid,
+                usename,
+                wait_event,
+                wait_event_type,
+                state,
+                clock_timestamp() - state_change AS duration,
+                query
+              FROM pg_stat_activity
+              WHERE wait_event IN ('SubtransSLRU', 'SubtransBuffer');
+            `;
+            const waitRes = await client.query(waitQuery);
+
+            // Check 2: Backends holding > 64 transaction locks (subxid overflow marker)
+            const overflowQuery = `
+              SELECT
+                pid,
+                COUNT(*) AS subxid_lock_count
+              FROM pg_locks
+              WHERE locktype = 'transactionid'
+              GROUP BY pid
+              HAVING COUNT(*) > 64;
+            `;
+            const overflowRes = await client.query(overflowQuery);
+
+            const hasMeltdown = waitRes.rows.length > 0;
+            const hasRisk = overflowRes.rows.length > 0;
+
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  status: hasMeltdown ? 'CRITICAL_MELTDOWN' : (hasRisk ? 'RISK_DETECTED' : 'HEALTHY'),
+                  subtransWaitersCount: waitRes.rows.length,
+                  overflowedBackendsCount: overflowRes.rows.length,
+                  activeWaiters: waitRes.rows,
+                  overflowedBackends: overflowRes.rows,
+                  recommendation: hasMeltdown
+                    ? 'CRITICAL: SubtransSLRU lock contention detected! Terminate offending batch backends immediately with pg_terminate_backend().'
+                    : (hasRisk
+                        ? 'WARNING: Backends holding >64 subxids found. Refactor code to eradicate SAVEPOINT or begin_nested() in loops.'
+                        : 'PostgreSQL subtransaction cache is healthy. All backends operating within 64-subxid in-memory cache.'),
+                }, null, 2),
+              }],
+            };
+          } finally {
+            client.release();
+          }
+        }
+      );
     }
     ```

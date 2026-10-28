@@ -3086,3 +3086,39 @@ alwaysApply: false
       IS DISTINCT FROM (EXCLUDED.display_name, EXCLUDED.avatar_url)
     RETURNING *;
     ```
+
+  - ❌ **Anti-Pattern: Subtransactions, Savepoint-in-Loop & `pg_subtrans` SLRU Meltdown**:
+    - Issuing `SAVEPOINT` (or ORM `begin_nested()` / `SavePoint()`) inside batch loops to catch errors per row, causing PostgreSQL's per-backend 64-subxid cache (`PGPROC.subxids`) to overflow.
+    - Writing PL/pgSQL stored procedures with `BEGIN ... EXCEPTION WHEN ... END` inside `LOOP ... END LOOP`, silently creating thousands of internal subtransactions.
+    - Triggering cluster-wide `SubtransSLRULock` contention where all concurrent backends checking row visibility must queue for single-lock disk reads, causing throughput to collapse by 99% and connection pools to exhaust.
+  - ✅ **Production Invariant**:
+    - Eradicate savepoints in loops; enforce declarative single-statement atomic DML (`INSERT ... ON CONFLICT`, `MERGE`).
+    - Ban PL/pgSQL `EXCEPTION` blocks inside loops; refactor to set-based operations or `IF NOT EXISTS` conditions.
+    - Partition large batch ingestions into discrete top-level transactions of $\le 500$ rows with explicit `SET LOCAL lock_timeout = '2000ms'`.
+    - Monitor `pg_stat_activity` for `wait_event = 'SubtransSLRU'` and alert when backends hold $> 64$ transaction locks.
+
+    ```sql
+    -- 1. Continuous Watchdog for SubtransSLRU Lock Contention
+    SELECT
+      pid,
+      usename,
+      wait_event,
+      wait_event_type,
+      state,
+      clock_timestamp() - state_change AS duration,
+      query
+    FROM pg_stat_activity
+    WHERE wait_event IN ('SubtransSLRU', 'SubtransBuffer');
+
+    -- 2. Declarative Zero-Savepoint Set Insertion (Replaces Procedural Exception Loops)
+    INSERT INTO inventory_ledger (item_id, delta_qty, logged_at)
+    SELECT
+      (item->>'id')::UUID,
+      (item->>'qty')::BIGINT,
+      clock_timestamp()
+    FROM jsonb_array_elements($1::jsonb) AS item
+    ON CONFLICT (item_id)
+    DO UPDATE SET
+      delta_qty = inventory_ledger.delta_qty + EXCLUDED.delta_qty,
+      logged_at = clock_timestamp();
+    ```
