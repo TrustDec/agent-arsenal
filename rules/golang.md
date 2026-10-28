@@ -4387,3 +4387,139 @@ func ScheduleVehicleBooking(
 	return bookingID, nil
 }
 ```
+
+- **PostgreSQL Foreign Data Wrappers (`postgres_fdw`), Federated Pushdown & Distributed 2PC Recovery with pgx**:
+  - ❌ **Anti-Pattern: Local Transaction Stalling Across Remote Clusters, Non-Immutable Time Function Injections, and Ignoring `pg_prepared_xacts`**:
+    - Querying foreign tables inside long-lived local transactions while executing non-database work (e.g. HTTP webhooks, Redis publishes, or heavy CPU hashing). The remote connection on the target database stays in `idle in transaction`, blocking remote migrations and pinning the autovacuum horizon.
+    - Passing dynamic functions like `time.Now()` directly into SQL strings without parameters or using non-immutable date constructs that prevent `postgres_fdw` from pushing predicates down to the remote node.
+    - Ignoring distributed transaction failures where prepared transactions (`PREPARE TRANSACTION`) remain orphaned in `pg_prepared_xacts` after network disconnects, exhausting transaction IDs and freezing the remote database.
+  - ✅ **Production Invariant**:
+    - Wrap foreign database operations in concise, dedicated transactions with strict context deadlines (`context.WithTimeout(ctx, 3*time.Second)`).
+    - Periodically run background watchdog goroutines to inspect `pg_prepared_xacts` and execute `ROLLBACK PREPARED` on orphaned in-doubt distributed transactions older than 60 seconds.
+    - Explicitly invoke `postgres_fdw_disconnect_all()` when recycling high-churn worker backends to prevent socket leaks on remote database clusters.
+
+```go
+package store
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+var (
+	ErrRemoteTimeout          = errors.New("federated remote query exceeded deadline")
+	ErrOrphanedPreparedTxFound = errors.New("orphaned 2PC prepared transactions detected")
+)
+
+type FederatedDailyMetric struct {
+	TenantID    uuid.UUID
+	TotalEvents int64
+}
+
+// FetchFederatedMetrics retrieves cross-cluster metrics ensuring the WHERE clause is pushed down to the remote engine.
+func FetchFederatedMetrics(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	startDate, endDate time.Time,
+) ([]FederatedDailyMetric, error) {
+	// Strict sub-3s timeout for cross-database federated operations
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	// Immutable parameters passed explicitly to guarantee remote pushdown
+	const query = `
+		SELECT
+			tenant_id,
+			SUM(event_count)::BIGINT AS total_events
+		FROM foreign_analytics.daily_active_users
+		WHERE activity_date >= $1::DATE
+		  AND activity_date < $2::DATE
+		GROUP BY tenant_id
+		ORDER BY total_events DESC
+		LIMIT 100;
+	`
+
+	rows, err := pool.Query(ctx, query, startDate.Format("2006-01-02"), endDate.Format("2006-01-02"))
+	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("%w: %v", ErrRemoteTimeout, err)
+		}
+		return nil, fmt.Errorf("federated query: %w", err)
+	}
+	defer rows.Close()
+
+	var metrics []FederatedDailyMetric
+	for rows.Next() {
+		var m FederatedDailyMetric
+		if err := rows.Scan(&m.TenantID, &m.TotalEvents); err != nil {
+			return nil, fmt.Errorf("scan federated metric: %w", err)
+		}
+		metrics = append(metrics, m)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
+	}
+
+	return metrics, nil
+}
+
+// ReconcileOrphanedPreparedTransactions inspects and cleans up stalled 2PC distributed transactions.
+func ReconcileOrphanedPreparedTransactions(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	maxAgeSeconds int,
+) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	const checkQuery = `
+		SELECT
+			gid,
+			ROUND(EXTRACT(EPOCH FROM (CLOCK_TIMESTAMP() - prepared)))::INT AS age_seconds
+		FROM pg_prepared_xacts
+		WHERE prepared < CLOCK_TIMESTAMP() - ($1 || ' seconds')::INTERVAL
+		ORDER BY prepared ASC;
+	`
+
+	rows, err := pool.Query(ctx, checkQuery, maxAgeSeconds)
+	if err != nil {
+		return 0, fmt.Errorf("query pg_prepared_xacts: %w", err)
+	}
+	defer rows.Close()
+
+	type preparedTx struct {
+		gid string
+		age int
+	}
+	var orphaned []preparedTx
+
+	for rows.Next() {
+		var tx preparedTx
+		if err := rows.Scan(&tx.gid, &tx.age); err != nil {
+			return 0, fmt.Errorf("scan prepared tx: %w", err)
+		}
+		orphaned = append(orphaned, tx)
+	}
+
+	rolledBackCount := 0
+	for _, tx := range orphaned {
+		// Safe identifier quoting
+		escapedGid := strings.ReplaceAll(tx.gid, "'", "''")
+		rollbackQuery := fmt.Sprintf("ROLLBACK PREPARED '%s';", escapedGid)
+
+		if _, err := pool.Exec(ctx, rollbackQuery); err != nil {
+			return rolledBackCount, fmt.Errorf("failed to rollback prepared tx %s: %w", tx.gid, err)
+		}
+		rolledBackCount++
+	}
+
+	return rolledBackCount, nil
+}
+```

@@ -2969,5 +2969,34 @@ alwaysApply: false
         checkIntervalOverlap,
       };
     }
+
+    // Nuxt 3 Federated FDW & Prepared Transaction Sentinel Composable
+    export function useDatabaseFDWSentinel() {
+      const { data: fdwData, status, refresh } = useFetch('/api/admin/database-fdw-health', {
+        lazy: true,
+        server: false,
+      });
+
+      const hasOrphanedPreparedTransactions = computed(() => {
+        return (fdwData.value?.orphanedPreparedTransactions?.length ?? 0) > 0;
+      });
+
+      const hasMisconfiguredServers = computed(() => {
+        return (fdwData.value?.violations?.length ?? 0) > 0;
+      });
+
+      const isFDWClusterHealthy = computed(() => {
+        return !hasOrphanedPreparedTransactions.value && !hasMisconfiguredServers.value;
+      });
+
+      return {
+        fdwData,
+        status,
+        hasOrphanedPreparedTransactions,
+        hasMisconfiguredServers,
+        isFDWClusterHealthy,
+        refresh,
+      };
+    }
     </script>
     ```

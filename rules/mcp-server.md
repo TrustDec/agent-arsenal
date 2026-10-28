@@ -2876,3 +2876,86 @@ alwaysApply: false
       }
     );
     ```
+
+- **MCP Foreign Data Wrapper (`postgres_fdw`) Health Sentinel & Pushdown Verification Tool**:
+  - ❌ **Anti-Pattern: Blind Foreign Table Scans & Unmonitored 2PC Distributed Lockups in MCP Runtimes**:
+    - Exposing tool endpoints that run unbounded queries across foreign servers without verifying remote predicate pushdown in `EXPLAIN (VERBOSE)`, allowing LLMs to trigger wire-spill downloads of millions of rows across VPCs.
+    - Neglecting orphaned prepared transactions (`pg_prepared_xacts`) left behind by distributed commits, which lock tables and pin autovacuum horizons.
+  - ✅ **Production Invariant**:
+    - Provide diagnostic MCP tools that inspect `pg_foreign_server`, verify `use_remote_estimate` and `fetch_size`, validate query pushdown inside `Remote SQL`, and detect in-doubt prepared transactions older than 60 seconds.
+    ```typescript
+    // Tool: Audit Foreign Data Wrapper Health & Remote Pushdown
+    server.tool(
+      'audit_database_fdw_health',
+      'Audit PostgreSQL postgres_fdw foreign servers, pushdown options, and orphaned 2PC prepared transactions',
+      {
+        sampleQuery: z.string().optional().describe('Optional SQL query against a foreign table to verify pushdown'),
+      },
+      async ({ sampleQuery }) => {
+        const client = await pool.connect();
+        try {
+          // 1. Audit configured foreign servers and options
+          const serverRes = await client.query(`
+            SELECT
+              s.srvname AS server_name,
+              w.fdwname AS wrapper_name,
+              s.srvoptions AS options
+            FROM pg_foreign_server s
+            JOIN pg_foreign_data_wrapper w ON w.oid = s.srvfdw;
+          `);
+
+          // 2. Audit orphaned prepared transactions (2PC)
+          const prepRes = await client.query(`
+            SELECT
+              gid,
+              prepared,
+              owner,
+              database,
+              ROUND(EXTRACT(EPOCH FROM (CLOCK_TIMESTAMP() - prepared))) AS age_seconds
+            FROM pg_prepared_xacts
+            WHERE prepared < CLOCK_TIMESTAMP() - INTERVAL '60 seconds';
+          `);
+
+          const violations: string[] = [];
+          for (const s of serverRes.rows) {
+            const opts = s.options ? s.options.join(',') : '';
+            if (!opts.includes('use_remote_estimate=true')) {
+              violations.push(`Server ${s.server_name} is missing use_remote_estimate=true. Query planner may choose catastrophic nested loops.`);
+            }
+            if (!opts.includes('fetch_size=')) {
+              violations.push(`Server ${s.server_name} is missing explicit fetch_size. Defaults to 100 which degrades network latency.`);
+            }
+          }
+
+          if (prepRes.rows.length > 0) {
+            violations.push(`Detected ${prepRes.rows.length} orphaned prepared transactions older than 60s. Vacuum horizon is currently pinned!`);
+          }
+
+          let pushdownResult: any = null;
+          if (sampleQuery) {
+            const planRes = await client.query(`EXPLAIN (VERBOSE, FORMAT JSON) ${sampleQuery}`);
+            const planText = JSON.stringify(planRes.rows[0]);
+            pushdownResult = {
+              hasRemoteSql: planText.includes('Remote SQL'),
+              hasRemoteFilter: planText.includes('WHERE') || planText.includes('Filter'),
+            };
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                servers: serverRes.rows,
+                orphanedPreparedTransactions: prepRes.rows,
+                pushdownResult,
+                isFDWHealthy: violations.length === 0,
+                violations,
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
+    ```

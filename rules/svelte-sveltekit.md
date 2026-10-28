@@ -3745,3 +3745,87 @@ alwaysApply: false
       {/if}
     </div>
     ```
+
+- **SvelteKit Federated Cross-Database Data Loading & Pushdown-Safe Route Streaming**:
+  - ❌ **Anti-Pattern: Blocking Server Loads on Slow Federated FDW Queries**: Running cross-database queries against foreign tables inside synchronous `+page.server.ts` `load()` functions without streaming promises or timeout boundaries, stalling SSR and rendering blank screens.
+  - ✅ **Production Invariant**: Return non-blocking promises from `+page.server.ts` to enable progressive streaming via Svelte 5 snippets and `{#await}`, passing parameterized bounds that push filtering directly to remote PostgreSQL servers:
+    ```ts
+    // src/routes/analytics/+page.server.ts
+    import type { PageServerLoad } from './$types';
+    import { dbPool } from '$lib/server/db';
+    import { error } from '@sveltejs/kit';
+
+    export const load: PageServerLoad = async ({ url, locals }) => {
+      if (!locals.user) throw error(401, 'Unauthorized');
+
+      const startDate = url.searchParams.get('start') || new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+      const endDate = url.searchParams.get('end') || new Date().toISOString().slice(0, 10);
+
+      // Return streaming promise for federated cross-database metrics
+      const federatedMetricsPromise = (async () => {
+        const client = await dbPool.connect();
+        try {
+          // Explicit parameterized query pushing WHERE and GROUP BY to foreign cluster
+          const res = await client.query(`
+            SELECT
+              tenant_id,
+              SUM(event_count)::BIGINT AS total_events
+            FROM foreign_analytics.daily_active_users
+            WHERE activity_date >= $1::DATE
+              AND activity_date < $2::DATE
+            GROUP BY tenant_id
+            ORDER BY total_events DESC
+            LIMIT 50;
+          `, [startDate, endDate]);
+          return res.rows;
+        } finally {
+          client.release();
+        }
+      })();
+
+      return {
+        streamed: {
+          metrics: federatedMetricsPromise,
+        },
+      };
+    };
+    ```
+    ```svelte
+    <!-- src/routes/analytics/+page.svelte -->
+    <script lang="ts">
+      import type { PageData } from './$types';
+
+      let { data }: { data: PageData } = $props();
+    </script>
+
+    <div class="analytics-dashboard">
+      <h1>Federated Analytics Overview</h1>
+
+      {#await data.streamed.metrics}
+        <div class="skeleton-loader p-4 bg-zinc-800 animate-pulse rounded-lg">
+          Loading cross-cluster metrics...
+        </div>
+      {:then rows}
+        <table class="w-full text-left text-sm text-zinc-300">
+          <thead>
+            <tr>
+              <th class="p-2 border-b border-zinc-700">Tenant</th>
+              <th class="p-2 border-b border-zinc-700">Total Events</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each rows as row}
+              <tr>
+                <td class="p-2 font-mono">{row.tenant_id}</td>
+                <td class="p-2 font-semibold text-emerald-400">{row.total_events}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      {:catch err}
+        <div class="alert danger p-4 bg-rose-950 text-rose-200 rounded">
+          Failed to load federated metrics: {err.message}
+        </div>
+      {/await}
+    </div>
+    ```

@@ -2625,3 +2625,65 @@ alwaysApply: false
     ORDER BY location <-> ST_SetSRID(ST_MakePoint(-73.9851, 40.7488), 4326)::geography
     LIMIT 10;
     ```
+
+- **PostgreSQL Foreign Data Wrappers (postgres_fdw), Cross-Database Federation & Remote Pushdown Optimization**:
+  - ❌ **Anti-Pattern: Missing Remote Estimates, Default 100-Fetch Sizing, Non-Immutable WHERE Bypasses, and Stale Remote Transactions**:
+    - Defining foreign servers without `OPTIONS (use_remote_estimate 'true', fetch_size '2000')`. PostgreSQL assumes an arbitrary 1,000-row dummy size, causing the query planner to choose disastrous nested loops over remote tables with millions of rows.
+    - Querying foreign tables with non-immutable functions (`WHERE created_at >= NOW() - INTERVAL '7 days'`) or mismatched collations, preventing `postgres_fdw` from pushing the filter to the remote database and streaming 50,000,000 unneeded rows over the network into local memory.
+    - Holding local transactions open across slow network or HTTP calls while querying foreign tables, causing remote connections to linger in `idle in transaction`, holding remote locks and pinning remote `$x_{\text{min}}$` autovacuum horizons.
+    - Neglecting orphaned prepared transactions (`pg_prepared_xacts`) from distributed two-phase commits (2PC), which survive disconnects and permanently freeze database transaction ID horizons.
+  - ✅ **Production Invariant**:
+    - Configure foreign servers with calibrated `fetch_size = '2000'`, `use_remote_estimate = 'true'`, and bounded `keep_connections = 'on'`.
+    - Verify with `EXPLAIN (VERBOSE)` that `Foreign Scan` shows the entire filter, aggregation, and limit inside `Remote SQL`.
+    - Deploy background watchdogs querying `pg_prepared_xacts` to detect and roll back orphaned distributed commits older than 60 seconds.
+    - Use dedicated, least-privilege user mappings (`CREATE USER MAPPING`) restricted strictly to required schemas, never mapping to remote superusers.
+    ```sql
+    -- 1. Foreign Server Definition with Pushdown & Batch Sizing Invariants
+    CREATE EXTENSION IF NOT EXISTS postgres_fdw;
+
+    CREATE SERVER IF NOT EXISTS order_analytics_server
+      FOREIGN DATA WRAPPER postgres_fdw
+      OPTIONS (
+        host 'orders-db.internal',
+        port '5432',
+        dbname 'orders_prod',
+        fetch_size '2000',
+        use_remote_estimate 'true',
+        keep_connections 'on'
+      );
+
+    -- 2. Granular Least-Privilege User Mapping
+    CREATE USER MAPPING IF NOT EXISTS FOR app_user
+      SERVER order_analytics_server
+      OPTIONS (
+        user 'analytics_federated_readonly',
+        password 'secret_app_token_99'
+      );
+
+    -- 3. Pushdown-Friendly Foreign Table Projection
+    CREATE FOREIGN TABLE IF NOT EXISTS foreign_orders (
+      id UUID NOT NULL,
+      tenant_id UUID NOT NULL,
+      total_amount NUMERIC(12, 2) NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL
+    )
+    SERVER order_analytics_server
+    OPTIONS (
+      schema_name 'public',
+      table_name 'orders',
+      use_remote_estimate 'true',
+      fetch_size '2000'
+    );
+
+    -- 4. Pushdown Verified Query: Remote SQL executes WHERE, GROUP BY, and LIMIT
+    EXPLAIN (VERBOSE, BUFFERS)
+    SELECT
+      tenant_id,
+      SUM(total_amount) AS total_revenue
+    FROM foreign_orders
+    WHERE created_at >= '2025-01-01 00:00:00+00'::TIMESTAMPTZ
+      AND created_at < '2025-02-01 00:00:00+00'::TIMESTAMPTZ
+    GROUP BY tenant_id
+    ORDER BY total_revenue DESC
+    LIMIT 10;
+    ```
