@@ -2959,3 +2959,138 @@ alwaysApply: false
       }
     );
     ```
+
+- **PostgreSQL Materialized View Health & Non-Blocking Concurrent Refresh Tool**:
+  - ❌ **Anti-Pattern: Blind REFRESH Invocations via LLM Tools**:
+    - LLM agents issuing direct raw SQL `REFRESH MATERIALIZED VIEW` without inspecting whether the view has a non-partial unique index or checking if a refresh is already active. This causes immediate query blocking on all connected clients.
+  - ✅ **Production Invariant**:
+    - Provide a safe, typed MCP tool that validates unique indexes, checks staleness, verifies dead tuple bloat, and uses advisory lock non-blocking execution.
+
+    ```typescript
+    import { z } from 'zod';
+    import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+    import { Pool } from 'pg';
+
+    export function registerMatViewTools(server: McpServer, pool: Pool) {
+      server.tool(
+        'database_materialized_view_health',
+        'Inspect materialized view staleness, unique indexes, dead tuple bloat, and perform safe non-blocking concurrent refresh',
+        {
+          viewName: z.string().describe('Materialized view name in current database'),
+          action: z.enum(['inspect', 'refresh_concurrently']).default('inspect'),
+          timeoutSeconds: z.number().optional().default(600),
+        },
+        async ({ viewName, action, timeoutSeconds }) => {
+          const client = await pool.connect();
+          try {
+            // 1. Inspect view presence, population, and unique index existence
+            const inspectRes = await client.query(
+              `
+              SELECT
+                c.relname,
+                c.relispopulated,
+                COALESCE(s.n_live_tup, 0) as live_tuples,
+                COALESCE(s.n_dead_tup, 0) as dead_tuples,
+                EXISTS (
+                  SELECT 1 FROM pg_index i
+                  WHERE i.indrelid = c.oid AND i.indisunique = true AND i.indpred IS NULL
+                ) as has_unique_index
+              FROM pg_class c
+              LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+              WHERE c.relname = $1 AND c.relkind = 'm';
+              `,
+              [viewName]
+            );
+
+            if (inspectRes.rows.length === 0) {
+              return {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({ error: `Materialized view "${viewName}" not found.` }),
+                }],
+              };
+            }
+
+            const info = inspectRes.rows[0];
+
+            if (action === 'inspect') {
+              const live = Number(info.live_tuples);
+              const dead = Number(info.dead_tuples);
+              const bloatRatio = live + dead > 0 ? Math.round((dead / (live + dead)) * 100) : 0;
+
+              return {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({
+                    viewName,
+                    isPopulated: info.relispopulated,
+                    hasUniqueIndex: info.has_unique_index,
+                    liveTuples: live,
+                    deadTuples: dead,
+                    bloatPercent: bloatRatio,
+                    canRefreshConcurrently: info.has_unique_index,
+                  }, null, 2),
+                }],
+              };
+            }
+
+            // Action: refresh_concurrently
+            if (!info.has_unique_index) {
+              return {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({
+                    error: `Cannot refresh concurrently: view "${viewName}" lacks a non-partial UNIQUE INDEX!`,
+                  }),
+                }],
+              };
+            }
+
+            // Advisory lock key from view name
+            const lockRes = await client.query(
+              `SELECT pg_try_advisory_lock(('x' || SUBSTR(MD5($1), 1, 16))::BIT(64)::BIGINT) as acquired;`,
+              [viewName]
+            );
+
+            if (!lockRes.rows[0].acquired) {
+              return {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({
+                    status: 'SKIPPED',
+                    message: `Another refresh process is already active for "${viewName}". Execution coalesced.`,
+                  }),
+                }],
+              };
+            }
+
+            const startTime = Date.now();
+            try {
+              await client.query(`SET LOCAL statement_timeout = ${timeoutSeconds * 1000};`);
+              await client.query(`SET LOCAL lock_timeout = '3000ms';`);
+              await client.query(`REFRESH MATERIALIZED VIEW CONCURRENTLY ${client.escapeIdentifier(viewName)};`);
+
+              return {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({
+                    status: 'SUCCESS',
+                    viewName,
+                    durationMs: Date.now() - startTime,
+                    refreshedAt: new Date().toISOString(),
+                  }, null, 2),
+                }],
+              };
+            } finally {
+              await client.query(
+                `SELECT pg_advisory_unlock(('x' || SUBSTR(MD5($1), 1, 16))::BIT(64)::BIGINT);`,
+                [viewName]
+              );
+            }
+          } finally {
+            client.release();
+          }
+        }
+      );
+    }
+    ```

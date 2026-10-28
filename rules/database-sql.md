@@ -2687,3 +2687,61 @@ alwaysApply: false
     ORDER BY total_revenue DESC
     LIMIT 10;
     ```
+
+- **PostgreSQL Materialized Views, Concurrent Refresh (`REFRESH MATERIALIZED VIEW CONCURRENTLY`) & Zero-Bloat Shadow Swapping**:
+  - ❌ **Anti-Pattern: Blocking ACCESS EXCLUSIVE Lock Refresh, Missing Unique Indexes, and Unbounded Multi-Worker Thundering Herds**:
+    - Invoking `REFRESH MATERIALIZED VIEW mv_name` in application code without `CONCURRENTLY`, taking an `ACCESS EXCLUSIVE` lock that blocks all incoming user `SELECT` queries for minutes or hours, exhausting connection pools.
+    - Attempting `REFRESH MATERIALIZED VIEW CONCURRENTLY` without a preexisting non-partial, non-nullable `UNIQUE INDEX`, causing immediate crashes with SQLSTATE 55000.
+    - Creating materialized views with data inside migration transactions (`CREATE MATERIALIZED VIEW mv AS ...`), causing migrations to hang and lock tables for lengthy table scans.
+    - Allowing parallel background workers or API handlers to simultaneously issue competing `REFRESH` queries without advisory locking, causing database CPU starvation and I/O thundering herds.
+  - ✅ **Production Invariant**:
+    - Always define materialized views `WITH NO DATA` during migrations and build unique indexes concurrently.
+    - Always execute refreshes with `REFRESH MATERIALIZED VIEW CONCURRENTLY`.
+    - Protect all refreshes with non-blocking session advisory locks (`pg_try_advisory_lock`) and bounded `statement_timeout`.
+    - For large datasets ($N > 2 \times 10^6$ rows), utilize the **Shadow Table Swap (Blue-Green Rotation)** pattern to achieve sub-millisecond switchovers with zero MVCC dead-tuple churn.
+    ```sql
+    -- 1. Migration Step: Instant DDL with zero table scans
+    CREATE MATERIALIZED VIEW IF NOT EXISTS mv_hourly_agent_metrics AS
+    SELECT
+      agent_id,
+      DATE_TRUNC('hour', executed_at) AS metric_hour,
+      COUNT(id) AS total_invocations,
+      SUM(tokens_used) AS total_tokens,
+      AVG(duration_ms) AS avg_duration_ms,
+      NOW() AS refreshed_at
+    FROM agent_executions
+    WHERE status = 'completed'
+    GROUP BY agent_id, DATE_TRUNC('hour', executed_at)
+    WITH NO DATA;
+
+    -- 2. Mandatory Unique Index: Required for CONCURRENT refresh
+    CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_mv_hourly_agent_metrics_pk
+      ON mv_hourly_agent_metrics (agent_id, metric_hour);
+
+    -- 3. Non-Blocking Concurrent Refresh with Advisory Lock Fencing
+    DO $$
+    DECLARE
+      v_locked BOOLEAN;
+      v_lock_key CONSTANT BIGINT := 8847291039847291;
+    BEGIN
+      -- Acquire advisory lock without waiting
+      v_locked := pg_try_advisory_lock(v_lock_key);
+      IF NOT v_locked THEN
+        RAISE NOTICE 'Refresh skipped: another worker is currently refreshing mv_hourly_agent_metrics';
+        RETURN;
+      END IF;
+
+      BEGIN
+        SET LOCAL statement_timeout = '600s'; -- 10 minute ceiling
+        SET LOCAL lock_timeout = '2s';
+
+        REFRESH MATERIALIZED VIEW CONCURRENTLY mv_hourly_agent_metrics;
+      EXCEPTION
+        WHEN OTHERS THEN
+          PERFORM pg_advisory_unlock(v_lock_key);
+          RAISE;
+      END;
+
+      PERFORM pg_advisory_unlock(v_lock_key);
+    END $$;
+    ```

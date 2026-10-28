@@ -3829,3 +3829,79 @@ alwaysApply: false
       {/await}
     </div>
     ```
+
+- **Materialized View Stale-While-Revalidate Analytics & Streaming Rollups in SvelteKit**:
+  - ❌ **Anti-Pattern: Synchronous DB Refresh inside SvelteKit Load Functions**:
+    - Triggering `REFRESH MATERIALIZED VIEW` directly inside `+page.server.ts`, blocking the SSR HTTP response for 20+ seconds and failing Core Web Vitals (TTFB / LCP).
+  - ✅ **Production Invariant**:
+    - Read from the materialized view immediately, emit `Cache-Control: public, max-age=60, stale-while-revalidate=300`, return `refreshed_at` staleness indicators, and trigger background refreshes via message queues or asynchronous jobs.
+
+    ```typescript
+    // src/routes/dashboard/+page.server.ts
+    import type { PageServerLoad } from './$types';
+    import { pool } from '$lib/server/db';
+
+    export const load: PageServerLoad = async ({ setHeaders }) => {
+      // 1. Set edge stale-while-revalidate cache headers
+      setHeaders({
+        'cache-control': 'public, max-age=60, stale-while-revalidate=300',
+      });
+
+      // 2. Point lookup against pre-computed materialized view
+      const result = await pool.query(`
+        SELECT
+          tenant_id,
+          report_date,
+          gross_revenue_cents,
+          total_orders,
+          refreshed_at
+        FROM mv_tenant_daily_revenue
+        ORDER BY report_date DESC
+        LIMIT 30;
+      `);
+
+      return {
+        metrics: result.rows,
+        lastRefreshedAt: result.rows[0]?.refreshed_at ?? null,
+      };
+    };
+    ```
+    ```svelte
+    <!-- src/routes/dashboard/+page.svelte -->
+    <script lang="ts">
+      import type { PageData } from './$types';
+
+      let { data }: { data: PageData } = $props();
+
+      // Svelte 5 Rune calculating staleness in minutes
+      let stalenessMinutes = $derived.by(() => {
+        if (!data.lastRefreshedAt) return null;
+        const diffMs = Date.now() - new Date(data.lastRefreshedAt).getTime();
+        return Math.floor(diffMs / 60000);
+      });
+    </script>
+
+    <div class="dashboard-container p-6 bg-zinc-900 text-zinc-100 rounded-xl">
+      <header class="flex justify-between items-center mb-6">
+        <h2 class="text-xl font-bold tracking-tight">Revenue Rollups</h2>
+        {#if stalenessMinutes !== null}
+          <div class="flex items-center gap-2 text-xs font-mono text-zinc-400">
+            <span class="inline-block w-2 h-2 rounded-full {stalenessMinutes > 30 ? 'bg-amber-400' : 'bg-emerald-400'}"></span>
+            Refreshed {stalenessMinutes}m ago
+          </div>
+        {/if}
+      </header>
+
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+        {#each data.metrics as item}
+          <div class="card p-4 bg-zinc-800 border border-zinc-700/60 rounded-lg">
+            <div class="text-xs text-zinc-400 font-mono">{new Date(item.report_date).toLocaleDateString()}</div>
+            <div class="text-2xl font-bold text-emerald-400 mt-1">
+              ${(item.gross_revenue_cents / 100).toLocaleString('en-US', { minimumFractionDigits: 2 })}
+            </div>
+            <div class="text-xs text-zinc-400 mt-1">{item.total_orders} total orders</div>
+          </div>
+        {/each}
+      </div>
+    </div>
+    ```

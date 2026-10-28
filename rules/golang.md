@@ -4523,3 +4523,102 @@ func ReconcileOrphanedPreparedTransactions(
 	return rolledBackCount, nil
 }
 ```
+
+- **PostgreSQL Materialized Views, Concurrent Refresh Fencing & Singleflight with pgx/v5**:
+  - ❌ **Anti-Pattern: Blocking REFRESH in API Requests, Missing Advisory Lock Fencing, and Worker Crash Loops**:
+    - Invoking `REFRESH MATERIALIZED VIEW` without `CONCURRENTLY` inside HTTP or gRPC request paths, holding connection pool leases for tens of seconds and causing HTTP 504 cascades.
+    - Spawning multiple uncoordinated goroutines that execute `REFRESH MATERIALIZED VIEW CONCURRENTLY` at the same time, thrashing CPU, locks, and disk I/O.
+    - Not checking for errors or lock acquisition failures, leaving connections hung or unreleased.
+  - ✅ **Production Invariant**:
+    - Use `golang.org/x/sync/singleflight` to deduplicate refresh calls within the Go process.
+    - Use PostgreSQL advisory locks (`pg_try_advisory_lock`) across distributed instances so only one node executes the refresh.
+    - Set explicit context timeouts and `statement_timeout` on the session.
+
+```go
+package store
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/singleflight"
+)
+
+var (
+	ErrRefreshAlreadyInProgress = errors.New("materialized view refresh already in progress")
+)
+
+type MatViewManager struct {
+	pool  *pgxpool.Pool
+	group singleflight.Group
+}
+
+func NewMatViewManager(pool *pgxpool.Pool) *MatViewManager {
+	return &MatViewManager{pool: pool}
+}
+
+// computeAdvisoryKey generates a deterministic 64-bit advisory lock key from the view name.
+func computeAdvisoryKey(viewName string) int64 {
+	hash := sha256.Sum256([]byte(viewName))
+	return int64(binary.BigEndian.Uint64(hash[:8]))
+}
+
+// RefreshConcurrently executes a non-blocking concurrent refresh with process-level singleflight
+// and distributed PostgreSQL session-level advisory locking.
+func (m *MatViewManager) RefreshConcurrently(ctx context.Context, viewName string, timeout time.Duration) error {
+	_, err, _ := m.group.Do(viewName, func() (any, error) {
+		refreshCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+
+		conn, err := m.pool.Acquire(refreshCtx)
+		if err != nil {
+			return nil, fmt.Errorf("acquire conn: %w", err)
+		}
+		defer conn.Release()
+
+		lockKey := computeAdvisoryKey(viewName)
+
+		// 1. Acquire distributed advisory lock non-blockingly
+		var acquired bool
+		err = conn.QueryRow(refreshCtx, "SELECT pg_try_advisory_lock($1);", lockKey).Scan(&acquired)
+		if err != nil {
+			return nil, fmt.Errorf("acquire advisory lock: %w", err)
+		}
+		if !acquired {
+			// Another cluster node is refreshing; coalesce without error
+			return nil, ErrRefreshAlreadyInProgress
+		}
+
+		defer func() {
+			// Ensure advisory lock is always released
+			_, _ = conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1);", lockKey)
+		}()
+
+		// 2. Set strict local statement timeout
+		timeoutMs := int(timeout.Milliseconds())
+		_, err = conn.Exec(refreshCtx, fmt.Sprintf("SET LOCAL statement_timeout = %d;", timeoutMs))
+		if err != nil {
+			return nil, fmt.Errorf("set statement_timeout: %w", err)
+		}
+
+		// 3. Execute concurrent refresh safely
+		refreshSQL := fmt.Sprintf("REFRESH MATERIALIZED VIEW CONCURRENTLY %s;", conn.Conn().PgConn().EscapeIdentifier(viewName))
+		_, err = conn.Exec(refreshCtx, refreshSQL)
+		if err != nil {
+			return nil, fmt.Errorf("refresh matview %s: %w", viewName, err)
+		}
+
+		return nil, nil
+	})
+
+	if errors.Is(err, ErrRefreshAlreadyInProgress) {
+		return nil // Graceful skip
+	}
+	return err
+}
+```

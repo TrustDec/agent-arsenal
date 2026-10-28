@@ -2998,5 +2998,43 @@ alwaysApply: false
         refresh,
       };
     }
+
+    // Nuxt 3 Materialized View Staleness & Auto-Refresh Trigger Composable
+    export function useMaterializedViewHealth(viewName: string, maxStalenessMinutes = 30) {
+      const { data: health, status, refresh: recheckHealth } = useFetch(`/api/matviews/${viewName}/health`, {
+        lazy: true,
+        server: false,
+      });
+
+      const isStale = computed(() => {
+        if (!health.value?.lastRefreshedAt) return true;
+        const diffMinutes = (Date.now() - new Date(health.value.lastRefreshedAt).getTime()) / 60000;
+        return diffMinutes > maxStalenessMinutes;
+      });
+
+      const isRefreshing = ref(false);
+
+      async function triggerConcurrentRefresh() {
+        if (isRefreshing.value) return;
+        isRefreshing.value = true;
+        try {
+          await $fetch(`/api/matviews/${viewName}/refresh`, {
+            method: 'POST',
+          });
+          await recheckHealth();
+        } finally {
+          isRefreshing.value = false;
+        }
+      }
+
+      return {
+        health,
+        status,
+        isStale,
+        isRefreshing,
+        recheckHealth,
+        triggerConcurrentRefresh,
+      };
+    }
     </script>
     ```
