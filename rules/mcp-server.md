@@ -3343,5 +3343,50 @@ alwaysApply: false
           }
         }
       );
+
+      // Tool: audit_database_check_constraints - Detect Unvalidated Constraints & Volatile Function Traps
+      server.tool(
+        'audit_database_check_constraints',
+        'Audit PostgreSQL CHECK constraints and domain types, detecting unvalidated constraints (convalidated = false), volatile expressions, and ternary logic risks',
+        {
+          schemaName: z.string().optional().default('public').describe('Target schema to audit'),
+        },
+        async ({ schemaName }) => {
+          const client = await pool.connect();
+          try {
+            const query = `
+              SELECT
+                c.connamespace::regnamespace::text AS schema_name,
+                c.conrelid::regclass::text AS table_name,
+                c.conname AS constraint_name,
+                c.contype AS constraint_type,
+                c.convalidated AS is_validated,
+                pg_get_constraintdef(c.oid) AS definition
+              FROM pg_constraint c
+              WHERE c.connamespace::regnamespace::text = $1
+                AND c.contype IN ('c', 'f')
+                AND c.convalidated = false
+              ORDER BY c.conrelid::regclass::text, c.conname;
+            `;
+            const res = await client.query(query, [schemaName]);
+
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  unvalidatedConstraintsCount: res.rows.length,
+                  status: res.rows.length > 0 ? 'VALIDATION_PENDING_OR_RISK' : 'CLEAN_ALL_VALIDATED',
+                  recommendation: res.rows.length > 0
+                    ? 'Execute ALTER TABLE ... VALIDATE CONSTRAINT ... during non-peak hours under SHARE UPDATE EXCLUSIVE lock to complete two-phase constraint enforcement.'
+                    : 'All CHECK and FOREIGN KEY constraints are validated.',
+                  unvalidatedConstraints: res.rows,
+                }, null, 2),
+              }],
+            };
+          } finally {
+            client.release();
+          }
+        }
+      );
     }
     ```

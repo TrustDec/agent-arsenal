@@ -3206,3 +3206,32 @@ alwaysApply: false
     });
     </script>
     ```
+
+- **Vue 3 / Nuxt 3 Form Invariants: Mirroring Relational Check Constraints & Cross-Field Rules**:
+  - ❌ **Anti-Pattern: Primitive Form State Without Invariant Fencing**:
+    - Allowing numeric inputs to submit negative currency cents or mutually exclusive fields simultaneously, resulting in `SQLSTATE 23514 check_violation` crashes.
+  - ✅ **Production Invariant**:
+    - Use VeeValidate or Zod form composables to validate multi-column state machines (e.g. `num_nonnulls` owner exclusivity and positive currency limits) before calling Nitro server API endpoints.
+
+    ```typescript
+    import { z } from 'zod';
+    import { useForm } from 'vee-validate';
+    import { toTypedSchema } from '@vee-validate/zod';
+
+    export const orderFormSchema = toTypedSchema(
+      z.object({
+        customerType: z.enum(['individual', 'organization']),
+        userId: z.string().uuid().optional(),
+        orgId: z.string().uuid().optional(),
+        amountCents: z.number().int().positive('Amount must be greater than 0'),
+      }).refine((data) => {
+        if (data.customerType === 'individual') {
+          return Boolean(data.userId) && !data.orgId;
+        }
+        return Boolean(data.orgId) && !data.userId;
+      }, {
+        message: 'Order must reference exactly one customer entity (User or Organization)',
+        path: ['userId'],
+      })
+    );
+    ```

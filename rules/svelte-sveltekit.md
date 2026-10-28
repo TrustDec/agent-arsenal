@@ -4153,3 +4153,31 @@ alwaysApply: false
       },
     };
     ```
+
+- **Svelte 5 Superforms & Zod: Mirroring Relational Check Constraints & Mutually Exclusive Invariants**:
+  - ❌ **Anti-Pattern: Divergent Frontend Validation & SQLSTATE 23514 Crashes**:
+    - Allowing forms to submit inputs that pass loose frontend checks but crash on PostgreSQL CHECK constraints (`positive_cents`, `started_at <= completed_at`, or mutually exclusive owner fields `num_nonnulls(userId, orgId) = 1`).
+  - ✅ **Production Invariant**:
+    - Define Zod schemas that mirror relational domain constraints and table-level check invariants using `.refine()` before sending mutations to database actions.
+
+    ```typescript
+    import { z } from 'zod';
+
+    export const billingAccountSchema = z.object({
+      name: z.string().min(1, 'Account name required'),
+      userId: z.string().uuid().nullable().optional(),
+      orgId: z.string().uuid().nullable().optional(),
+      creditLimitCents: z.number().int().nonnegative('Credit limit must be non-negative'),
+    }).refine(
+      (data) => {
+        // Enforce exact-one owner invariant: num_nonnulls(userId, orgId) = 1
+        const hasUser = Boolean(data.userId);
+        const hasOrg = Boolean(data.orgId);
+        return (hasUser && !hasOrg) || (!hasUser && hasOrg);
+      },
+      {
+        message: 'Billing account must be assigned to either a User or an Organization, never both.',
+        path: ['userId'],
+      }
+    );
+    ```

@@ -4960,4 +4960,84 @@ func (w *BoundedCascadeDeletionWorker) PurgeChildRecordsCascaded(
 
 	return totalDeleted, nil
 }
+
+// PositiveCents guarantees non-negative financial values at the Go type layer,
+// mirroring PostgreSQL CREATE DOMAIN positive_cents AS BIGINT CHECK (VALUE >= 0).
+type PositiveCents int64
+
+func NewPositiveCents(v int64) (PositiveCents, error) {
+	if v < 0 {
+		return 0, fmt.Errorf("positive_cents invariant violated: %d < 0", v)
+	}
+	return PositiveCents(v), nil
+}
+
+func (p PositiveCents) Value() (driver.Value, error) {
+	if p < 0 {
+		return nil, fmt.Errorf("positive_cents invariant violated on serialization: %d < 0", p)
+	}
+	return int64(p), nil
+}
+
+func (p *PositiveCents) Scan(src any) error {
+	if src == nil {
+		return fmt.Errorf("positive_cents cannot be null")
+	}
+	switch v := src.(type) {
+	case int64:
+		if v < 0 {
+			return fmt.Errorf("positive_cents invariant violated: %d < 0", v)
+		}
+		*p = PositiveCents(v)
+		return nil
+	default:
+		return fmt.Errorf("unsupported type for positive_cents: %T", src)
+	}
+}
+
+// OrderStatus defines a validated string enum pattern with zero DB migration lock-ins.
+type OrderStatus string
+
+const (
+	OrderStatusPending   OrderStatus = "pending"
+	OrderStatusCompleted OrderStatus = "completed"
+	OrderStatusCancelled OrderStatus = "cancelled"
+)
+
+func (s OrderStatus) IsValid() bool {
+	switch s {
+	case OrderStatusPending, OrderStatusCompleted, OrderStatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s OrderStatus) Value() (driver.Value, error) {
+	if !s.IsValid() {
+		return nil, fmt.Errorf("invalid order_status: %q", s)
+	}
+	return string(s), nil
+}
+
+func (s *OrderStatus) Scan(src any) error {
+	switch v := src.(type) {
+	case string:
+		st := OrderStatus(v)
+		if !st.IsValid() {
+			return fmt.Errorf("invalid order_status from database: %q", v)
+		}
+		*s = st
+		return nil
+	case []byte:
+		st := OrderStatus(string(v))
+		if !st.IsValid() {
+			return fmt.Errorf("invalid order_status from database: %q", string(v))
+		}
+		*s = st
+		return nil
+	default:
+		return fmt.Errorf("unsupported type for order_status: %T", src)
+	}
+}
 ```

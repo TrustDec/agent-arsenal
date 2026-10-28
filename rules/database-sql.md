@@ -2972,3 +2972,41 @@ alwaysApply: false
       )
     GROUP BY c.conrelid, c.conname, c.confrelid;
     ```
+
+  - ❌ **Anti-Pattern: Synchronous CHECK Constraints, 3VL NULL Bypass & Native ENUM Lock-In**:
+    - Adding CHECK constraints synchronously on large tables (`ALTER TABLE ... ADD CONSTRAINT ... CHECK (...)`) without `NOT VALID`, freezing reads and writes under `ACCESS EXCLUSIVE` during full-table sequential scans.
+    - Misunderstanding SQL three-valued logic (3VL), where `CHECK (col <= 100)` or `CHECK (col != 'banned')` evaluates to `UNKNOWN` when `col` is `NULL`, silently bypassing the constraint.
+    - Declaring PostgreSQL native enums (`CREATE TYPE status AS ENUM (...)`) that cannot be modified inside multi-statement transactions, cannot have values removed or reordered, and lock tables during schema evolution.
+    - Storing mutually exclusive polymorphic relationships (e.g. `user_id` vs `org_id`) without database-level `num_nonnulls` constraints, leading to dirty state drift.
+  - ✅ **Production Invariant**:
+    - Add all CHECK constraints via two-phase `NOT VALID` + `VALIDATE CONSTRAINT` (`SHARE UPDATE EXCLUSIVE` non-blocking scan).
+    - Always pair CHECK constraints on nullable columns with explicit `IS NULL OR` or column-level `NOT NULL`.
+    - Use Lookup/Reference tables or validated `VARCHAR(32)` CHECK constraints over native DB enums.
+    - Enforce mutually exclusive relationships with `CHECK (num_nonnulls(col1, col2, ...) = 1)`.
+
+    ```sql
+    -- 1. Two-Phase Zero-Downtime CHECK Constraint Protocol
+    ALTER TABLE transactions
+    ADD CONSTRAINT check_positive_amount
+    CHECK (amount_cents > 0)
+    NOT VALID;
+
+    ALTER TABLE transactions
+    VALIDATE CONSTRAINT check_positive_amount;
+
+    -- 2. Mutually Exclusive Polymorphic Owner Invariant
+    ALTER TABLE accounts
+    ADD CONSTRAINT check_single_owner
+    CHECK (num_nonnulls(user_id, organization_id) = 1)
+    NOT VALID;
+
+    ALTER TABLE accounts
+    VALIDATE CONSTRAINT check_single_owner;
+
+    -- 3. Reusable PostgreSQL Domain Types
+    CREATE DOMAIN positive_cents AS BIGINT
+    CHECK (VALUE >= 0);
+
+    CREATE DOMAIN email_address AS VARCHAR(255)
+    CHECK (VALUE ~* '^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$');
+    ```
