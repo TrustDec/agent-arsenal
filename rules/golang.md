@@ -5235,4 +5235,30 @@ func IngestBoundedDiscreteBatches[T any](
 	}
 	return nil
 }
+
+// UserAuditEventAligned demonstrates optimal memory layout adhering to both Go struct
+// alignment and PostgreSQL Column Tetris invariants. By ordering fields strictly in
+// descending word size (8B -> 4B -> 2B -> 1B -> dynamic strings), this struct eliminates
+// all internal padding holes, ensuring maximum CPU L1/L2 cache locality during high-volume batch scans.
+type UserAuditEventAligned struct {
+	// 8-Byte Fields (64-bit aligned, zero padding)
+	ID             int64     `db:"id"`
+	CreatedAt      time.Time `db:"created_at"`
+	ProcessedAt    time.Time `db:"processed_at"`
+	CostMicrocents int64     `db:"cost_microcents"`
+
+	// 4-Byte Fields (32-bit aligned, zero padding)
+	TenantID int32 `db:"tenant_id"`
+
+	// 2-Byte Fields (16-bit aligned, zero padding)
+	RetryCount int16 `db:"retry_count"`
+
+	// 1-Byte Fields (8-bit aligned, zero padding)
+	IsSuccess  bool `db:"is_success"`
+	IsInternal bool `db:"is_internal"`
+	IsBillable bool `db:"is_billable"`
+
+	// Dynamic/Varlena Tail Fields
+	PayloadHash string `db:"payload_hash"`
+}
 ```

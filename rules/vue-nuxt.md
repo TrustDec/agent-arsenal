@@ -3337,4 +3337,21 @@ alwaysApply: false
 
       return { success: true, count: inserted };
     });
+
+    // server/api/audit-events/export.get.ts
+    // Invariant: Optimized projection matching Column Tetris physical storage layout
+    // for maximum streaming throughput and minimal deserialization overhead
+    export const exportAuditEventsHandler = defineEventHandler(async (event) => {
+      const db = useDatabase();
+      const events = await db.query(
+        `SELECT
+           id, created_at, processed_at, cost_microcents,
+           tenant_id, retry_count, is_success, is_internal, is_billable,
+           payload_hash
+         FROM user_audit_events
+         ORDER BY id DESC
+         LIMIT 500;`
+      );
+      return { events: events.rows };
+    });
     ```

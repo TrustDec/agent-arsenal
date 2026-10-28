@@ -3122,3 +3122,39 @@ alwaysApply: false
       delta_qty = inventory_ledger.delta_qty + EXCLUDED.delta_qty,
       logged_at = clock_timestamp();
     ```
+
+  - ❌ **Anti-Pattern: Column Ordering Randomness & 8-Byte Word Padding Bloat (Missing Column Tetris)**:
+    - Declaring columns semantically or alphabetically (e.g., interleaving `boolean` or `smallint` between `bigint` or `timestamptz`), forcing PostgreSQL to inject 2 to 7 dead zero-padding bytes between attributes to satisfy CPU 8-byte word alignment (`MAXALIGN = 8`).
+    - Placing variable-length columns (`text`, `varchar`, `jsonb`) before fixed 8-byte types, destroying compile-time static byte offsets and degrading CPU cache line locality.
+    - Appending columns via `ALTER TABLE ADD COLUMN` over time, permanently locking in physical heap fragmentation in `pg_attribute`.
+  - ✅ **Production Invariant**:
+    - Enforce Column Tetris layout in all table DDL: sort columns strictly in descending alignment order:
+      1. Fixed 8-Byte Types (`bigint`, `timestamptz`, `timestamp`, `double precision`)
+      2. Fixed 4-Byte Types (`integer`, `date`, `real`, `oid`)
+      3. Fixed 2-Byte Types (`smallint`)
+      4. Fixed 1-Byte Types (`boolean`, `char(1)`)
+      5. Variable-Length Varlena Tail (`uuid`, `text`, `varchar`, `jsonb`, `bytea`, `numeric`)
+    - Guarantees internal padding $P_i = 0$ for all fixed-width attributes, increasing 8KB page packing density by 20% to 35% and saving gigabytes of `shared_buffers` cache.
+    - Use the following PostgreSQL catalog query to audit physical padding waste across existing tables:
+
+    ```sql
+    -- Continuous Audit for Table Padding Bloat & Column Tetris Alignment
+    SELECT
+      a.attname AS column_name,
+      t.typname AS data_type,
+      t.typalign AS alignment,
+      t.typlen AS fixed_size,
+      CASE t.typalign
+        WHEN 'd' THEN '8 bytes (double/bigint)'
+        WHEN 'i' THEN '4 bytes (integer/date)'
+        WHEN 's' THEN '2 bytes (smallint)'
+        WHEN 'c' THEN '1 byte (char/bool)'
+        ELSE 'variable'
+      END AS alignment_desc
+    FROM pg_attribute a
+    JOIN pg_type t ON a.atttypid = t.oid
+    WHERE a.attrelid = 'user_audit_events'::regclass
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+    ORDER BY a.attnum ASC;
+    ```

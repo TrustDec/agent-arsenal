@@ -3572,5 +3572,70 @@ alwaysApply: false
           }
         }
       );
+
+      // Tool: Audit PostgreSQL Table Column Tetris & 8-Byte Word Padding Bloat
+      server.tool(
+        'audit_table_column_tetris_padding',
+        'Analyzes a PostgreSQL table schema for 8-byte word padding bloat and outputs an optimal Column Tetris column layout',
+        {
+          tableName: z.string().describe('The name of the table to audit'),
+        },
+        async ({ tableName }) => {
+          const client = await pool.connect();
+          try {
+            const query = `
+              SELECT
+                a.attname AS column_name,
+                t.typname AS data_type,
+                t.typalign AS alignment,
+                t.typlen AS fixed_size,
+                a.attnotnull AS is_not_null
+              FROM pg_attribute a
+              JOIN pg_type t ON a.atttypid = t.oid
+              WHERE a.attrelid = $1::regclass
+                AND a.attnum > 0
+                AND NOT a.attisdropped
+              ORDER BY a.attnum ASC;
+            `;
+            const res = await client.query(query, [tableName]);
+
+            let currentOffset = 24; // Base header
+            let totalPadding = 0;
+            const columns = res.rows.map((row: any) => {
+              const align = row.alignment === 'd' ? 8 : (row.alignment === 'i' ? 4 : (row.alignment === 's' ? 2 : 1));
+              const size = row.fixed_size > 0 ? row.fixed_size : 8;
+              const rem = currentOffset % align;
+              const pad = rem === 0 ? 0 : align - rem;
+              totalPadding += pad;
+              currentOffset += pad + size;
+
+              return {
+                name: row.column_name,
+                dataType: row.data_type,
+                alignBytes: align,
+                paddingBefore: pad,
+              };
+            });
+
+            const hasPadding = totalPadding > 0;
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  tableName,
+                  totalPaddingWastedBytes: totalPadding,
+                  hasPaddingBloat: hasPadding,
+                  columns,
+                  recommendation: hasPadding
+                    ? 'Table contains padding bloat! Apply Column Tetris: sort columns by descending alignment (8B -> 4B -> 2B -> 1B -> Varlena Tail) to eliminate internal padding.'
+                    : 'Table schema is perfectly aligned with Column Tetris invariants. Zero internal padding bytes detected.',
+                }, null, 2),
+              }],
+            };
+          } finally {
+            client.release();
+          }
+        }
+      );
     }
     ```
