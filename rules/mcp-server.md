@@ -3094,3 +3094,105 @@ alwaysApply: false
       );
     }
     ```
+
+- **PostgreSQL Advisory Lock Fencing, Active Inspection & Distributed Mutex Tool**:
+  - ❌ **Anti-Pattern: Concurrent Uncoordinated Agent Mutations & Leaked Session Locks**:
+    - Multi-agent swarms or autonomous tool calls executing destructive mutations (e.g. updating user balances, altering schemas, or dispatching batched jobs) simultaneously without mutual exclusion.
+    - Agents running raw SQL `SELECT pg_advisory_lock(id)` inside tools and failing to unlock on network errors, leaving persistent zombie locks.
+  - ✅ **Production Invariant**:
+    - Provide a structured MCP tool that computes deterministic 64-bit keys from namespace + tenant + entity, checks for lock conflicts, queries `pg_locks` for active locks, and safely tests availability using non-blocking primitives.
+
+    ```typescript
+    import { z } from 'zod';
+    import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+    import { Pool } from 'pg';
+    import { createHash } from 'node:crypto';
+
+    export function registerAdvisoryLockTools(server: McpServer, pool: Pool) {
+      server.tool(
+        'database_advisory_lock_manager',
+        'Inspect active PostgreSQL advisory locks or test mutual exclusion availability for a resource without blocking',
+        {
+          action: z.enum(['inspect_all', 'check_availability']),
+          namespace: z.number().int().optional().describe('Namespace integer ID (e.g. 100 for orders, 200 for billing)'),
+          tenantId: z.string().optional().default('default'),
+          entityId: z.string().optional().describe('Unique resource identifier or UUID'),
+        },
+        async ({ action, namespace, tenantId, entityId }) => {
+          const client = await pool.connect();
+          try {
+            if (action === 'inspect_all') {
+              const res = await client.query(`
+                SELECT
+                  l.pid,
+                  a.usename,
+                  a.client_addr::TEXT as client_addr,
+                  a.state,
+                  EXTRACT(EPOCH FROM (NOW() - a.query_start))::INT as running_duration_seconds,
+                  l.mode,
+                  l.granted,
+                  CASE 
+                    WHEN l.objsubid = 1 THEN l.objid::BIGINT::TEXT 
+                    ELSE '(' || l.classid || ',' || l.objid || ')' 
+                  END as lock_key,
+                  a.query
+                FROM pg_locks l
+                JOIN pg_stat_activity a ON l.pid = a.pid
+                WHERE l.locktype = 'advisory'
+                ORDER BY a.query_start ASC
+                LIMIT 50;
+              `);
+
+              return {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({
+                    totalActiveLocks: res.rows.length,
+                    locks: res.rows,
+                  }, null, 2),
+                }],
+              };
+            }
+
+            // Action: check_availability
+            if (namespace === undefined || !entityId) {
+              return {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({ error: 'namespace and entityId are required for check_availability' }),
+                }],
+              };
+            }
+
+            // Compute signed 64-bit bigint key
+            const combined = `${namespace}:${tenantId}:${entityId}`;
+            const hash = createHash('sha256').update(combined).digest();
+            const lockKey = hash.readBigInt64BE(0).toString();
+
+            // Check availability in a throwaway transaction
+            await client.query('BEGIN;');
+            const checkRes = await client.query<{ acquired: boolean }>(
+              'SELECT pg_try_advisory_xact_lock($1) as acquired;',
+              [lockKey]
+            );
+            const isAvailable = checkRes.rows[0]?.acquired ?? false;
+            await client.query('ROLLBACK;'); // Instantly release
+
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  resource: combined,
+                  bigintKey: lockKey,
+                  isAvailable,
+                  status: isAvailable ? 'AVAILABLE' : 'LOCKED_BY_ANOTHER_TRANSACTION',
+                }, null, 2),
+              }],
+            };
+          } finally {
+            client.release();
+          }
+        }
+      );
+    }
+    ```

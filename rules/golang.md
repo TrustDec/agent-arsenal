@@ -4622,3 +4622,120 @@ func (m *MatViewManager) RefreshConcurrently(ctx context.Context, viewName strin
 	return err
 }
 ```
+
+- **PostgreSQL Advisory Locks, Deterministic 64-Bit Namespacing & Canonical Multi-Locking with pgx/v5**:
+  - ❌ **Anti-Pattern: Session Locks in Pooled Go Microservices, 32-Bit Hash Collisions, and Map-Iteration Deadlocks**:
+    - Calling `SELECT pg_advisory_lock($1)` on a `*pgxpool.Pool` connection, which leaks the lock across queries under PgBouncer transaction pooling or leaves dangling locks if a goroutine panics.
+    - Hashing keys to 32-bit integers, which suffer high collision rates ($>1\%$ at 10k keys), causing unrelated jobs to block each other.
+    - Acquiring multiple advisory locks by iterating through a Go map or slice in arbitrary order, causing AB-BA deadlocks between concurrent workers.
+  - ✅ **Production Invariant**:
+    - Always use transaction-scoped `pg_try_advisory_xact_lock` inside a `pgx.Tx`, guaranteeing automatic release on commit or rollback.
+    - Hash namespace, tenant ID, and entity ID into a signed 64-bit `int64` key.
+    - Sort multiple lock keys in ascending order before sequential acquisition.
+
+```go
+package lock
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"sort"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+var ErrResourceLocked = errors.New("requested resource is locked by another transaction")
+
+type LockTarget struct {
+	Namespace int32
+	TenantID  string
+	EntityID  string
+}
+
+// Hash64 calculates a signed 64-bit integer advisory lock key.
+func Hash64(target LockTarget) int64 {
+	h := sha256.New()
+	_, _ = fmt.Fprintf(h, "%d:%s:%s", target.Namespace, target.TenantID, target.EntityID)
+	sum := h.Sum(nil)
+	return int64(binary.BigEndian.Uint64(sum[:8]))
+}
+
+// WithTransactionMutex executes fn while holding a non-blocking transaction-scoped advisory lock.
+func WithTransactionMutex[T any](
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	target LockTarget,
+	fn func(ctx context.Context, tx pgx.Tx) (T, error),
+) (T, error) {
+	var zero T
+	key := Hash64(target)
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return zero, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var acquired bool
+	err = tx.QueryRow(ctx, "SELECT pg_try_advisory_xact_lock($1);", key).Scan(&acquired)
+	if err != nil {
+		return zero, fmt.Errorf("try advisory lock: %w", err)
+	}
+	if !acquired {
+		return zero, ErrResourceLocked
+	}
+
+	result, err := fn(ctx, tx)
+	if err != nil {
+		return zero, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return zero, fmt.Errorf("commit tx: %w", err)
+	}
+
+	return result, nil
+}
+
+// AcquireCanonicalMultiLocks acquires multiple advisory locks in ascending numerical order,
+// mathematically preventing AB-BA deadlocks between concurrent goroutines.
+func AcquireCanonicalMultiLocks(ctx context.Context, tx pgx.Tx, targets []LockTarget) error {
+	if len(targets) == 0 {
+		return nil
+	}
+
+	// 1. Compute and deduplicate keys
+	keySet := make(map[int64]struct{}, len(targets))
+	for _, t := range targets {
+		keySet[Hash64(t)] = struct{}{}
+	}
+
+	keys := make([]int64, 0, len(keySet))
+	for k := range keySet {
+		keys = append(keys, k)
+	}
+
+	// 2. Canonical sorting: always ascending numerical order
+	sort.Slice(keys, func(i, j int) bool {
+		return keys[i] < keys[j]
+	})
+
+	// 3. Acquire sequentially in canonical order
+	for _, k := range keys {
+		var acquired bool
+		err := tx.QueryRow(ctx, "SELECT pg_try_advisory_xact_lock($1);", k).Scan(&acquired)
+		if err != nil {
+			return fmt.Errorf("lock key %d: %w", k, err)
+		}
+		if !acquired {
+			return fmt.Errorf("%w: key %d", ErrResourceLocked, k)
+		}
+	}
+
+	return nil
+}
+```

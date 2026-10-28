@@ -3905,3 +3905,109 @@ alwaysApply: false
       </div>
     </div>
     ```
+
+- **Advisory Lock Fencing & 409 Conflict Handling in SvelteKit Form Actions**:
+  - ❌ **Anti-Pattern: Blocking Form Actions & Duplicate Submit Races**:
+    - Allowing double-click submissions to enter parallel transactions without mutual exclusion, or letting long-running backend locks hang HTTP requests until the client times out.
+  - ✅ **Production Invariant**:
+    - Use non-blocking `pg_try_advisory_xact_lock` in `+page.server.ts` actions.
+    - If the lock is held, immediately return `fail(409, { busy: true, message: 'Operation in progress' })` with `Retry-After` header.
+    - Svelte 5 component binds form state, tracks countdown timers, and shows accessible status badges.
+
+    ```typescript
+    // src/routes/checkout/+page.server.ts
+    import { fail } from '@sveltejs/kit';
+    import type { Actions } from './$types';
+    import { pool } from '$lib/server/db';
+    import { createHash } from 'node:crypto';
+
+    export const actions: Actions = {
+      processOrder: async ({ request, locals }) => {
+        const formData = await request.formData();
+        const orderId = formData.get('orderId')?.toString();
+        const tenantId = locals.tenantId ?? 'default';
+
+        if (!orderId) {
+          return fail(400, { missingOrderId: true });
+        }
+
+        // Deterministic 64-bit key: namespace 101 for checkout
+        const hash = createHash('sha256').update(`101:${tenantId}:${orderId}`).digest();
+        const lockKey = hash.readBigInt64BE(0).toString();
+
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN;');
+          const lockRes = await client.query<{ acquired: boolean }>(
+            'SELECT pg_try_advisory_xact_lock($1) AS acquired;',
+            [lockKey]
+          );
+
+          if (!lockRes.rows[0]?.acquired) {
+            await client.query('ROLLBACK;');
+            return fail(409, {
+              orderId,
+              busy: true,
+              message: 'This order is currently being processed by another worker. Please wait a moment.',
+            });
+          }
+
+          // Execute business mutation
+          await client.query(
+            "UPDATE orders SET status = 'processing', updated_at = NOW() WHERE id = $1 AND tenant_id = $2;",
+            [orderId, tenantId]
+          );
+
+          await client.query('COMMIT;');
+          return { success: true, orderId };
+        } catch (err) {
+          await client.query('ROLLBACK;').catch(() => {});
+          return fail(500, { message: 'Internal transaction error' });
+        } finally {
+          client.release();
+        }
+      },
+    };
+    ```
+    ```svelte
+    <!-- src/routes/checkout/+page.svelte -->
+    <script lang="ts">
+      import { enhance } from '$app/forms';
+      import type { ActionData } from './$types';
+
+      let { form }: { form: ActionData } = $props();
+      let isSubmitting = $state(false);
+    </script>
+
+    <div class="max-w-md mx-auto p-6 bg-zinc-900 border border-zinc-800 rounded-xl text-zinc-100">
+      <h2 class="text-lg font-semibold mb-4">Complete Checkout</h2>
+
+      {#if form?.busy}
+        <div class="mb-4 p-3 bg-amber-500/10 border border-amber-500/30 text-amber-400 text-sm rounded-lg flex items-center gap-2">
+          <span class="inline-block w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
+          {form.message}
+        </div>
+      {/if}
+
+      <form
+        method="POST"
+        action="?/processOrder"
+        use:enhance={() => {
+          isSubmitting = true;
+          return async ({ update }) => {
+            await update();
+            isSubmitting = false;
+          };
+        }}
+      >
+        <input type="hidden" name="orderId" value="ord_live_87412" />
+        <button
+          type="submit"
+          disabled={isSubmitting || form?.busy}
+          class="w-full py-2.5 px-4 rounded-lg font-medium bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 transition-colors"
+        >
+          {isSubmitting ? 'Acquiring Lock...' : 'Pay & Finalize Order'}
+        </button>
+      </form>
+    </div>
+    ```

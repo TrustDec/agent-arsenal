@@ -3036,5 +3036,52 @@ alwaysApply: false
         triggerConcurrentRefresh,
       };
     }
+
+    // Nuxt 3 Advisory Lock Fencing Composable for Concurrent Mutations
+    export function useAdvisoryLockedMutation<T>() {
+      const isLocked = ref(false);
+      const isPending = ref(false);
+      const lockError = ref<string | null>(null);
+
+      async function executeLocked(url: string, body: Record<string, any>): Promise<T | null> {
+        if (isPending.value || isLocked.value) return null;
+        isPending.value = true;
+        lockError.value = null;
+
+        try {
+          const res = await $fetch<T>(url, {
+            method: 'POST',
+            body,
+            onResponseError({ response }) {
+              if (response.status === 409) {
+                isLocked.value = true;
+                lockError.value = response._data?.message || 'Resource is currently locked by another worker.';
+              }
+            },
+          });
+          return res;
+        } catch (err: any) {
+          if (!isLocked.value) {
+            lockError.value = err.message || 'Operation failed';
+          }
+          return null;
+        } finally {
+          isPending.value = false;
+        }
+      }
+
+      function resetLockState() {
+        isLocked.value = false;
+        lockError.value = null;
+      }
+
+      return {
+        isLocked,
+        isPending,
+        lockError,
+        executeLocked,
+        resetLockState,
+      };
+    }
     </script>
     ```

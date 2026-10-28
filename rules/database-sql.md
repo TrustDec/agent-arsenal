@@ -2745,3 +2745,56 @@ alwaysApply: false
       PERFORM pg_advisory_unlock(v_lock_key);
     END $$;
     ```
+
+- **PostgreSQL Advisory Locks, 64-Bit Hash Namespaces & Connection Pooler Fencing (PgBouncer/pgpool)**:
+  - ❌ **Anti-Pattern: Session-Mode Locks in Transaction Pools, 32-Bit Hash Collisions, and Blocking Connection Depletion**:
+    - Invoking `SELECT pg_advisory_lock(...)` in environments using PgBouncer/pgpool in `transaction` mode, leaving session locks attached to physical server backends after the client returns the connection, causing phantom deadlocks on unrelated client transactions.
+    - Passing raw integer IDs without namespace partitioning or using 32-bit hashes (`crc32`), causing collisions between unrelated business entities (e.g. `user_id = 42` blocking `order_id = 42`).
+    - Using blocking `pg_advisory_lock` in web request handlers, holding connections open for seconds while waiting on third-party APIs and exhausting the database connection pool.
+    - Acquiring multiple advisory locks in non-canonical order, triggering AB-BA deadlock exceptions (`40P01`).
+  - ✅ **Production Invariant**:
+    - Mandatory transaction-scoped locks (`pg_advisory_xact_lock` or `pg_try_advisory_xact_lock`), automatically released upon `COMMIT` or `ROLLBACK`.
+    - Generate deterministic signed 64-bit bigint keys using `hashtextextended(namespace || ':' || tenant_id || ':' || entity_id, 0)`.
+    - Canonical sorting of lock keys in ascending numerical order when acquiring $>1$ lock.
+    - Active monitoring of `pg_locks WHERE locktype = 'advisory'` to identify blocking locks.
+
+    ```sql
+    -- 1. Deterministic 64-bit Advisory Key Generator
+    CREATE OR REPLACE FUNCTION generate_advisory_key(
+      p_namespace INT,
+      p_tenant_id TEXT,
+      p_resource_id TEXT
+    ) RETURNS BIGINT AS $$
+      SELECT hashtextextended(p_namespace::TEXT || ':' || COALESCE(p_tenant_id, 'global') || ':' || p_resource_id, 0);
+    $$ LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE;
+
+    -- 2. Non-Blocking Transaction-Scoped Application Mutex Pattern
+    BEGIN;
+      -- Fast-fail check with zero wait time:
+      SELECT pg_try_advisory_xact_lock(generate_advisory_key(101, 'tenant_alpha', 'order_98721')) AS lock_acquired;
+
+      -- If lock_acquired is FALSE: immediately ROLLBACK and return 409 Conflict to caller.
+      -- If lock_acquired is TRUE: safely execute state mutation.
+
+      UPDATE orders
+      SET status = 'processing', updated_at = NOW()
+      WHERE id = 'order_98721' AND tenant_id = 'tenant_alpha';
+
+    COMMIT; -- PostgreSQL kernel automatically releases the advisory lock here!
+
+    -- 3. Diagnostic Observability: Query active advisory locks
+    SELECT
+      l.pid,
+      a.usename,
+      a.client_addr,
+      a.state,
+      NOW() - a.query_start AS duration,
+      l.mode,
+      l.granted,
+      CASE WHEN l.objsubid = 1 THEN l.objid::BIGINT::TEXT ELSE '(' || l.classid || ',' || l.objid || ')' END AS lock_key,
+      a.query
+    FROM pg_locks l
+    JOIN pg_stat_activity a ON l.pid = a.pid
+    WHERE l.locktype = 'advisory'
+    ORDER BY a.query_start ASC;
+    ```
