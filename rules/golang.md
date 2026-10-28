@@ -4738,4 +4738,81 @@ func AcquireCanonicalMultiLocks(ctx context.Context, tx pgx.Tx, targets []LockTa
 
 	return nil
 }
+
+// SerializableTxRunner provides resilient execution of transactions under PostgreSQL SERIALIZABLE isolation,
+// automatically handling SQLSTATE 40001 (serialization_failure) and 40P01 (deadlock) with decorrelated jitter.
+type SerializableTxRunner struct {
+	pool        *pgxpool.Pool
+	maxRetries  int
+	baseBackoff time.Duration
+	maxBackoff  time.Duration
+}
+
+func NewSerializableTxRunner(pool *pgxpool.Pool) *SerializableTxRunner {
+	return &SerializableTxRunner{
+		pool:        pool,
+		maxRetries:  5,
+		baseBackoff: 25 * time.Millisecond,
+		maxBackoff:  2 * time.Second,
+	}
+}
+
+// Execute runs an idempotent closure inside a SERIALIZABLE transaction.
+// The closure must be pure and free of irreversible external side effects (e.g., Stripe, email).
+func (r *SerializableTxRunner) Execute(ctx context.Context, fn func(ctx context.Context, tx pgx.Tx) error) error {
+	txOpts := pgx.TxOptions{
+		IsoLevel: pgx.Serializable,
+	}
+
+	for attempt := 1; attempt <= r.maxRetries; attempt++ {
+		err := func() error {
+			tx, err := r.pool.BeginTx(ctx, txOpts)
+			if err != nil {
+				return fmt.Errorf("begin serializable tx: %w", err)
+			}
+			defer tx.Rollback(ctx)
+
+			if err := fn(ctx, tx); err != nil {
+				return err
+			}
+
+			if err := tx.Commit(ctx); err != nil {
+				return err
+			}
+			return nil
+		}()
+
+		if err == nil {
+			return nil
+		}
+
+		// Inspect error for retryable SQLSTATE 40001 or 40P01
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "40P01") {
+			if attempt >= r.maxRetries {
+				return fmt.Errorf("serializable transaction exhausted retry budget (%d attempts): %w", attempt, err)
+			}
+
+			// Full decorrelated jitter: Uniform(0, min(maxBackoff, baseBackoff * 2^attempt))
+			multiplier := float64(int(1) << attempt)
+			currentCeiling := float64(r.baseBackoff) * multiplier
+			if currentCeiling > float64(r.maxBackoff) {
+				currentCeiling = float64(r.maxBackoff)
+			}
+			sleepDuration := time.Duration(rand.Float64() * currentCeiling)
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(sleepDuration):
+				continue
+			}
+		}
+
+		// Terminal non-retryable error
+		return err
+	}
+
+	return errors.New("serializable transaction retry termination")
+}
 ```

@@ -2798,3 +2798,57 @@ alwaysApply: false
     WHERE l.locktype = 'advisory'
     ORDER BY a.query_start ASC;
     ```
+
+- **Database Transaction Isolation Levels, Serializable Snapshot Isolation (SSI) & SIREAD Predicate Locks**:
+  - ❌ **Anti-Pattern: Implicit Read Committed Skew, Repeatable Read Write Skew, and Unhandled 40001 Crashes**:
+    - Relying on default `READ COMMITTED` isolation across multi-query business workflows, allowing concurrent commits to change balances or inventory between statements within the same transaction (Read Skew).
+    - Believing `REPEATABLE READ` prevents all race conditions, only for concurrent transactions updating disjoint rows (such as the classic Doctor-on-Call or dual-balance overdraft) to both commit cleanly and violate cross-row invariants (Write Skew).
+    - Running transactions in `SERIALIZABLE` without an automated idempotent retry loop, crashing user workflows on expected `SQLSTATE 40001 serialization_failure` errors.
+    - Executing unindexed queries under SSI, silently escalating SIREAD locks to the table level (`locktype = 'relation'`) and aborting concurrent writers across the entire database.
+    - Running large analytical/reporting queries in standard SSI, holding SIREAD locks that cause concurrent OLTP transactions to abort.
+  - ✅ **Production Invariant**:
+    - Explicit isolation level declaration (`BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE`).
+    - Enforce cross-row constraints via SSI with automated retry or declarative PostgreSQL exclusion constraints (`EXCLUDE USING gist`).
+    - Mandatory idempotent retry wrapper catching `SQLSTATE 40001` and `40P01` with decorrelated jitter backoff.
+    - Analytical snapshots declare `BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE`, guaranteeing zero aborts and zero SIREAD locks.
+    - Continuous monitoring of SIREAD predicate locks via `pg_locks WHERE mode = 'SIReadLock'`.
+
+    ```sql
+    -- 1. Declarative Cross-Row Constraint Defense: Exclusion Constraints
+    -- Prevents double-booking / write skew without transaction-level retry overhead
+    CREATE TABLE room_reservations (
+      reservation_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      room_id UUID NOT NULL,
+      booking_period TSTZRANGE NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      EXCLUDE USING gist (room_id WITH =, booking_period WITH &&)
+    );
+
+    -- 2. Zero-Conflict Analytical Snapshots with SERIALIZABLE READ ONLY DEFERRABLE
+    -- Waits once until a clean snapshot is available, then runs with ZERO abort risk!
+    BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE;
+      SELECT
+        DATE_TRUNC('day', created_at) AS day,
+        COUNT(*) AS total_reservations,
+        SUM(amount) AS total_revenue
+      FROM orders
+      GROUP BY 1
+      ORDER BY 1 DESC;
+    COMMIT;
+
+    -- 3. Diagnostic Query: Monitor SIREAD Predicate Locks & Lock Escalation
+    -- Watch for relation-level locks which indicate unindexed range scans in SSI
+    SELECT
+      l.locktype,
+      c.relname AS relation_name,
+      l.page,
+      l.tuple,
+      l.pid,
+      NOW() - a.query_start AS duration,
+      a.query
+    FROM pg_locks l
+    LEFT JOIN pg_class c ON l.relation = c.oid
+    JOIN pg_stat_activity a ON l.pid = a.pid
+    WHERE l.mode = 'SIReadLock'
+    ORDER BY l.locktype DESC, duration DESC;
+    ```

@@ -4011,3 +4011,38 @@ alwaysApply: false
       </form>
     </div>
     ```
+
+- **Svelte 5 Runes: Transaction Concurrency & Serializable Conflict Feedback UI**:
+  - ❌ **Anti-Pattern: Raw 500 Page Crashes on Database SSI 40001 Retries**:
+    - Allowing transient database serialization collisions (`SQLSTATE 40001`) or write skew retries to propagate to the user as hard error boundaries or flash blank screens.
+  - ✅ **Production Invariant**:
+    - Wrap form enhancements in Svelte 5 `$state` runes tracking retry count and transient contention states, informing the user with reassuring non-blocking indicators during rapid collision resolution.
+
+    ```svelte
+    <script lang="ts">
+      import { enhance } from '$app/forms';
+
+      let isExecuting = $state(false);
+      let retryNotice = $state<string | null>(null);
+
+      function handleActionEnhance() {
+        isExecuting = true;
+        retryNotice = null;
+
+        return async ({ result, update }: any) => {
+          if (result.type === 'failure' && result.data?.code === '40001') {
+            retryNotice = 'High traffic detected. Optimizing transaction order...';
+          }
+          await update();
+          isExecuting = false;
+        };
+      }
+    </script>
+
+    {#if retryNotice}
+      <div class="p-3 mb-4 rounded-lg bg-sky-950/40 border border-sky-800 text-sky-300 text-xs flex items-center gap-2">
+        <span class="w-2 h-2 rounded-full bg-sky-400 animate-ping"></span>
+        {retryNotice}
+      </div>
+    {/if}
+    ```

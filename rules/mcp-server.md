@@ -3194,5 +3194,56 @@ alwaysApply: false
           }
         }
       );
+
+      // Tool: inspect_predicate_locks - Observability for SSI SIREAD locks & escalation detection
+      server.tool(
+        'inspect_predicate_locks',
+        'Inspect active PostgreSQL Serializable Snapshot Isolation (SSI) SIREAD predicate locks to detect relation-level lock escalation and conflict hotspots',
+        {
+          targetRelation: z.string().optional().describe('Filter by specific table/relation name'),
+        },
+        async ({ targetRelation }) => {
+          const client = await pool.connect();
+          try {
+            const query = `
+              SELECT
+                l.locktype,
+                l.mode,
+                COALESCE(c.relname, 'database') AS relation_name,
+                l.page,
+                l.tuple,
+                l.pid,
+                NOW() - a.query_start AS duration,
+                a.query
+              FROM pg_locks l
+              LEFT JOIN pg_class c ON l.relation = c.oid
+              JOIN pg_stat_activity a ON l.pid = a.pid
+              WHERE l.mode = 'SIReadLock'
+                AND ($1::text IS NULL OR c.relname = $1)
+              ORDER BY l.locktype DESC, duration DESC
+              LIMIT 50;
+            `;
+            const res = await client.query(query, [targetRelation || null]);
+
+            const hasEscalatedRelationLocks = res.rows.some((r) => r.locktype === 'relation');
+
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  activePredicateLocksCount: res.rows.length,
+                  hasEscalatedRelationLocks,
+                  warning: hasEscalatedRelationLocks
+                    ? 'CRITICAL: Relation-level SIREAD locks detected! This triggers false conflicts for concurrent serializable transactions. Check for unindexed table scans.'
+                    : 'HEALTHY: All predicate locks are page or tuple level.',
+                  locks: res.rows,
+                }, null, 2),
+              }],
+            };
+          } finally {
+            client.release();
+          }
+        }
+      );
     }
     ```

@@ -3083,5 +3083,49 @@ alwaysApply: false
         resetLockState,
       };
     }
+
+    // Composable: useSerializableMutation with automatic optimistic conflict feedback
+    export function useSerializableMutation<T>() {
+      const isRetrying = ref(false);
+      const retryCount = ref(0);
+      const lastError = ref<string | null>(null);
+
+      async function mutateWithRetry(
+        action: () => Promise<T>,
+        maxClientRetries = 3
+      ): Promise<T | null> {
+        retryCount.value = 0;
+        lastError.value = null;
+
+        for (let i = 0; i <= maxClientRetries; i++) {
+          try {
+            if (i > 0) isRetrying.value = true;
+            return await action();
+          } catch (err: any) {
+            // Detect HTTP 409 Conflict or serialization conflict payload
+            const isConflict = err?.statusCode === 409 || err?.data?.code === '40001';
+            if (isConflict && i < maxClientRetries) {
+              retryCount.value++;
+              // Jittered backoff before client re-submission
+              const backoff = Math.floor(Math.random() * 200 * Math.pow(1.5, i));
+              await new Promise((resolve) => setTimeout(resolve, backoff));
+              continue;
+            }
+            lastError.value = err?.data?.message || err?.message || 'Transaction failed';
+            return null;
+          } finally {
+            isRetrying.value = false;
+          }
+        }
+        return null;
+      }
+
+      return {
+        isRetrying,
+        retryCount,
+        lastError,
+        mutateWithRetry,
+      };
+    }
     </script>
     ```
