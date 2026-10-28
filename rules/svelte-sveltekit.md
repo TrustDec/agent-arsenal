@@ -4204,3 +4204,50 @@ alwaysApply: false
       };
     };
     ```
+
+- **Svelte 5 & SvelteKit: Atomic Form Action Upserts & Duplicate Race Defense**:
+  - ❌ **Anti-Pattern: Check-Then-Insert in SvelteKit Form Actions**:
+    - Querying `SELECT id FROM table WHERE email = $1` in SvelteKit `actions.default`, and then executing `INSERT`, triggering unhandled 500 crashes under double clicks or network retries.
+  - ✅ **Production Invariant**:
+    - Perform atomic `INSERT ... ON CONFLICT DO UPDATE / NOTHING` in SvelteKit form actions with normalized `email.trim().toLowerCase()` inputs, mapping `SQLSTATE 23505` cleanly to `fail(409, { error: 'Resource already exists' })`.
+
+    ```typescript
+    import { fail } from '@sveltejs/kit';
+    import { z } from 'zod';
+    import type { Actions } from './$types';
+
+    const registerSchema = z.object({
+      email: z.string().email().transform((v) => v.trim().toLowerCase()),
+      name: z.string().min(1).max(100),
+    });
+
+    export const actions: Actions = {
+      default: async ({ request, locals }) => {
+        const formData = await request.formData();
+        const parseResult = registerSchema.safeParse(Object.fromEntries(formData));
+        if (!parseResult.success) {
+          return fail(400, { errors: parseResult.error.flatten().fieldErrors });
+        }
+
+        const { email, name } = parseResult.data;
+        try {
+          // Atomic upsert with HOT update check
+          const result = await locals.db.query(
+            `INSERT INTO members (tenant_id, email, name, updated_at)
+             VALUES ($1, $2, $3, clock_timestamp())
+             ON CONFLICT (tenant_id, email) WHERE deleted_at IS NULL
+             DO UPDATE SET name = EXCLUDED.name, updated_at = clock_timestamp()
+             WHERE members.name IS DISTINCT FROM EXCLUDED.name
+             RETURNING id, email, name;`,
+            [locals.tenantId, email, name]
+          );
+          return { success: true, member: result.rows[0] };
+        } catch (err: any) {
+          if (err.code === '23505') {
+            return fail(409, { error: 'An active member with this email already exists.' });
+          }
+          throw err;
+        }
+      },
+    };
+    ```

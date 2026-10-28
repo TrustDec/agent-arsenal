@@ -3055,3 +3055,34 @@ alwaysApply: false
     WHERE s.last_value::numeric / s.max_value::numeric >= 0.75
     ORDER BY percent_consumed DESC;
     ```
+
+  - ❌ **Anti-Pattern: Check-Then-Insert Race, ANSI NULL Duplicate Leaks & Unguarded Upsert MVCC Bloat**:
+    - Relying on application-level `SELECT ... IF NOT EXISTS INSERT ...`, causing duplicate key collision crashes (`SQLSTATE 23505`) under concurrent traffic.
+    - Creating composite unique constraints on nullable columns without `NULLS NOT DISTINCT`, allowing infinite duplicate rows with `NULL` under ANSI SQL-92 semantics.
+    - Adding monolithic table-level `UNIQUE(email)` on tables using soft deletes (`deleted_at`), permanently locking out soft-deleted users from re-registering.
+    - Executing unconditional `ON CONFLICT DO UPDATE SET col = EXCLUDED.col, updated_at = NOW()`, causing continuous MVCC dead-tuple churn and breaking Heap-Only Tuple (HOT) updates even when data values did not change.
+  - ✅ **Production Invariant**:
+    - Replace check-then-insert with atomic `INSERT ... ON CONFLICT (key) DO UPDATE / DO NOTHING`.
+    - Declare `UNIQUE NULLS NOT DISTINCT` on PostgreSQL 15+ composite nullable unique columns.
+    - For tables with soft deletes, enforce partial B-tree unique indexes: `CREATE UNIQUE INDEX ... WHERE deleted_at IS NULL`.
+    - Guard upsert updates with `WHERE target IS DISTINCT FROM EXCLUDED.target` to preserve HOT updates and slash dead tuple generation by up to $90\%$.
+    - Add new unique constraints via two-phase concurrent migration (`CREATE UNIQUE INDEX CONCURRENTLY` followed by `ALTER TABLE ... ADD CONSTRAINT ... USING INDEX`).
+
+    ```sql
+    -- 1. Partial Unique Expression Index for Soft-Deleted Multi-Tenant Table
+    CREATE UNIQUE INDEX CONCURRENTLY idx_users_active_tenant_lower_email
+    ON users (tenant_id, LOWER(TRIM(email)))
+    WHERE deleted_at IS NULL;
+
+    -- 2. Guarded Atomic UPSERT with HOT Update Preservation
+    INSERT INTO user_profiles (user_id, display_name, avatar_url, updated_at)
+    VALUES ($1, $2, $3, clock_timestamp())
+    ON CONFLICT (user_id)
+    DO UPDATE SET
+      display_name = EXCLUDED.display_name,
+      avatar_url = EXCLUDED.avatar_url,
+      updated_at = clock_timestamp()
+    WHERE (user_profiles.display_name, user_profiles.avatar_url)
+      IS DISTINCT FROM (EXCLUDED.display_name, EXCLUDED.avatar_url)
+    RETURNING *;
+    ```

@@ -3268,3 +3268,47 @@ alwaysApply: false
       };
     });
     ```
+
+- **Vue 3 / Nuxt 3: Nitro Atomic UPSERT & Duplicate Collision Defense (409 Conflict)**:
+  - ❌ **Anti-Pattern: Check-Then-Insert Race in Nuxt Server Handlers**:
+    - Writing `if (!(await findUser(email))) { await createUser(email) }` in Nitro event handlers, failing with unhandled 500 errors on concurrent calls.
+  - ✅ **Production Invariant**:
+    - Execute atomic upserts directly against the database with input normalization (`email.toLowerCase().trim()`) and convert `SQLSTATE 23505` to structured HTTP 409 Conflict responses.
+
+    ```typescript
+    // server/api/organizations/[id]/members.post.ts
+    import { z } from 'zod';
+
+    const memberPayloadSchema = z.object({
+      email: z.string().email().transform((e) => e.trim().toLowerCase()),
+      role: z.enum(['admin', 'member', 'viewer']),
+    });
+
+    export default defineEventHandler(async (event) => {
+      const orgId = getRouterParam(event, 'id');
+      const body = await readValidatedBody(event, (b) => memberPayloadSchema.parse(b));
+
+      try {
+        const query = `
+          INSERT INTO organization_members (org_id, email, role, updated_at)
+          VALUES ($1, $2, $3, clock_timestamp())
+          ON CONFLICT (org_id, email) WHERE deleted_at IS NULL
+          DO UPDATE SET
+            role = EXCLUDED.role,
+            updated_at = clock_timestamp()
+          WHERE organization_members.role IS DISTINCT FROM EXCLUDED.role
+          RETURNING id, org_id, email, role;
+        `;
+        const res = await useDatabase().query(query, [orgId, body.email, body.role]);
+        return { success: true, member: res.rows[0] };
+      } catch (err: any) {
+        if (err.code === '23505') {
+          throw createError({
+            statusCode: 409,
+            statusMessage: 'Conflict: Active member with this email already exists in organization.',
+          });
+        }
+        throw err;
+      }
+    });
+    ```

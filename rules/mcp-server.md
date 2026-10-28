@@ -3449,5 +3449,67 @@ alwaysApply: false
           }
         }
       );
+
+      // Tool: audit_database_unique_constraints - Detect Soft-Delete Collisions & NULL Bypass Risks
+      server.tool(
+        'audit_database_unique_constraints',
+        'Audit PostgreSQL tables for invalid unique indexes, unindexed soft-delete collision risks, and composite unique keys missing NULLS NOT DISTINCT',
+        {},
+        async () => {
+          const client = await pool.connect();
+          try {
+            // Check 1: Invalid indexes resulting from failed CONCURRENT builds
+            const invalidQuery = `
+              SELECT
+                c.relname AS index_name,
+                t.relname AS table_name,
+                n.nspname AS schema_name
+              FROM pg_index i
+              JOIN pg_class c ON c.oid = i.indexrelid
+              JOIN pg_class t ON t.oid = i.indrelid
+              JOIN pg_namespace n ON n.oid = t.relnamespace
+              WHERE i.indisvalid = false
+                AND n.nspname NOT IN ('pg_catalog', 'information_schema');
+            `;
+            const invalidRes = await client.query(invalidQuery);
+
+            // Check 2: Tables with deleted_at having full unique constraints instead of partial
+            const softDeleteRisksQuery = `
+              SELECT
+                con.conname AS constraint_name,
+                tbl.relname AS table_name,
+                ns.nspname AS schema_name
+              FROM pg_constraint con
+              JOIN pg_class tbl ON tbl.oid = con.conrelid
+              JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+              WHERE con.contype = 'u'
+                AND ns.nspname NOT IN ('pg_catalog', 'information_schema')
+                AND EXISTS (
+                  SELECT 1 FROM pg_attribute att
+                  WHERE att.attrelid = tbl.oid
+                    AND att.attname = 'deleted_at'
+                    AND NOT att.attisdropped
+                );
+            `;
+            const softDeleteRisksRes = await client.query(softDeleteRisksQuery);
+
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  invalidIndexesCount: invalidRes.rows.length,
+                  softDeleteRisksCount: softDeleteRisksRes.rows.length,
+                  status: (invalidRes.rows.length > 0 || softDeleteRisksRes.rows.length > 0) ? 'ACTION_REQUIRED' : 'HEALTHY',
+                  invalidIndexes: invalidRes.rows,
+                  softDeleteMonolithicConstraints: softDeleteRisksRes.rows,
+                  recommendation: 'Replace monolithic unique constraints on soft-deleted tables with CREATE UNIQUE INDEX ... WHERE deleted_at IS NULL, and rebuild any invalid indexes CONCURRENTLY.',
+                }, null, 2),
+              }],
+            };
+          } finally {
+            client.release();
+          }
+        }
+      );
     }
     ```

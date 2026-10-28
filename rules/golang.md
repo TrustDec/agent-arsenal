@@ -5140,4 +5140,61 @@ func (c *TransactionalGaplessCounter) NextContiguousNumber(ctx context.Context, 
 	}
 	return nextVal, nil
 }
+
+// CanonicalUpsertBatch performs an atomic batch upsert with canonical lexicographical
+// sorting to prevent SQLSTATE 40P01 deadlocks and HOT-guarded update clauses.
+type TenantConfig struct {
+	TenantID string `json:"tenant_id"`
+	ConfigKey string `json:"config_key"`
+	ConfigVal string `json:"config_val"`
+}
+
+func UpsertTenantConfigsCanonical(ctx context.Context, pool *pgxpool.Pool, configs []TenantConfig) error {
+	if len(configs) == 0 {
+		return nil
+	}
+
+	// Invariant: Canonical sorting by conflict target eliminates AB-BA lock cycles
+	sorted := make([]TenantConfig, len(configs))
+	copy(sorted, configs)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].TenantID != sorted[j].TenantID {
+			return sorted[i].TenantID < sorted[j].TenantID
+		}
+		return strings.ToLower(sorted[i].ConfigKey) < strings.ToLower(sorted[j].ConfigKey)
+	})
+
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return fmt.Errorf("failed to begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	batch := &pgx.Batch{}
+	query := `
+		INSERT INTO tenant_configs (tenant_id, config_key, config_val, updated_at)
+		VALUES ($1, LOWER(TRIM($2)), $3, clock_timestamp())
+		ON CONFLICT (tenant_id, LOWER(TRIM(config_key)))
+		DO UPDATE SET
+			config_val = EXCLUDED.config_val,
+			updated_at = clock_timestamp()
+		WHERE tenant_configs.config_val IS DISTINCT FROM EXCLUDED.config_val;
+	`
+	for _, c := range sorted {
+		batch.Queue(query, c.TenantID, c.ConfigKey, c.ConfigVal)
+	}
+
+	br := tx.SendBatch(ctx, batch)
+	for i := 0; i < len(sorted); i++ {
+		if _, err := br.Exec(); err != nil {
+			br.Close()
+			return fmt.Errorf("failed to execute batch row %d: %w", i, err)
+		}
+	}
+	if err := br.Close(); err != nil {
+		return fmt.Errorf("failed to close batch: %w", err)
+	}
+
+	return tx.Commit(ctx)
+}
 ```
