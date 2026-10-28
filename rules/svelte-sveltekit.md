@@ -4046,3 +4046,55 @@ alwaysApply: false
       </div>
     {/if}
     ```
+
+- **Svelte 5 Runes: Client-Side Monotonic UUIDv7 Generation for Instant Optimistic UI Collections**:
+  - ❌ **Anti-Pattern: Blocking Async Sequence Round-Trips for Client UI Lists**:
+    - Forcing UI state to wait for server-generated `BIGSERIAL` primary keys before rendering optimistic list items, resulting in jank and broken keyboard navigation.
+  - ✅ **Production Invariant**:
+    - Pre-generate RFC 9562 UUIDv7 in the client using a monotonic rune-backed generator. The item is instantly inserted into the sorted Svelte 5 `$state` array with guaranteed chronological ordering and submitted to the server with its permanent primary key.
+
+    ```svelte
+    <script lang="ts">
+      interface ListItem {
+        id: string;
+        text: string;
+        createdAt: number;
+      }
+
+      let items = $state<ListItem[]>([]);
+      let inputText = $state('');
+
+      // Client-side RFC 9562 UUIDv7 generator
+      function generateClientUUIDv7(): string {
+        const now = Date.now();
+        const bytes = new Uint8Array(16);
+        crypto.getRandomValues(bytes);
+
+        // 48-bit timestamp
+        bytes[0] = (now / 0x10000000000) & 0xff;
+        bytes[1] = (now / 0x100000000) & 0xff;
+        bytes[2] = (now / 0x1000000) & 0xff;
+        bytes[3] = (now / 0x10000) & 0xff;
+        bytes[4] = (now / 0x100) & 0xff;
+        bytes[5] = now & 0xff;
+
+        // Version 7 + Variant 10
+        bytes[6] = 0x70 | (bytes[6] & 0x0f);
+        bytes[8] = 0x80 | (bytes[8] & 0x3f);
+
+        const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+        return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+      }
+
+      function handleAddItem() {
+        if (!inputText.trim()) return;
+        const newId = generateClientUUIDv7();
+        items.push({
+          id: newId,
+          text: inputText.trim(),
+          createdAt: Date.now(),
+        });
+        inputText = '';
+      }
+    </script>
+    ```

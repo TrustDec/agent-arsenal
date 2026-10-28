@@ -3127,5 +3127,50 @@ alwaysApply: false
         mutateWithRetry,
       };
     }
+
+    // Composable: useMonotonicUUIDv7 for client-side pre-generation and optimistic collections
+    export function useMonotonicUUIDv7() {
+      let lastEpochMs = 0;
+      let seqCounter = 0;
+
+      function generate(): string {
+        let now = Date.now();
+        if (now === lastEpochMs) {
+          seqCounter++;
+          if (seqCounter > 0x0fff) {
+            while (Date.now() <= lastEpochMs) {}
+            now = Date.now();
+            lastEpochMs = now;
+            seqCounter = 0;
+          }
+        } else if (now > lastEpochMs) {
+          lastEpochMs = now;
+          seqCounter = 0;
+        } else {
+          seqCounter++;
+        }
+
+        const bytes = new Uint8Array(16);
+        crypto.getRandomValues(bytes);
+
+        bytes[0] = (lastEpochMs / 0x10000000000) & 0xff;
+        bytes[1] = (lastEpochMs / 0x100000000) & 0xff;
+        bytes[2] = (lastEpochMs / 0x1000000) & 0xff;
+        bytes[3] = (lastEpochMs / 0x10000) & 0xff;
+        bytes[4] = (lastEpochMs / 0x100) & 0xff;
+        bytes[5] = lastEpochMs & 0xff;
+
+        bytes[6] = 0x70 | ((seqCounter >> 8) & 0x0f);
+        bytes[7] = seqCounter & 0xff;
+        bytes[8] = 0x80 | (bytes[8] & 0x3f);
+
+        const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+        return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+      }
+
+      return {
+        generate,
+      };
+    }
     </script>
     ```

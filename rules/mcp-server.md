@@ -3245,5 +3245,49 @@ alwaysApply: false
           }
         }
       );
+
+      // Tool: inspect_primary_key_btree_health - Observability for Primary Key B-Tree Index Bloat & Fragmentation
+      server.tool(
+        'inspect_primary_key_btree_health',
+        'Inspect PostgreSQL primary key B-tree index sizes, scan statistics, and detect potential page split bloat caused by random UUIDv4 keys',
+        {
+          tableName: z.string().optional().describe('Filter by specific table name'),
+        },
+        async ({ tableName }) => {
+          const client = await pool.connect();
+          try {
+            const query = `
+              SELECT
+                schemaname,
+                relname AS table_name,
+                indexrelname AS index_name,
+                pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
+                pg_relation_size(indexrelid) AS index_bytes,
+                idx_scan,
+                idx_tup_read,
+                idx_tup_fetch
+              FROM pg_stat_user_indexes
+              WHERE (indexrelname LIKE '%pkey%' OR indexrelname LIKE '%pk%')
+                AND ($1::text IS NULL OR relname = $1)
+              ORDER BY pg_relation_size(indexrelid) DESC
+              LIMIT 50;
+            `;
+            const res = await client.query(query, [tableName || null]);
+
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  analyzedIndexesCount: res.rows.length,
+                  recommendation: 'Ensure high-throughput write tables use monotonic UUIDv7 rather than random UUIDv4 to maintain >=90% B-tree fillfactor and eliminate 50-50 leaf page split storms.',
+                  indexes: res.rows,
+                }, null, 2),
+              }],
+            };
+          } finally {
+            client.release();
+          }
+        }
+      );
     }
     ```

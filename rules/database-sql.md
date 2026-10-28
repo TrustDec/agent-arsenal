@@ -2852,3 +2852,61 @@ alwaysApply: false
     WHERE l.mode = 'SIReadLock'
     ORDER BY l.locktype DESC, duration DESC;
     ```
+
+- **Database Primary Key Architecture, UUIDv7 / TSID vs UUIDv4, Monotonic Locality & B-Tree Page Split Defense**:
+  - ❌ **Anti-Pattern: Random UUIDv4 Leaf Page Splits, Auto-Increment IDOR, and VARCHAR(36) Bloat**:
+    - Declaring primary keys with `UUID DEFAULT gen_random_uuid()` (UUIDv4) in high-throughput write tables, scattering inserts uniformly across all B-tree leaf pages, triggering constant 50-50 leaf page splits, capping storage fillfactor at ~50-60%, generating massive Full-Page Write (FPW) WAL volume, and evicting active OLTP working sets from `shared_buffers`.
+    - Using naive `BIGSERIAL` / `BIGINT GENERATED ALWAYS AS IDENTITY` on public-facing entities, leaking daily sales velocity and user counts to competitors and opening trivial Insecure Direct Object Reference (IDOR) enumeration attacks.
+    - Storing UUIDs as `VARCHAR(36)` strings, consuming 36 bytes instead of native 16-byte binary types, multiplying foreign key index sizes by 2.25x and ruining CPU cache line alignment.
+  - ✅ **Production Invariant**:
+    - Mandate RFC 9562 UUIDv7 or TSID for all primary keys in write-heavy tables.
+    - Exploit 48-bit Unix millisecond timestamps for 99%+ rightmost leaf page append locality (near zero page splits, same write throughput as BIGINT).
+    - Store identifiers as native PostgreSQL `UUID` (16 bytes) or MySQL `BINARY(16)` / `BIGINT`.
+    - Pre-generate IDs client-side before issuing database transactions for zero-round-trip horizontal scaling and built-in idempotency keys.
+    - Continuous monitoring of B-tree index bloat and leaf page density via `pg_stat_user_indexes`.
+
+    ```sql
+    -- 1. RFC 9562 UUIDv7 Generator for PostgreSQL 14-16 (Native in PostgreSQL 17+)
+    CREATE OR REPLACE FUNCTION generate_uuid_v7()
+    RETURNS uuid
+    AS $$
+    DECLARE
+      v_epoch_ms bigint;
+    BEGIN
+      v_epoch_ms := (extract(epoch from clock_timestamp()) * 1000)::bigint;
+      RETURN (
+        lpad(to_hex(v_epoch_ms), 12, '0') ||
+        '7' ||
+        substr(md5(random()::text), 1, 3) ||
+        to_hex(8 + (random() * 3)::integer) ||
+        substr(md5(random()::text), 2, 3) ||
+        substr(md5(random()::text), 5, 12)
+      )::uuid;
+    END;
+    $$ LANGUAGE plpgsql VOLATILE;
+
+    -- 2. Production Table Schema with Monotonic UUIDv7 Primary Key
+    CREATE TABLE customer_orders (
+      order_id UUID PRIMARY KEY DEFAULT generate_uuid_v7(),
+      tenant_id UUID NOT NULL,
+      customer_id UUID NOT NULL,
+      total_cents BIGINT NOT NULL CHECK (total_cents >= 0),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    -- 3. Composite Index with Monotonic Locality
+    CREATE INDEX idx_orders_tenant_created 
+    ON customer_orders (tenant_id, order_id DESC);
+
+    -- 4. Diagnostic Query: Primary Key B-Tree Index Health & Bloat
+    SELECT
+      relname AS table_name,
+      indexrelname AS index_name,
+      pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
+      idx_scan,
+      idx_tup_read,
+      idx_tup_fetch
+    FROM pg_stat_user_indexes
+    WHERE indexrelname LIKE '%pkey%' OR indexrelname LIKE '%pk%'
+    ORDER BY pg_relation_size(indexrelid) DESC;
+    ```

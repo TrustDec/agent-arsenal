@@ -4815,4 +4815,79 @@ func (r *SerializableTxRunner) Execute(ctx context.Context, fn func(ctx context.
 
 	return errors.New("serializable transaction retry termination")
 }
+
+// MonotonicUUIDv7Factory generates RFC 9562 compliant UUIDv7 identifiers
+// with a thread-safe 12-bit monotonic sub-millisecond sequence counter.
+type MonotonicUUIDv7Factory struct {
+	mu          sync.Mutex
+	lastEpochMs int64
+	seqCounter  uint16
+}
+
+func NewMonotonicUUIDv7Factory() *MonotonicUUIDv7Factory {
+	return &MonotonicUUIDv7Factory{}
+}
+
+// NewUUIDv7 generates a 16-byte time-ordered UUIDv7 with sub-millisecond monotonicity.
+func (f *MonotonicUUIDv7Factory) NewUUIDv7() ([16]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	now := time.Now().UTC()
+	currentEpochMs := now.UnixMilli()
+
+	if currentEpochMs == f.lastEpochMs {
+		f.seqCounter++
+		if f.seqCounter > 0x0FFF {
+			// Spin-wait until next physical millisecond on overflow
+			for currentEpochMs <= f.lastEpochMs {
+				time.Sleep(100 * time.Microsecond)
+				currentEpochMs = time.Now().UTC().UnixMilli()
+			}
+			f.seqCounter = 0
+		}
+	} else if currentEpochMs > f.lastEpochMs {
+		f.lastEpochMs = currentEpochMs
+		f.seqCounter = 0
+	} else {
+		// Clock stepped backward (NTP slew): clamp to last known timestamp if drift <= 5000ms
+		drift := f.lastEpochMs - currentEpochMs
+		if drift > 5000 {
+			return [16]byte{}, fmt.Errorf("system clock rollback exceeds 5000ms safety threshold: %dms", drift)
+		}
+		f.seqCounter++
+		if f.seqCounter > 0x0FFF {
+			time.Sleep(time.Duration(drift+1) * time.Millisecond)
+			f.lastEpochMs = time.Now().UTC().UnixMilli()
+			f.seqCounter = 0
+		}
+	}
+
+	var entropy [10]byte
+	if _, err := rand.Read(entropy[:]); err != nil {
+		return [16]byte{}, fmt.Errorf("read crypto random entropy: %w", err)
+	}
+
+	var uuid [16]byte
+
+	// 48-bit Unix millisecond timestamp (big-endian)
+	uuid[0] = byte(f.lastEpochMs >> 40)
+	uuid[1] = byte(f.lastEpochMs >> 32)
+	uuid[2] = byte(f.lastEpochMs >> 24)
+	uuid[3] = byte(f.lastEpochMs >> 16)
+	uuid[4] = byte(f.lastEpochMs >> 8)
+	uuid[5] = byte(f.lastEpochMs)
+
+	// Version 7 (0b0111) + 4 bits sequence high
+	uuid[6] = 0x70 | byte((f.seqCounter>>8)&0x0F)
+	// 8 bits sequence low
+	uuid[7] = byte(f.seqCounter & 0xFF)
+
+	// Variant 10 (RFC 9562) + 6 bits entropy
+	uuid[8] = 0x80 | (entropy[0] & 0x3F)
+	// Remaining 56 bits entropy
+	copy(uuid[9:], entropy[1:8])
+
+	return uuid, nil
+}
 ```
