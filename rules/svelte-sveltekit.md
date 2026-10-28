@@ -4181,3 +4181,26 @@ alwaysApply: false
       }
     );
     ```
+
+- **Svelte 5 & SvelteKit: 64-Bit BIGINT Identifier Safety & String Serialization Invariants**:
+  - ❌ **Anti-Pattern: Raw 64-Bit Integer JSON Parsing & Precision Loss**:
+    - Serializing database `BIGINT` primary keys as native numbers in JSON API responses, causing JavaScript `JSON.parse` to silently truncate values $> 2^{53}-1$ (`9,007,199,254,740,991`), corrupting user IDs and record routes.
+  - ✅ **Production Invariant**:
+    - Serialize database `BIGINT` identifiers as strings in server endpoints and load functions. Use Zod schemas that parse stringified BigInts and convert them safely via `BigInt(val)` when mathematical operations are required.
+
+    ```typescript
+    import { z } from 'zod';
+    import type { PageServerLoad } from './$types';
+
+    // Invariant: IDs exceeding MAX_SAFE_INTEGER must be treated as strings or z.string().regex(/^\d+$/)
+    export const recordIdSchema = z.string().regex(/^\d+$/, 'ID must be a numeric integer string');
+
+    export const load: PageServerLoad = async ({ params }) => {
+      const recordId = recordIdSchema.parse(params.id);
+
+      // Pass ID to client as string; never cast to Number()
+      return {
+        recordId, // e.g. "9007199254740995"
+      };
+    };
+    ```

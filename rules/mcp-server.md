@@ -3388,5 +3388,66 @@ alwaysApply: false
           }
         }
       );
+
+      // Tool: audit_database_sequences - Detect Integer Overflow & Uncached Sequence Contention
+      server.tool(
+        'audit_database_sequences',
+        'Audit PostgreSQL sequences and identity columns to detect 32-bit int4 overflow risks, high capacity consumption (>=75%), cycle vulnerabilities, and uncached sequence lock contention',
+        {
+          thresholdPercent: z.number().optional().default(75).describe('Warning threshold for sequence consumption percentage'),
+        },
+        async ({ thresholdPercent }) => {
+          const client = await pool.connect();
+          try {
+            const query = `
+              SELECT
+                ns.nspname AS schema_name,
+                tbl.relname AS table_name,
+                att.attname AS column_name,
+                typ.typname AS data_type,
+                seq_ns.nspname || '.' || seq.relname AS sequence_name,
+                s.last_value,
+                s.max_value,
+                s.is_cycled,
+                s.cache_size,
+                ROUND((s.last_value::numeric / s.max_value::numeric) * 100, 2) AS percent_consumed
+              FROM pg_class seq
+              JOIN pg_namespace seq_ns ON seq.relnamespace = seq_ns.oid
+              JOIN pg_sequences s ON s.schemaname = seq_ns.nspname AND s.sequencename = seq.relname
+              JOIN pg_depend dep ON dep.objid = seq.oid AND dep.deptype IN ('a', 'i')
+              JOIN pg_class tbl ON dep.refobjid = tbl.oid
+              JOIN pg_namespace ns ON tbl.relnamespace = ns.oid
+              JOIN pg_attribute att ON att.attrelid = tbl.oid AND att.attnum = dep.refobjsubid
+              JOIN pg_type typ ON att.atttypid = typ.oid
+              WHERE seq.relkind = 'S'
+                AND ns.nspname NOT IN ('pg_catalog', 'information_schema')
+              ORDER BY (s.last_value::numeric / s.max_value::numeric) DESC;
+            `;
+            const res = await client.query(query);
+
+            const atRisk = res.rows.filter((r) => Number(r.percent_consumed) >= thresholdPercent || r.data_type === 'int4');
+            const uncached = res.rows.filter((r) => Number(r.cache_size) <= 1);
+
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  totalSequencesAudited: res.rows.length,
+                  atRiskCount: atRisk.length,
+                  uncachedCount: uncached.length,
+                  status: atRisk.length > 0 ? 'ACTION_REQUIRED_CAPACITY_OR_TYPE' : 'HEALTHY',
+                  recommendation: atRisk.length > 0
+                    ? 'Execute 4-phase zero-downtime expand-contract migration to upgrade int4 to BIGINT, and configure CACHE 50-100 on high-velocity sequences.'
+                    : 'All sequences within safe operational capacity.',
+                  atRiskSequences: atRisk,
+                  uncachedSequences: uncached.slice(0, 10),
+                }, null, 2),
+              }],
+            };
+          } finally {
+            client.release();
+          }
+        }
+      );
     }
     ```

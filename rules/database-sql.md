@@ -3010,3 +3010,48 @@ alwaysApply: false
     CREATE DOMAIN email_address AS VARCHAR(255)
     CHECK (VALUE ~* '^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$');
     ```
+
+  - ❌ **Anti-Pattern: 32-Bit SERIAL/INT4 Integer Overflow, Synchronous Type Conversion & Sequence Lock Contention**:
+    - Declaring surrogate primary keys or auto-incrementing transactional event tables with 32-bit `SERIAL` or `INTEGER GENERATED ALWAYS AS IDENTITY`, risking catastrophic system-wide write stoppage at $2,147,483,647$ rows (`SQLSTATE 22003 numeric_value_out_of_range`).
+    - Attempting to fix integer exhaustion via naive synchronous `ALTER TABLE t ALTER COLUMN id TYPE bigint;`, holding `ACCESS EXCLUSIVE` table lock for hours during a full-table physical heap rewrite and connection pool collapse.
+    - Keeping default `CACHE 1` on sequences in high-velocity insert tables, generating synchronous WAL records and buffer `LWLock` latch contention on every single row.
+    - Using auto-increment database sequences for statutory gapless financial audit trails (invoices, tax receipts) where transaction aborts/rollbacks create unrecoverable sequence number gaps.
+  - ✅ **Production Invariant**:
+    - Declare all auto-increment surrogate keys as 64-bit `BIGINT GENERATED ALWAYS AS IDENTITY` with explicit `NO CYCLE`.
+    - Modernize legacy `int4` columns to `BIGINT` via the 4-phase zero-downtime expand-contract protocol (shadow column $\to$ dual-write trigger $\to$ bounded batch backfill $\to$ concurrent index build $\to$ atomic column swap under `lock_timeout = '2s'`).
+    - Configure sequence `CACHE 50` or `100` on high-throughput write workloads to eliminate sequence buffer contention and slash WAL generation by up to $98\%$.
+    - Isolate gapless accounting sequences into dedicated pessimistic row-lock counters (`SELECT counter FROM invoice_series WHERE series = $1 FOR UPDATE`).
+
+    ```sql
+    -- 1. Modern SQL:2003 Identity Primary Key with High-Concurrency Cache
+    CREATE TABLE transaction_records (
+      id BIGINT GENERATED ALWAYS AS IDENTITY (CACHE 50 NO CYCLE) PRIMARY KEY,
+      tenant_id UUID NOT NULL,
+      amount_cents BIGINT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+    );
+
+    -- 2. Tune Existing Sequence for High-Throughput Inserts
+    ALTER SEQUENCE orders_id_seq CACHE 100;
+
+    -- 3. Proactive Sequence Exhaustion Audit Query
+    SELECT
+      ns.nspname AS schema_name,
+      tbl.relname AS table_name,
+      att.attname AS column_name,
+      typ.typname AS data_type,
+      s.sequencename,
+      s.last_value,
+      s.max_value,
+      ROUND((s.last_value::numeric / s.max_value::numeric) * 100, 2) AS percent_consumed
+    FROM pg_sequences s
+    JOIN pg_class seq ON seq.relname = s.sequencename
+    JOIN pg_namespace seq_ns ON seq.relnamespace = seq_ns.oid AND seq_ns.nspname = s.schemaname
+    JOIN pg_depend dep ON dep.objid = seq.oid AND dep.deptype IN ('a', 'i')
+    JOIN pg_class tbl ON dep.refobjid = tbl.oid
+    JOIN pg_namespace ns ON tbl.relnamespace = ns.oid
+    JOIN pg_attribute att ON att.attrelid = tbl.oid AND att.attnum = dep.refobjsubid
+    JOIN pg_type typ ON att.atttypid = typ.oid
+    WHERE s.last_value::numeric / s.max_value::numeric >= 0.75
+    ORDER BY percent_consumed DESC;
+    ```

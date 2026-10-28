@@ -5040,4 +5040,104 @@ func (s *OrderStatus) Scan(src any) error {
 		return fmt.Errorf("unsupported type for order_status: %T", src)
 	}
 }
+
+// StringInt64 wraps int64 to serialize strictly as a string in JSON,
+// preventing JavaScript client float truncation (Number.MAX_SAFE_INTEGER: 9,007,199,254,740,991).
+type StringInt64 int64
+
+func (s StringInt64) Int64() int64 {
+	return int64(s)
+}
+
+func (s StringInt64) MarshalJSON() ([]byte, error) {
+	return []byte(strconv.Quote(strconv.FormatInt(int64(s), 10))), nil
+}
+
+func (s *StringInt64) UnmarshalJSON(data []byte) error {
+	str := string(data)
+	if str == "null" || str == `""` {
+		*s = 0
+		return nil
+	}
+	unquoted, err := strconv.Unquote(str)
+	if err != nil {
+		// Fallback if client sent raw numeric token
+		val, parseErr := strconv.ParseInt(str, 10, 64)
+		if parseErr != nil {
+			return fmt.Errorf("invalid int64 token: %w", parseErr)
+		}
+		*s = StringInt64(val)
+		return nil
+	}
+	val, err := strconv.ParseInt(unquoted, 10, 64)
+	if err != nil {
+		return fmt.Errorf("failed to parse stringified int64: %w", err)
+	}
+	*s = StringInt64(val)
+	return nil
+}
+
+func (s StringInt64) Value() (driver.Value, error) {
+	return int64(s), nil
+}
+
+func (s *StringInt64) Scan(src any) error {
+	if src == nil {
+		*s = 0
+		return nil
+	}
+	switch v := src.(type) {
+	case int64:
+		*s = StringInt64(v)
+		return nil
+	case int32:
+		*s = StringInt64(v)
+		return nil
+	case string:
+		val, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return err
+		}
+		*s = StringInt64(val)
+		return nil
+	default:
+		return fmt.Errorf("unsupported type for StringInt64: %T", src)
+	}
+}
+
+// TransactionalGaplessCounter allocates strictly contiguous invoice counters
+// using pessimistic row-level locking (SELECT ... FOR UPDATE).
+type TransactionalGaplessCounter struct {
+	pool *pgxpool.Pool
+}
+
+func NewTransactionalGaplessCounter(pool *pgxpool.Pool) *TransactionalGaplessCounter {
+	return &TransactionalGaplessCounter{pool: pool}
+}
+
+func (c *TransactionalGaplessCounter) NextContiguousNumber(ctx context.Context, seriesName string) (int64, error) {
+	tx, err := c.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var nextVal int64
+	query := `
+		UPDATE invoice_series
+		SET current_counter = current_counter + 1,
+		    updated_at = clock_timestamp()
+		WHERE series_name = $1
+		RETURNING current_counter;
+	`
+	err = tx.QueryRow(ctx, query, seriesName).Scan(&nextVal)
+	if err != nil {
+		return 0, fmt.Errorf("failed to allocate contiguous counter for series %q: %w", seriesName, err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("failed to commit contiguous counter transaction: %w", err)
+	}
+	return nextVal, nil
+}
 ```

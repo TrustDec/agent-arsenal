@@ -3235,3 +3235,36 @@ alwaysApply: false
       })
     );
     ```
+
+- **Vue 3 / Nuxt 3: 64-Bit BIGINT Identifier Precision Defense & String Route Params**:
+  - ❌ **Anti-Pattern: Nuxt Nitro Numeric BIGINT Deserialization Trap**:
+    - Casting route parameters or database `BIGINT` primary keys to JavaScript `Number(route.params.id)`, causing silent truncation on values $> 2^{53}-1$ (`9,007,199,254,740,991`).
+  - ✅ **Production Invariant**:
+    - Preserve database `BIGINT` surrogate IDs as string refs throughout Vue components and Pinia stores. In Nitro event handlers, validate stringified BigInts using Zod schemas.
+
+    ```typescript
+    // server/api/records/[id].get.ts
+    import { z } from 'zod';
+
+    const idParamSchema = z.string().regex(/^\d+$/, 'Record ID must be numeric string');
+
+    export default defineEventHandler(async (event) => {
+      const rawId = getRouterParam(event, 'id');
+      const recordId = idParamSchema.parse(rawId);
+
+      // Perform database query with bigint parameter
+      const record = await db.query.records.findFirst({
+        where: (t, { eq }) => eq(t.id, BigInt(recordId)),
+      });
+
+      if (!record) {
+        throw createError({ statusCode: 404, statusMessage: 'Record Not Found' });
+      }
+
+      // Return record with stringified BigInt ID
+      return {
+        ...record,
+        id: record.id.toString(),
+      };
+    });
+    ```
