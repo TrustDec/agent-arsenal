@@ -3172,5 +3172,37 @@ alwaysApply: false
         generate,
       };
     }
+
+    // Nitro Server Handler: Atomic Parent-Child Mutation with Referential Integrity
+    export default defineEventHandler(async (event) => {
+      const body = await readBody(event);
+      const tenantId = event.context.tenantId;
+
+      if (!tenantId || !body.items || !Array.isArray(body.items)) {
+        throw createError({ statusCode: 400, message: 'Invalid payload or unauthenticated tenant' });
+      }
+
+      // Execute parent-child transaction with composite foreign key guarantees
+      return await useNitroPostgresPool().transaction(async (tx) => {
+        const orderId = body.orderId || (await generateUUIDv7());
+
+        // 1. Insert parent
+        await tx.query(
+          `INSERT INTO orders (id, tenant_id, total_cents, status) VALUES ($1, $2, $3, 'pending')`,
+          [orderId, tenantId, body.totalCents]
+        );
+
+        // 2. Batch insert child items referencing composite (tenant_id, order_id)
+        for (const item of body.items) {
+          await tx.query(
+            `INSERT INTO order_items (id, tenant_id, order_id, sku, price_cents)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [await generateUUIDv7(), tenantId, orderId, item.sku, item.priceCents]
+          );
+        }
+
+        return { success: true, orderId };
+      });
+    });
     </script>
     ```

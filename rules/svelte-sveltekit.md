@@ -4098,3 +4098,58 @@ alwaysApply: false
       }
     </script>
     ```
+
+- **SvelteKit Server Actions: Transactional Parent-Child Associations with Strict Foreign Key Invariants**:
+  - ❌ **Anti-Pattern: Orphaned Child Rows & Non-Transactional Mutex Violations**:
+    - Inserting parent and child entities in disparate database queries without a single transaction block, leaving orphaned records if child insertion crashes.
+    - Naively invoking unrestricted synchronous deletes that trigger monolithic cascade table locks.
+  - ✅ **Production Invariant**:
+    - Wrap parent and child creation in a single transaction with foreign key integrity checks.
+    - Execute child deletions via bounded keyset chunking before deleting the parent record, avoiding cascade locks.
+
+    ```typescript
+    import { fail } from '@sveltejs/kit';
+    import type { Actions } from './$types';
+    import { db } from '$lib/server/db';
+    import { orders, orderItems } from '$lib/server/db/schema';
+    import { eq, inArray } from 'drizzle-orm';
+
+    export const actions: Actions = {
+      deleteOrderSafely: async ({ request, locals }) => {
+        const formData = await request.formData();
+        const orderId = formData.get('orderId')?.toString();
+        const tenantId = locals.tenantId;
+
+        if (!orderId || !tenantId) {
+          return fail(400, { message: 'Missing orderId or unauthenticated tenant' });
+        }
+
+        try {
+          // Bounded keyset deletion of child items to prevent monolithic cascade locks
+          let deletedCount = 0;
+          while (true) {
+            const batch = await db
+              .select({ id: orderItems.id })
+              .from(orderItems)
+              .where(eq(orderItems.orderId, orderId))
+              .limit(500);
+
+            if (batch.length === 0) break;
+
+            const ids = batch.map((b) => b.id);
+            await db.delete(orderItems).where(inArray(orderItems.id, ids));
+            deletedCount += ids.length;
+          }
+
+          // Delete parent entity once child associations are safely cleared
+          await db
+            .delete(orders)
+            .where(eq(orders.id, orderId));
+
+          return { success: true, deletedItemsCount: deletedCount };
+        } catch (err) {
+          return fail(500, { message: 'Failed to safely purge order and items' });
+        }
+      },
+    };
+    ```

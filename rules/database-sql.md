@@ -2910,3 +2910,65 @@ alwaysApply: false
     WHERE indexrelname LIKE '%pkey%' OR indexrelname LIKE '%pk%'
     ORDER BY pg_relation_size(indexrelid) DESC;
     ```
+
+- **Foreign Key Indexing Discipline, Zero-Downtime NOT VALID Constraints & Cascading Lock Defense**:
+  - ❌ **Anti-Pattern: Unindexed Foreign Keys, Synchronous DDL Locks & Monolithic Cascading Deletes**:
+    - Relying on PostgreSQL foreign keys without creating explicit supporting B-tree indexes on referencing columns, forcing parent `DELETE` or `UPDATE` statements to execute full sequential scans on child tables, holding row or relation locks and exhausting connection pools.
+    - Adding foreign keys synchronously with `ALTER TABLE ADD CONSTRAINT ... FOREIGN KEY ...` without `NOT VALID`, freezing reads and writes across both parent and child tables for minutes during full-table validation scans.
+    - Declaring unbounded `ON DELETE CASCADE` across deep entity hierarchies, deleting 100,000+ rows in a single monolithic transaction, blowing lock table limits, generating gigabytes of WAL, and causing replica lag spikes.
+    - Using single-column foreign keys in multi-tenant tables, allowing records from Tenant A to reference parents belonging to Tenant B.
+  - ✅ **Production Invariant**:
+    - Mandate B-tree indexes on 100% of foreign key columns (leftmost prefix).
+    - Add constraints using the two-phase `NOT VALID` + `VALIDATE CONSTRAINT` pattern for zero read/write blocking.
+    - Replace deep `ON DELETE CASCADE` with batched keyset cascade deletion workers (`LIMIT 1000`) throttled on replica lag ($\tau_{\text{lag}} < 1.0\text{s}$).
+    - Enforce composite multi-tenant foreign keys `(tenant_id, parent_id) REFERENCES parent(tenant_id, id)`.
+
+    ```sql
+    -- 1. Two-Phase Zero-Downtime Foreign Key Creation
+    -- Step A: Create supporting index concurrently (no lock on writes)
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_order_items_order_id
+    ON order_items (tenant_id, order_id);
+
+    -- Step B: Attach constraint as NOT VALID (instant catalog metadata lock)
+    ALTER TABLE order_items
+    ADD CONSTRAINT fk_order_items_order
+    FOREIGN KEY (tenant_id, order_id)
+    REFERENCES orders (tenant_id, id)
+    ON DELETE RESTRICT
+    NOT VALID;
+
+    -- Step C: Validate constraint asynchronously (takes non-blocking SHARE UPDATE EXCLUSIVE)
+    ALTER TABLE order_items
+    VALIDATE CONSTRAINT fk_order_items_order;
+
+    -- 2. Keyset Chunked Cascade Deletion Pattern (Zero Connection Starvation)
+    WITH doomed_batch AS (
+      SELECT id
+      FROM order_items
+      WHERE order_id = :target_order_id
+      ORDER BY id ASC
+      LIMIT 1000
+      FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM order_items
+    WHERE id IN (SELECT id FROM doomed_batch);
+
+    -- 3. Introspect Unindexed Foreign Keys in PostgreSQL
+    SELECT
+      c.conrelid::regclass AS child_table,
+      c.conname AS constraint_name,
+      ARRAY_TO_STRING(ARRAY_AGG(att.attname ORDER BY u.attposition), ', ') AS fk_columns,
+      c.confrelid::regclass AS parent_table
+    FROM pg_constraint c
+    JOIN LATERAL UNNEST(c.conkey) WITH ORDINALITY AS u(attnum, attposition) ON true
+    JOIN pg_attribute att ON att.attrelid = c.conrelid AND att.attnum = u.attnum
+    WHERE c.contype = 'f'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM pg_index i
+        WHERE i.indrelid = c.conrelid
+          AND i.indisvalid = true
+          AND (i.indkey[0:array_length(c.conkey, 1) - 1] = c.conkey)
+      )
+    GROUP BY c.conrelid, c.conname, c.confrelid;
+    ```

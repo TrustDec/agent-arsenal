@@ -4890,4 +4890,74 @@ func (f *MonotonicUUIDv7Factory) NewUUIDv7() ([16]byte, error) {
 
 	return uuid, nil
 }
+
+// BoundedCascadeDeletionWorker safely purges child relations in keyset batches
+// to prevent table lock escalation, WAL storms, and replication lag cliffs.
+type BoundedCascadeDeletionWorker struct {
+	pool      *pgxpool.Pool
+	batchSize int
+	pause     time.Duration
+}
+
+func NewBoundedCascadeDeletionWorker(pool *pgxpool.Pool, batchSize int, pause time.Duration) *BoundedCascadeDeletionWorker {
+	if batchSize <= 0 {
+		batchSize = 1000
+	}
+	if pause <= 0 {
+		pause = 50 * time.Millisecond
+	}
+	return &BoundedCascadeDeletionWorker{
+		pool:      pool,
+		batchSize: batchSize,
+		pause:     pause,
+	}
+}
+
+// PurgeChildRecordsCascaded deletes child rows linked to parentID in small micro-transactions.
+func (w *BoundedCascadeDeletionWorker) PurgeChildRecordsCascaded(
+	ctx context.Context,
+	childTable string,
+	foreignKeyCol string,
+	parentID [16]byte,
+) (int64, error) {
+	var totalDeleted int64
+
+	for {
+		select {
+		case <-ctx.Done():
+			return totalDeleted, ctx.Err()
+		default:
+		}
+
+		// Keyset batch delete with SKIP LOCKED to prevent contention
+		query := fmt.Sprintf(`
+			WITH candidates AS (
+				SELECT id
+				FROM %s
+				WHERE %s = $1
+				ORDER BY id ASC
+				LIMIT $2
+				FOR UPDATE SKIP LOCKED
+			)
+			DELETE FROM %s
+			WHERE id IN (SELECT id FROM candidates)
+		`, childTable, foreignKeyCol, childTable)
+
+		tag, err := w.pool.Exec(ctx, query, parentID[:], w.batchSize)
+		if err != nil {
+			return totalDeleted, fmt.Errorf("purge batch on %s: %w", childTable, err)
+		}
+
+		rowsDeleted := tag.RowsAffected()
+		totalDeleted += rowsDeleted
+
+		if rowsDeleted < int64(w.batchSize) {
+			break
+		}
+
+		time.Sleep(w.pause)
+	}
+
+	return totalDeleted, nil
+}
 ```

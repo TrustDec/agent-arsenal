@@ -3289,5 +3289,59 @@ alwaysApply: false
           }
         }
       );
+
+      // Tool: inspect_unindexed_foreign_keys - Detect Missing B-Tree Indexes on Foreign Key Columns
+      server.tool(
+        'inspect_unindexed_foreign_keys',
+        'Inspect PostgreSQL schema and detect foreign key constraints lacking supporting B-tree indexes, which cause full-table sequential scans during parent updates or deletes',
+        {
+          schemaName: z.string().optional().default('public').describe('Target schema to audit'),
+        },
+        async ({ schemaName }) => {
+          const client = await pool.connect();
+          try {
+            const query = `
+              SELECT
+                c.connamespace::regnamespace::text AS schema_name,
+                c.conrelid::regclass::text AS child_table,
+                c.conname AS constraint_name,
+                ARRAY_AGG(att.attname ORDER BY u.attposition) AS fk_columns,
+                c.confrelid::regclass::text AS parent_table,
+                ARRAY_AGG(ref_att.attname ORDER BY u.attposition) AS parent_pk_columns,
+                pg_size_pretty(pg_total_relation_size(c.conrelid)) AS child_table_size
+              FROM pg_constraint c
+              JOIN LATERAL UNNEST(c.conkey) WITH ORDINALITY AS u(attnum, attposition) ON true
+              JOIN pg_attribute att ON att.attrelid = c.conrelid AND att.attnum = u.attnum
+              JOIN pg_attribute ref_att ON ref_att.attrelid = c.confrelid AND ref_att.attnum = c.confkey[u.attposition]
+              WHERE c.contype = 'f'
+                AND c.connamespace::regnamespace::text = $1
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM pg_index i
+                  WHERE i.indrelid = c.conrelid
+                    AND i.indisvalid = true
+                    AND (i.indkey[0:array_length(c.conkey, 1) - 1] = c.conkey)
+                )
+              GROUP BY c.connamespace, c.conrelid, c.conname, c.confrelid
+              ORDER BY pg_total_relation_size(c.conrelid) DESC;
+            `;
+            const res = await client.query(query, [schemaName]);
+
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  unindexedForeignKeysCount: res.rows.length,
+                  severity: res.rows.length > 0 ? 'HIGH_RISK_DEADLOCK_AND_SCAN_SPIKES' : 'CLEAN',
+                  recommendation: 'Create B-tree indexes concurrently on all child fk_columns to eliminate O(N) sequential scans during parent deletes/updates and avoid connection pool exhaustion.',
+                  violations: res.rows,
+                }, null, 2),
+              }],
+            };
+          } finally {
+            client.release();
+          }
+        }
+      );
     }
     ```
