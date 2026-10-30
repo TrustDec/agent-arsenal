@@ -3637,5 +3637,63 @@ alwaysApply: false
           }
         }
       );
+
+      // Diagnostic Tool: Inspect Query Prepared Statement Plan Cache Stability & Generic Drift
+      server.tool(
+        'inspect_query_plan_cache_stability',
+        'Validates SQL query stability across generic vs custom execution plans, detecting parameter sniffing and sequential scan drift via PostgreSQL EXPLAIN (GENERIC_PLAN)',
+        {
+          sql: z.string().describe('Parameterized SQL query using $1, $2 parameter placeholders'),
+        },
+        async ({ sql }) => {
+          const client = await pool.connect();
+          try {
+            // Guard: Assert SQL uses static = ANY($1) instead of dynamic IN ($1, $2, ...)
+            const dynamicInMatch = /\bIN\s*\(\s*\$\d+(?:\s*,\s*\$\d+)+\s*\)/i.test(sql);
+            if (dynamicInMatch) {
+              return {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({
+                    stable: false,
+                    violation: 'DYNAMIC_IN_CLAUSE_DETECTED',
+                    error: 'SQL contains dynamic IN ($1, $2, ...) list. Rewrite using static array containment = ANY($1::type[]) to prevent prepared statement cache explosion and backend OOM.',
+                  }, null, 2),
+                }],
+              };
+            }
+
+            // Execute EXPLAIN (GENERIC_PLAN, FORMAT JSON) to analyze generic execution tree
+            const explainRes = await client.query(`EXPLAIN (GENERIC_PLAN, FORMAT JSON) ${sql}`);
+            const planData = explainRes.rows[0]['QUERY PLAN'][0]?.Plan;
+
+            const nodeType = planData?.['Node Type'] ?? 'Unknown';
+            const totalCost = planData?.['Total Cost'] ?? 0;
+            const isSeqScan = nodeType === 'Seq Scan';
+
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  sql,
+                  genericPlanNodeType: nodeType,
+                  genericTotalCost: totalCost,
+                  hasSeqScanRisk: isSeqScan,
+                  recommendation: isSeqScan && totalCost > 1000
+                    ? "Generic plan collapsed into an unindexed Sequential Scan. For skewed status or tenant queries, wrap execution with 'SET LOCAL plan_cache_mode = force_custom' or use partial indexes."
+                    : 'Generic plan is stable and suitable for prepared statement cache reuse.',
+                }, null, 2),
+              }],
+            };
+          } catch (err: any) {
+            return {
+              isError: true,
+              content: [{ type: 'text', text: `Failed to inspect plan cache stability: ${err.message}` }],
+            };
+          } finally {
+            client.release();
+          }
+        }
+      );
     }
     ```

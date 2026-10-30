@@ -3354,4 +3354,36 @@ alwaysApply: false
       );
       return { events: events.rows };
     });
+
+    // server/api/orders/lookup.post.ts
+    // Invariant: Static SQL using = ANY($1::uuid[]) to prevent prepared statement cache explosion,
+    // plus resilient recovery on PostgreSQL SQLSTATE 0A000 (cached plan invalidation during DDL)
+    export const orderLookupHandler = defineEventHandler(async (event) => {
+      const body = await readBody<{ orderIds: string[]; status?: string }>(event);
+      if (!Array.isArray(body?.orderIds) || body.orderIds.length === 0) {
+        throw createError({ statusCode: 400, message: 'Invalid orderIds array' });
+      }
+
+      const db = useDatabase();
+      const sql = `
+        SELECT id, tenant_id, status, amount_cents, created_at
+        FROM customer_orders
+        WHERE id = ANY($1::UUID[])
+          AND ($2::TEXT IS NULL OR status = $2)
+        ORDER BY created_at DESC;
+      `;
+
+      try {
+        const result = await db.query(sql, [body.orderIds, body.status || null]);
+        return { orders: result.rows };
+      } catch (err: any) {
+        if (err?.code === '0A000' || err?.code === 'XX000') {
+          // Cached plan invalidated by concurrent zero-downtime DDL migration; retry once
+          await db.query('DISCARD PLANS');
+          const retryRes = await db.query(sql, [body.orderIds, body.status || null]);
+          return { orders: retryRes.rows };
+        }
+        throw err;
+      }
+    });
     ```

@@ -4290,5 +4290,35 @@ alwaysApply: false
         );
         return { events };
       },
+
+      // Batch item lookup: Static array parameterization and resilient plan invalidation retry
+      lookupBatchItems: async ({ request, locals }) => {
+        const data = await request.formData();
+        const rawIds = data.getAll('ids') as string[];
+        if (rawIds.length === 0) {
+          return fail(400, { message: 'No item IDs provided' });
+        }
+
+        const querySql = `
+          SELECT id, tenant_id, status, title, updated_at
+          FROM workspace_items
+          WHERE tenant_id = $1
+            AND id = ANY($2::UUID[])
+          ORDER BY updated_at DESC;
+        `;
+
+        try {
+          const items = await locals.db.manyOrNone(querySql, [locals.tenantId, rawIds]);
+          return { success: true, items };
+        } catch (err: any) {
+          if (err?.code === '0A000' || err?.code === 'XX000') {
+            // Concurrent DDL altered table descriptor; clear cached plan and retry once
+            await locals.db.none('DISCARD PLANS');
+            const retryItems = await locals.db.manyOrNone(querySql, [locals.tenantId, rawIds]);
+            return { success: true, items: retryItems };
+          }
+          throw err;
+        }
+      },
     };
     ```

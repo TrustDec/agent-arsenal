@@ -3158,3 +3158,34 @@ alwaysApply: false
       AND NOT a.attisdropped
     ORDER BY a.attnum ASC;
     ```
+
+- **Prepared Statements, Plan Cache Invalidation, Parameter Sniffing & Generic Plan Drift Defense**:
+  - ❌ **Anti-Pattern: The 5-Execution Generic Plan Flip & Parameter Sniffing Collapse**:
+    - Relying on default `plan_cache_mode = auto` for queries filtering on skewed data distributions (e.g. status columns where 99.9% of rows are 'COMPLETED' and 0.01% are 'FAILED'). On the 6th execution, PostgreSQL evaluates a generic plan with `$1` placeholder, assumes average selectivity, and permanently binds to a Sequential Scan for the lifetime of that connection.
+    - Dynamically constructing `WHERE id IN ($1, $2, ... $N)` clauses with variable parameter counts, spawning thousands of unique prepared statement handles in `pg_prepared_statements` and leaking backend memory until OOM.
+    - Zero-downtime DDL migrations triggering unhandled SQLSTATE `0A000` / `XX000` (`cached plan must not change result type`) across long-lived connection pools, causing microservices to crash until restarted.
+  - ✅ **Production Invariant**:
+    - Mandate static array parameterization `WHERE id = ANY($1::UUID[])` instead of dynamic `IN (...)`, preserving a single static statement handle regardless of array length.
+    - Set `SET LOCAL plan_cache_mode = 'force_custom';` inside transactions that execute queries on highly skewed or multi-tenant predicates to guarantee parameter-specific index scans.
+    - In PgBouncer transaction pooling mode, strictly use unnamed prepared statements or verify PgBouncer 1.21+ `max_prepared_statements >= 100` with `server_reset_query = DISCARD ALL`.
+    - Implement automatic transparent retry on SQLSTATE `0A000` / `XX000` by issuing `DISCARD PLANS` before retrying the query once.
+    - Run PostgreSQL 16+ `EXPLAIN (GENERIC_PLAN, BUFFERS)` in CI performance regression pipelines to verify that the generic plan cost does not exceed $2.0\times$ the custom plan:
+
+    ```sql
+    -- 1. PostgreSQL 16+ CI Gate for Prepared Statement Generic Plan Verification
+    EXPLAIN (GENERIC_PLAN, BUFFERS)
+    SELECT id, tenant_id, status, created_at
+    FROM customer_orders
+    WHERE tenant_id = $1
+      AND status = $2
+      AND id = ANY($3::UUID[]);
+
+    -- 2. Transaction-Scoped Plan Cache Mode Override for Skewed Predicates
+    BEGIN;
+    SET LOCAL plan_cache_mode = 'force_custom';
+    SELECT id, tenant_id, status, created_at
+    FROM customer_orders
+    WHERE status = 'FAILED'
+      AND created_at >= NOW() - INTERVAL '1 hour';
+    COMMIT;
+    ```

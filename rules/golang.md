@@ -5261,4 +5261,50 @@ type UserAuditEventAligned struct {
 	// Dynamic/Varlena Tail Fields
 	PayloadHash string `db:"payload_hash"`
 }
+
+// ResilientQueryWithPlanInvalidationRecovery executes a query with automatic retry on PostgreSQL
+// SQLSTATE 0A000 ("cached plan must not change result type") or XX000, preventing service outages
+// during zero-downtime DDL migrations across long-lived jackc/pgx connection pools.
+func ResilientQueryWithPlanInvalidationRecovery[T any](
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	sql string,
+	args []any,
+	scanFn func(pgx.Rows) (T, error),
+) (T, error) {
+	var zero T
+	maxRetries := 2
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		conn, err := pool.Acquire(ctx)
+		if err != nil {
+			return zero, fmt.Errorf("acquire conn failed: %w", err)
+		}
+
+		rows, err := conn.Query(ctx, sql, args...)
+		if err != nil {
+			conn.Release()
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && (pgErr.Code == "0A000" || pgErr.Code == "XX000") {
+				// Cached plan invalidated by concurrent DDL migration. Clear plans and retry.
+				if resetConn, rErr := pool.Acquire(ctx); rErr == nil {
+					_, _ = resetConn.Exec(ctx, "DISCARD PLANS")
+					resetConn.Release()
+				}
+				continue
+			}
+			return zero, fmt.Errorf("query execution failed: %w", err)
+		}
+
+		result, scanErr := scanFn(rows)
+		rows.Close()
+		conn.Release()
+		if scanErr != nil {
+			return zero, scanErr
+		}
+		return result, nil
+	}
+
+	return zero, fmt.Errorf("query failed after %d retries due to persistent plan invalidation", maxRetries)
+}
 ```
