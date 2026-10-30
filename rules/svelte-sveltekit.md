@@ -4320,5 +4320,53 @@ alwaysApply: false
           throw err;
         }
       },
+
+      // Inventory allocation: Precision FOR NO KEY UPDATE NOWAIT preventing FK lock blocks
+      allocateInventoryItem: async ({ request, locals }) => {
+        const data = await request.formData();
+        const itemId = data.get('itemId') as string;
+        const qty = parseInt(data.get('quantity') as string, 10);
+
+        if (!itemId || isNaN(qty) || qty <= 0) {
+          return fail(400, { message: 'Invalid item allocation parameters' });
+        }
+
+        try {
+          const updated = await locals.db.tx(async (t) => {
+            await t.none("SET LOCAL lock_timeout = '2000ms';");
+
+            // Precision row locking: allows concurrent child movement inserts
+            const item = await t.oneOrNone(
+              `SELECT id, available_qty
+               FROM inventory_items
+               WHERE id = $1
+               FOR NO KEY UPDATE NOWAIT;`,
+              [itemId]
+            );
+
+            if (!item) throw new Error('ITEM_NOT_FOUND');
+            if (item.available_qty < qty) throw new Error('INSUFFICIENT_STOCK');
+
+            return await t.one(
+              `UPDATE inventory_items
+               SET available_qty = available_qty - $1,
+                   updated_at = NOW()
+               WHERE id = $2
+               RETURNING id, available_qty;`,
+              [qty, itemId]
+            );
+          });
+
+          return { success: true, item: updated };
+        } catch (err: any) {
+          if (err?.code === '55P03') {
+            return fail(409, { message: 'Inventory item is currently being modified. Please retry.' });
+          }
+          if (err?.message === 'INSUFFICIENT_STOCK') {
+            return fail(422, { message: 'Insufficient stock available.' });
+          }
+          return fail(500, { message: 'Inventory allocation failed.' });
+        }
+      },
     };
     ```

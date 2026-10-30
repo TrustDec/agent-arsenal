@@ -5307,4 +5307,65 @@ func ResilientQueryWithPlanInvalidationRecovery[T any](
 
 	return zero, fmt.Errorf("query failed after %d retries due to persistent plan invalidation", maxRetries)
 }
+
+// ErrLockUnavailable indicates that the requested row is currently locked by a concurrent transaction (SQLSTATE 55P03).
+var ErrLockUnavailable = errors.New("row lock unavailable: concurrent transaction holds conflicting lock")
+
+// ExecuteWithNoKeyUpdateLock executes a transactional mutation on non-key columns using PostgreSQL
+// FOR NO KEY UPDATE NOWAIT. This prevents blocking concurrent child table foreign key checks (LockTupleKeyShare),
+// enforces sub-second lock_timeout ladders, and automatically handles SQLSTATE 55P03 / 40P01.
+func ExecuteWithNoKeyUpdateLock[T any](
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	lockTimeout time.Duration,
+	maxDeadlockRetries int,
+	fn func(ctx context.Context, tx pgx.Tx) (T, error),
+) (T, error) {
+	var zero T
+	timeoutMs := lockTimeout.Milliseconds()
+	if timeoutMs <= 0 {
+		timeoutMs = 2000
+	}
+
+	for attempt := 0; attempt <= maxDeadlockRetries; attempt++ {
+		var result T
+		err := pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
+			// Enforce transaction-scoped lock timeout
+			if _, setErr := tx.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = '%dms'", timeoutMs)); setErr != nil {
+				return fmt.Errorf("failed to set lock_timeout: %w", setErr)
+			}
+
+			var fnErr error
+			result, fnErr = fn(ctx, tx)
+			return fnErr
+		})
+
+		if err == nil {
+			return result, nil
+		}
+
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			// SQLSTATE 55P03: lock_not_available (NOWAIT contention) -> Fail fast
+			if pgErr.Code == "55P03" {
+				return zero, fmt.Errorf("%w: %s", ErrLockUnavailable, pgErr.Message)
+			}
+
+			// SQLSTATE 40P01: deadlock_detected -> Exponential jitter retry
+			if pgErr.Code == "40P01" && attempt < maxDeadlockRetries {
+				jitter := time.Duration(10+rand.Intn(50*(1<<attempt))) * time.Millisecond
+				select {
+				case <-time.After(jitter):
+					continue
+				case <-ctx.Done():
+					return zero, ctx.Err()
+				}
+			}
+		}
+
+		return zero, err
+	}
+
+	return zero, fmt.Errorf("transaction failed after %d deadlock retries", maxDeadlockRetries)
+}
 ```

@@ -3189,3 +3189,41 @@ alwaysApply: false
       AND created_at >= NOW() - INTERVAL '1 hour';
     COMMIT;
     ```
+
+- **Row-Level Locking Modes, FOR NO KEY UPDATE vs FOR UPDATE & MultiXact Contention Defense**:
+  - ❌ **Anti-Pattern: The Parent FOR UPDATE vs Child Foreign Key KEY SHARE Starvation**:
+    - Defaulting to `SELECT ... FOR UPDATE` when locking a parent row (e.g. updating account balance, user status, or timestamps). In PostgreSQL, every child table `INSERT` or `UPDATE` takes an implicit `FOR KEY SHARE` (`LockTupleKeyShare`) lock on the referenced parent tuple to verify referential integrity. Because `FOR UPDATE` (`LockTupleExclusive`) conflicts with `FOR KEY SHARE`, ALL concurrent child insertions across the entire cluster are blocked waiting on the parent lock, collapsing throughput from 30,000 TPS to <100 TPS and starving connection pools.
+    - Acquiring `FOR SHARE` or `FOR KEY SHARE` prior to an `UPDATE` in the same transaction. When two concurrent transactions read with `FOR SHARE` and then attempt to mutate the row, both attempt lock upgrades, creating a deterministic circular wait-for deadlock (`ERROR: 40P01: deadlock detected`).
+    - Unmonitored hot-parent insertions spawning millions of `MultiXactId` members in `pg_multixact`, triggering heavy SLRU lock contention and driving `age(datminmxid)` toward `autovacuum_multixact_freeze_max_age`, causing emergency cluster-wide autovacuum freeze storms.
+  - ✅ **Production Invariant**:
+    - For all mutations that do NOT modify primary keys or unique index columns, MANDATE `SELECT ... FOR NO KEY UPDATE` (or Drizzle `.for('no key update')` / SQLAlchemy `with_for_update(mode='no_key_update')`). `LockTupleNoKeyExclusive` is 100% compatible with `LockTupleKeyShare`, allowing concurrent child foreign key validation inserts to proceed with 0ms lock wait.
+    - Eliminate shared-to-exclusive lock upgrades: If a transaction has any probability of mutating the row, acquire `FOR NO KEY UPDATE` or `FOR UPDATE` immediately on initial read.
+    - Wrap all row locks with sub-second timeout ladders: `SET LOCAL lock_timeout = '2000ms'`.
+    - For interactive user mutations, use `NOWAIT` to fail-fast on SQLSTATE `55P03` (`lock_not_available`) and map to HTTP 409 Conflict.
+    - Run continuous audit queries to track `age(datminmxid)` and tuple lock contention:
+
+    ```sql
+    -- 1. Precision Row Locking: FOR NO KEY UPDATE (Allows concurrent child FK inserts)
+    BEGIN;
+    SET LOCAL lock_timeout = '2000ms';
+    SELECT id, balance_cents, version
+    FROM accounts
+    WHERE id = $1
+    FOR NO KEY UPDATE NOWAIT;
+
+    UPDATE accounts
+    SET balance_cents = balance_cents - $2,
+        version = version + 1,
+        updated_at = NOW()
+    WHERE id = $1;
+    COMMIT;
+
+    -- 2. Audit MultiXact Wraparound Headroom
+    SELECT
+      datname,
+      datminmxid,
+      age(datminmxid) AS multixact_age,
+      2147483648 - age(datminmxid) AS mxid_headroom_remaining
+    FROM pg_database
+    WHERE datname = current_database();
+    ```

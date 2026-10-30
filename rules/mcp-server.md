@@ -3695,5 +3695,79 @@ alwaysApply: false
           }
         }
       );
+
+      // Diagnostic Tool: Inspect Row-Level Locking Safety & MultiXact Contention
+      server.tool(
+        'inspect_row_level_locking_safety',
+        'Audits SQL row locking statements for foreign key starvation hazards, lock upgrade deadlocks, and active pg_locks tuple contention / MultiXact age',
+        {
+          sql: z.string().describe('SQL query containing SELECT ... FOR UPDATE / NO KEY UPDATE / SHARE'),
+          mutatesUniqueKeys: z.boolean().default(false).describe('Whether the subsequent update modifies primary or unique key columns'),
+        },
+        async ({ sql, mutatesUniqueKeys }) => {
+          const client = await pool.connect();
+          try {
+            const upper = sql.toUpperCase();
+            const hasForUpdate = upper.includes('FOR UPDATE');
+            const hasForNoKeyUpdate = upper.includes('FOR NO KEY UPDATE');
+            const hasForShare = upper.includes('FOR SHARE') || upper.includes('FOR KEY SHARE');
+            const hasNoWait = upper.includes('NOWAIT');
+            const hasSkipLocked = upper.includes('SKIP LOCKED');
+
+            // 1. Audit active MultiXact age headroom in the database
+            const mxidRes = await client.query(`
+              SELECT
+                datname,
+                datminmxid,
+                age(datminmxid) AS multixact_age,
+                2147483648 - age(datminmxid) AS mxid_headroom
+              FROM pg_database
+              WHERE datname = current_database();
+            `);
+            const mxidData = mxidRes.rows[0];
+
+            // 2. Identify locking hazards
+            const hazards: string[] = [];
+            let recommendedSql = sql;
+
+            if (hasForShare) {
+              hazards.push('CRITICAL: Shared lock (FOR SHARE) detected. If followed by an UPDATE in the same transaction, this triggers deterministic 40P01 deadlock.');
+              recommendedSql = sql.replace(/FOR\s+(KEY\s+)?SHARE/i, mutatesUniqueKeys ? 'FOR UPDATE' : 'FOR NO KEY UPDATE');
+            } else if (hasForUpdate && !mutatesUniqueKeys) {
+              hazards.push('WARNING: FOR UPDATE conflicts with child foreign key validation (LockTupleKeyShare). Use FOR NO KEY UPDATE since non-key columns are modified.');
+              recommendedSql = sql.replace(/FOR\s+UPDATE/i, 'FOR NO KEY UPDATE');
+            }
+
+            if (!hasNoWait && !hasSkipLocked) {
+              hazards.push('NOTICE: Blocking lock detected without NOWAIT / SKIP LOCKED. Must be wrapped with SET LOCAL lock_timeout <= 2000ms.');
+            }
+
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  sql,
+                  hasHazards: hazards.length > 0,
+                  hazards,
+                  recommendedSql,
+                  multiXactStatus: {
+                    database: mxidData?.datname,
+                    multiXactAge: Number(mxidData?.multixact_age ?? 0),
+                    headroomRemaining: Number(mxidData?.mxid_headroom ?? 0),
+                    isApproachingFreeze: Number(mxidData?.multixact_age ?? 0) > 200000000,
+                  },
+                }, null, 2),
+              }],
+            };
+          } catch (err: any) {
+            return {
+              isError: true,
+              content: [{ type: 'text', text: `Failed to inspect row-level locking safety: ${err.message}` }],
+            };
+          } finally {
+            client.release();
+          }
+        }
+      );
     }
     ```

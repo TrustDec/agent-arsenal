@@ -3386,4 +3386,62 @@ alwaysApply: false
         throw err;
       }
     });
+
+    // server/api/accounts/deduct.post.ts
+    // Invariant: Non-key row locking using FOR NO KEY UPDATE NOWAIT.
+    // Prevents blocking concurrent child table foreign key validations (LockTupleKeyShare),
+    // and maps PostgreSQL SQLSTATE 55P03 (lock_not_available) to HTTP 409 Conflict.
+    export const accountDeductHandler = defineEventHandler(async (event) => {
+      const body = await readBody<{ accountId: string; amountCents: number }>(event);
+      if (!body?.accountId || typeof body.amountCents !== 'number' || body.amountCents <= 0) {
+        throw createError({ statusCode: 400, message: 'Invalid deduction payload' });
+      }
+
+      const client = await useDatabase().connect();
+      try {
+        await client.query('BEGIN;');
+        await client.query("SET LOCAL lock_timeout = '2000ms';");
+
+        // Lock row with weak exclusive lock: allows child FK checks to proceed
+        const selectSql = `
+          SELECT id, balance_cents
+          FROM accounts
+          WHERE id = $1
+          FOR NO KEY UPDATE NOWAIT;
+        `;
+        const res = await client.query(selectSql, [body.accountId]);
+        if (res.rowCount === 0) {
+          throw createError({ statusCode: 404, message: 'Account not found' });
+        }
+
+        const currentBalance = Number(res.rows[0].balance_cents);
+        if (currentBalance < body.amountCents) {
+          throw createError({ statusCode: 422, message: 'Insufficient balance' });
+        }
+
+        const updateSql = `
+          UPDATE accounts
+          SET balance_cents = balance_cents - $1,
+              updated_at = NOW()
+          WHERE id = $2
+          RETURNING id, balance_cents;
+        `;
+        const updateRes = await client.query(updateSql, [body.amountCents, body.accountId]);
+        await client.query('COMMIT;');
+
+        return { success: true, account: updateRes.rows[0] };
+      } catch (err: any) {
+        await client.query('ROLLBACK;').catch(() => {});
+        if (err?.code === '55P03') {
+          // Resource currently locked by another concurrent transaction
+          throw createError({
+            statusCode: 409,
+            message: 'Account is currently being modified by another transaction. Please retry.',
+          });
+        }
+        throw err;
+      } finally {
+        client.release();
+      }
+    });
     ```
