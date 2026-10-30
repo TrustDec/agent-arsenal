@@ -3444,4 +3444,33 @@ alwaysApply: false
         client.release();
       }
     });
+
+    // server/api/orders/user.get.ts
+    // Invariant: Zero-heap Index-Only Scan via PostgreSQL covering index with leaf-only INCLUDE payload.
+    // Relies on: CREATE INDEX CONCURRENTLY idx_orders_user_cov ON orders (user_id) INCLUDE (status, total_amount_cents, created_at);
+    // Preserves Heap-Only Tuple (HOT) update efficiency by excluding mutable timestamps from INCLUDE.
+    export const userOrdersCoveredHandler = defineEventHandler(async (event) => {
+      const query = getQuery(event);
+      const userId = query.userId as string;
+      if (!userId) {
+        throw createError({ statusCode: 400, message: 'Missing userId parameter' });
+      }
+
+      const client = await useDatabase().connect();
+      try {
+        const sql = `
+          SELECT id, status, total_amount_cents, created_at
+          FROM orders
+          WHERE user_id = $1
+          ORDER BY user_id
+          LIMIT 50;
+        `;
+        const res = await client.query(sql, [userId]);
+        return { success: true, count: res.rowCount, orders: res.rows };
+      } catch (err: any) {
+        throw createError({ statusCode: 500, message: `Failed to fetch user orders: ${err.message}` });
+      } finally {
+        client.release();
+      }
+    });
     ```

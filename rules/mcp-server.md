@@ -3769,5 +3769,97 @@ alwaysApply: false
           }
         }
       );
+
+      // Diagnostic Tool: Inspect Covering Index & Index-Only Scan Safety
+      server.tool(
+        'inspect_covering_index_safety',
+        'Audits PostgreSQL indexes and queries for covering index optimization, leaf-only payload separation, visibility map heap fetches, and HOT update preservation',
+        {
+          tableName: z.string().describe('Target table name to audit'),
+          indexName: z.string().optional().describe('Specific index name to audit (optional)'),
+        },
+        async ({ tableName, indexName }) => {
+          const client = await pool.connect();
+          try {
+            // 1. Audit index statistics, heap fetches, and scan frequency
+            const statQuery = `
+              SELECT
+                c.relname AS table_name,
+                i.relname AS index_name,
+                idx.indisunique AS is_unique,
+                stat.idx_scan,
+                stat.idx_tup_fetch AS heap_fetches,
+                CASE
+                  WHEN stat.idx_scan = 0 THEN 0.0
+                  ELSE ROUND((stat.idx_tup_fetch::numeric / stat.idx_scan::numeric), 2)
+                END AS avg_heap_fetches_per_scan,
+                pg_size_pretty(pg_relation_size(i.oid)) AS index_size,
+                pg_size_pretty(pg_relation_size(c.oid)) AS table_size
+              FROM pg_class c
+              JOIN pg_index idx ON c.oid = idx.indrelid
+              JOIN pg_class i ON i.oid = idx.indexrelid
+              JOIN pg_statio_user_indexes stat ON stat.indexrelid = idx.indexrelid
+              WHERE c.relname = $1
+                ${indexName ? 'AND i.relname = $2' : ''}
+              ORDER BY stat.idx_scan DESC;
+            `;
+            const params = indexName ? [tableName, indexName] : [tableName];
+            const statRes = await client.query(statQuery, params);
+
+            // 2. Audit autovacuum settings for the table
+            const autoVacRes = await client.query(`
+              SELECT reloptions
+              FROM pg_class
+              WHERE relname = $1;
+            `, [tableName]);
+
+            const reloptions: string[] = autoVacRes.rows[0]?.reloptions ?? [];
+            const hasAggressiveAutovacuum = reloptions.some((opt: string) =>
+              opt.includes('autovacuum_vacuum_scale_factor=0.0')
+            );
+
+            // 3. Evaluate heap fetch risks
+            const warnings: string[] = [];
+            for (const row of statRes.rows) {
+              if (Number(row.avg_heap_fetches_per_scan) > 10.0 && Number(row.idx_scan) > 100) {
+                warnings.push(
+                  `HIGH_HEAP_FETCHES: Index '${row.index_name}' incurs an average of ${row.avg_heap_fetches_per_scan} heap fetches per scan. ` +
+                  `Visibility Map is likely cold. Consider tuning autovacuum_vacuum_scale_factor to 0.05.`
+                );
+              }
+            }
+
+            if (!hasAggressiveAutovacuum) {
+              warnings.push(
+                `AUTOVACUUM_TUNING: Table '${tableName}' does not have customized autovacuum settings. ` +
+                `For reliable Index-Only Scans with 0 heap fetches, apply: ALTER TABLE ${tableName} SET (autovacuum_vacuum_scale_factor = 0.05);`
+              );
+            }
+
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  tableName,
+                  indexCount: statRes.rowCount,
+                  indexes: statRes.rows,
+                  hasAggressiveAutovacuum,
+                  warnings,
+                  recommendation: warnings.length === 0
+                    ? 'Covering index and Visibility Map metrics are optimal.'
+                    : 'Tune table autovacuum scale factors or review included column mutations.',
+                }, null, 2),
+              }],
+            };
+          } catch (err: any) {
+            return {
+              isError: true,
+              content: [{ type: 'text', text: `Failed to inspect covering index safety: ${err.message}` }],
+            };
+          } finally {
+            client.release();
+          }
+        }
+      );
     }
     ```

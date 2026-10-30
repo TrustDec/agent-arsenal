@@ -3227,3 +3227,40 @@ alwaysApply: false
     FROM pg_database
     WHERE datname = current_database();
     ```
+
+- **Covering Indexes (INCLUDE Clause), Index-Only Scans & Visibility Map Defense**:
+  - ❌ **Anti-Pattern: The Index-Only Scan Heap Fetch Degeneration & Payload Bloat**:
+    - Adding projection columns into B-Tree index keys (`CREATE INDEX ON orders (user_id, status, total_amount)`), which duplicates wide non-filter attributes across every internal routing node, collapsing B-Tree fan-out $B$ by 70%, inflating index depth, and evicting the OLTP working set from `shared_buffers`.
+    - Relying on `INCLUDE (...)` on write-heavy tables with default autovacuum. When `PD_ALL_VISIBLE` bits in the Visibility Map are cleared by updates, PostgreSQL is forced to fetch the physical heap block for every single index entry (`Heap Fetches: 300,000`), converting index-only scans into random I/O storms.
+    - Appending projection columns directly to `CREATE UNIQUE INDEX`, inadvertently corrupting domain uniqueness by enforcing uniqueness across the entire composite tuple rather than the business key.
+    - Placing frequently updated attributes (e.g. `updated_at`, `view_count`) inside `INCLUDE (...)`, permanently disabling Heap-Only Tuple (HOT) optimizations and triggering massive index bloat on every update.
+  - ✅ **Production Invariant**:
+    - Strictly separate search keys from projection payloads: Index keys contain ONLY filtered (`WHERE`), joined (`ON`), and sorted (`ORDER BY`) columns; non-key projection attributes reside strictly in `INCLUDE (...)`.
+    - For unique lookups, use `CREATE UNIQUE INDEX ... (business_keys) INCLUDE (payload_columns)`.
+    - Never include high-churn mutable columns in `INCLUDE`; restrict payloads to immutable or low-churn fields to preserve HOT update rates.
+    - Tune autovacuum on high-read tables relying on Index-Only Scans (`autovacuum_vacuum_scale_factor = 0.05`, `autovacuum_vacuum_insert_scale_factor = 0.02`) to keep the Visibility Map warm.
+    - Build covering indexes concurrently outside transaction blocks: `CREATE INDEX CONCURRENTLY ... INCLUDE (...) WITH (fillfactor = 90)`.
+
+    ```sql
+    -- 1. Optimal Covering Index with leaf-only payload and HOT preservation
+    CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_users_tenant_email_cov
+    ON users (tenant_id, email)
+    INCLUDE (id, role, status, created_at)
+    WITH (fillfactor = 90);
+
+    -- 2. Audit Visibility Map Coverage & Index-Only Scan Heap Fetch Ratio
+    SELECT
+      c.relname AS table_name,
+      i.relname AS index_name,
+      stat.idx_scan,
+      stat.idx_tup_fetch AS heap_fetches,
+      CASE
+        WHEN stat.idx_scan = 0 THEN 0.0
+        ELSE ROUND((stat.idx_tup_fetch::numeric / stat.idx_scan::numeric), 2)
+      END AS avg_heap_fetches_per_scan
+    FROM pg_class c
+    JOIN pg_index idx ON c.oid = idx.indrelid
+    JOIN pg_class i ON i.oid = idx.indexrelid
+    JOIN pg_statio_user_indexes stat ON stat.indexrelid = idx.indexrelid
+    WHERE c.relname = 'users';
+    ```

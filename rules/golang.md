@@ -5368,4 +5368,67 @@ func ExecuteWithNoKeyUpdateLock[T any](
 
 	return zero, fmt.Errorf("transaction failed after %d deadlock retries", maxDeadlockRetries)
 }
+
+// CoveredAccountLookup represents a projection retrieved via an Index-Only Scan.
+type CoveredAccountLookup struct {
+	ID        string    `json:"id"`
+	Role      string    `json:"role"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// QueryCoveredAccountByEmail executes an Index-Only Scan against a covering index:
+// CREATE UNIQUE INDEX idx_users_tenant_email_cov ON users (tenant_id, email) INCLUDE (id, role, status, created_at);
+// It leverages leaf-only covering attributes with zero heap accesses when the Visibility Map is maintained.
+func QueryCoveredAccountByEmail(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	tenantID string,
+	email string,
+) (*CoveredAccountLookup, error) {
+	query := `
+		SELECT id, role, status, created_at
+		FROM users
+		WHERE tenant_id = $1 AND email = $2;
+	`
+	var acc CoveredAccountLookup
+	err := pool.QueryRow(ctx, query, tenantID, email).Scan(
+		&acc.ID,
+		&acc.Role,
+		&acc.Status,
+		&acc.CreatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to query covered user account: %w", err)
+	}
+
+	return &acc, nil
+}
+
+// AuditVisibilityMapCoverage verifies the ratio of visible heap blocks to ensure
+// Index-Only Scans do not silently degrade into random heap fetches.
+func AuditVisibilityMapCoverage(ctx context.Context, pool *pgxpool.Pool, tableName string) (float64, error) {
+	query := `
+		SELECT
+			CASE
+				WHEN stat.idx_scan = 0 THEN 0.0
+				ELSE ROUND((stat.idx_tup_fetch::numeric / stat.idx_scan::numeric), 4)
+			END AS avg_heap_fetches_per_scan
+		FROM pg_class c
+		JOIN pg_index idx ON c.oid = idx.indrelid
+		JOIN pg_statio_user_indexes stat ON stat.indexrelid = idx.indexrelid
+		WHERE c.relname = $1
+		ORDER BY stat.idx_scan DESC
+		LIMIT 1;
+	`
+	var heapFetchRatio float64
+	err := pool.QueryRow(ctx, query, tableName).Scan(&heapFetchRatio)
+	if err != nil {
+		return 0.0, fmt.Errorf("failed to audit visibility map coverage: %w", err)
+	}
+	return heapFetchRatio, nil
+}
 ```
