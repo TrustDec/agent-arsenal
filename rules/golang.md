@@ -8021,6 +8021,84 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **PostgreSQL Partition-Wise Join & Aggregate Execution Repository**:
+  - Implement transaction-scoped partition-wise execution harnesses using `jackc/pgx/v5` ensuring `SET LOCAL` GUC isolation and memory fencing.
+  - Dynamically budget `work_mem` against parallel worker counts to eliminate temp disk block spilling while protecting the process from out-of-memory crashes.
+
+  ```go
+  // internal/store/partitionwise_executor.go
+  package store
+
+  import (
+  	"context"
+  	"fmt"
+  	"log/slog"
+  	"time"
+
+  	"github.com/jackc/pgx/v5"
+  	"github.com/jackc/pgx/v5/pgxpool"
+  )
+
+  type PartitionwiseExecutor struct {
+  	pool   *pgxpool.Pool
+  	logger *slog.Logger
+  }
+
+  func NewPartitionwiseExecutor(pool *pgxpool.Pool, logger *slog.Logger) *PartitionwiseExecutor {
+  	return &PartitionwiseExecutor{pool: pool, logger: logger}
+  }
+
+  type PartitionwiseConfig struct {
+  	WorkMemMB        int
+  	MaxWorkers       int
+  	StatementTimeout time.Duration
+  }
+
+  func DefaultPartitionwiseConfig() PartitionwiseConfig {
+  	return PartitionwiseConfig{
+  		WorkMemMB:        64,
+  		MaxWorkers:       4,
+  		StatementTimeout: 15 * time.Second,
+  	}
+  }
+
+  // ExecuteScoped executes an analytical or batch query with transaction-scoped
+  // partition-wise join and aggregate GUCs, guaranteeing zero bleed into other connections.
+  func (e *PartitionwiseExecutor) ExecuteScoped(
+  	ctx context.Context,
+  	cfg PartitionwiseConfig,
+  	fn func(tx pgx.Tx) error,
+  ) error {
+  	tx, err := e.pool.Begin(ctx)
+  	if err != nil {
+  		return fmt.Errorf("failed to begin transaction: %w", err)
+  	}
+  	defer tx.Rollback(ctx)
+
+  	timeoutMs := int(cfg.StatementTimeout.Milliseconds())
+  	gucs := []string{
+  		fmt.Sprintf("SET LOCAL statement_timeout = %d", timeoutMs),
+  		fmt.Sprintf("SET LOCAL work_mem = '%dMB'", cfg.WorkMemMB),
+  		fmt.Sprintf("SET LOCAL max_parallel_workers_per_gather = %d", cfg.MaxWorkers),
+  		"SET LOCAL enable_partitionwise_join = on",
+  		"SET LOCAL enable_partitionwise_aggregate = on",
+  	}
+
+  	for _, guc := range gucs {
+  		if _, err := tx.Exec(ctx, guc); err != nil {
+  			return fmt.Errorf("failed to set local guc '%s': %w", guc, err)
+  		}
+  	}
+
+  	if err := fn(tx); err != nil {
+  		return err
+  	}
+
+  	return tx.Commit(ctx)
+  }
+  ```
+
+
 
 
 

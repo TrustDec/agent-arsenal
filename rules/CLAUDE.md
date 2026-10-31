@@ -65,6 +65,8 @@ When given a coding or debugging task, always follow this sequence:
 - **Clean Subprocess Lifecycles**: Never leave orphan background processes or dangling test servers running; ensure test runs and tools terminate cleanly with deterministic exit codes.
 - **Sub-Agent Context Isolation**: Offload heavy exploratory sweeps, repository map generation, and massive benchmark runs to sandboxed sub-agents, returning strictly structured 5-line syntheses to the orchestrator.
 - **Git Worktree Isolation for High-Blast-Radius Tasks**: Isolate broad refactoring runs or risky dependency upgrades in ephemeral git worktrees, verifying clean builds before merging to main.
+- **Partition-Wise Join & GUC Fencing Discipline**: When generating database queries on partitioned relations, never enable `enable_partitionwise_join` or `enable_partitionwise_aggregate` globally. Scope flags strictly via `SET LOCAL` within transaction boundaries and enforce partition boundary alignment to prevent combinatorial planning storms.
+
 
 
 

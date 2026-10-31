@@ -3792,6 +3792,19 @@ alwaysApply: false
     - Deploy **STORED Generated Columns for Projected Keys**: use `GENERATED ALWAYS AS (expr) STORED` when attributes are projected or referenced in foreign keys; reserve expression indexes for pure filter predicates.
     - Enforce **Collation "C" Fencing**: append `COLLATE "C"` to text expressions (`(LOWER(slug) COLLATE "C")`) to immunize against OS glibc upgrades and accelerate `memcmp()` comparisons.
 
+- **Partition-Wise Joins, Partition-Wise Aggregates & Dynamic Memory Defense (PostgreSQL 12–17+)**:
+  - ❌ **Anti-Pattern: Monolithic Join Append Memory Cliff & Modulus Mismatch**:
+    - Relying on default `enable_partitionwise_join = off` and `enable_partitionwise_aggregate = off` for large partitioned tables joined on partition keys, forcing PostgreSQL to build giant monolithic Hash Tables across millions of rows and spilling gigabytes to temp disk files.
+    - Enabling `enable_partitionwise_join = on` globally in `postgresql.conf`, causing dynamic programming join search on high-partition tables to pin CPU cores for 15+ seconds during query planning.
+    - Creating asymmetric partition topologies (e.g., Table A has 64 HASH partitions, Table B has 32 partitions), silently defeating partition-wise joins and causing Cartesian cross-partition scans.
+    - Multiplied `work_mem` allocation: setting excessive `work_mem` without budgeting for parallel partition join concurrency ($W \times \text{work\_mem}$), causing Linux kernel OOM killer to terminate the PostgreSQL postmaster.
+  - ✅ **Production Invariant**:
+    - Enforce **Strict 1:1 Co-Located Partition Topology**: ensure joined tables share identical partition strategies (RANGE/HASH), key data types, and partition counts/boundaries.
+    - Deploy **Transaction-Scoped GUC Activation**: keep `enable_partitionwise_join = off` and `enable_partitionwise_aggregate = off` globally; activate strictly via `SET LOCAL enable_partitionwise_join = on;` and `SET LOCAL enable_partitionwise_aggregate = on;` inside reporting transactions.
+    - Enforce **Dynamic `work_mem` Sizing & OOM Fencing**: budget transaction memory: `work_mem = min(work_mem, budget / (W * active_partitions + 1))` to guarantee zero disk spilling (`TempWrittenBlocks = 0`) while preventing host RAM exhaustion.
+    - Enforce **Partition Pruning Predicate Symmetry**: always include explicit partition range or equality filters in `WHERE` clauses to bound join planning complexity to $\mathcal{O}(P_{\text{pruned}} \log P_{\text{pruned}})$.
+
+
 
 
 

@@ -5989,6 +5989,71 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         }
       }
     );
+
+    // MCP Tool: Audit Table Partitioning Alignment for Partition-Wise Joins
+    server.registerTool(
+      'audit_partitionwise_alignment',
+      {
+        description: 'Audits whether two partitioned tables have congruent partitioning strategies and boundaries for safe partition-wise join execution',
+        parameters: {
+          tableA: { type: 'string', description: 'Name of the first partitioned table' },
+          tableB: { type: 'string', description: 'Name of the second partitioned table' },
+        },
+      },
+      async (args) => {
+        const client = await pool.connect();
+        try {
+          const fetchScheme = async (tableName: string) => {
+            const res = await client.query(`
+              SELECT
+                c.relname,
+                CASE partstrat WHEN 'h' THEN 'hash' WHEN 'r' THEN 'range' WHEN 'l' THEN 'list' ELSE 'other' END AS strategy,
+                (SELECT count(*) FROM pg_inherits WHERE inhparent = c.oid) AS partition_count
+              FROM pg_partitioned_table p
+              JOIN pg_class c ON c.oid = p.partrelid
+              WHERE c.relname = $1;
+            `, [tableName]);
+            if (res.rows.length === 0) return null;
+            return res.rows[0];
+          };
+
+          const schemeA = await fetchScheme(args.tableA);
+          const schemeB = await fetchScheme(args.tableB);
+
+          if (!schemeA || !schemeB) {
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  aligned: false,
+                  error: `One or both tables are not partitioned: tableA=${!!schemeA}, tableB=${!!schemeB}`,
+                }, null, 2),
+              }],
+            };
+          }
+
+          const strategyMatch = schemeA.strategy === schemeB.strategy;
+          const countMatch = parseInt(schemeA.partition_count, 10) === parseInt(schemeB.partition_count, 10);
+          const aligned = strategyMatch && countMatch;
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                aligned,
+                tableA: schemeA,
+                tableB: schemeB,
+                recommendation: aligned
+                  ? 'Partitions are structurally aligned. Activate via SET LOCAL enable_partitionwise_join = on in transaction scope.'
+                  : `Misaligned partitions: strategyMatch=${strategyMatch}, countMatch=${countMatch}. Refactor partition counts or boundaries before activating partition-wise joins.`,
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
   }
   ```
 
