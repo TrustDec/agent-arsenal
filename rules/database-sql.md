@@ -3856,6 +3856,19 @@ alwaysApply: false
     - Enforce **Transaction-Scoped Canary Overrides**: evaluate slow query paths safely inside transactions via `SET LOCAL auto_explain.log_min_duration = '50ms'` rather than mutating cluster-wide settings.
     - Enforce **Cardinality Divergence Sentinel**: flag any plan node where $\mathcal{E}_{\text{card}} = \max(R_{\text{act}}/R_{\text{est}}, R_{\text{est}}/R_{\text{act}}) \ge 10.0$ and duration $>20\text{ms}$ as a critical statistical regression requiring `ANALYZE` or `CREATE STATISTICS`.
 
+- **`pg_stat_io` Multi-Dimensional Storage Diagnostics, Backend Contexts & Dirty Buffer Eviction Invariants (PostgreSQL 16–17+)**:
+  - ❌ **Anti-Pattern: Monolithic Disk I/O Guesswork & Synchronous Client Dirty Writeback Penalty**:
+    - Relying on monolithic OS-level `iostat` or `pg_statio_all_tables` without isolating which backend process (`client backend`, `autovacuum`, `bgwriter`, `checkpointer`) or context (`normal`, `vacuum`, `bulkread`, `bulkwrite`) is driving physical NVMe disk thrashing.
+    - Allowing `client backend` processes to synchronously write dirty buffers to disk (`backend_type = 'client backend', context = 'normal', op = 'write' > 0`) due to undersized background writer settings (`bgwriter_lru_maxpages`), spiking p99 transaction latency from 1.5ms to >250ms.
+    - Overlooking temporary relation disk spills (`target = 'temp relation', op = 'write' > 0`), causing memory-starved hash tables and sorts to silently exhaust storage controller IOPS.
+    - Blindness to `bulkread` ring buffer flooding (`context = 'bulkread'`), missing unindexed sequential table sweeps that bypass `shared_buffers` hit counters.
+  - ✅ **Production Invariant**:
+    - Enforce **Zero Synchronous Client Writes**: assert $\Delta \text{writes} = 0$ for `backend_type = 'client backend'` and `context = 'normal'`. If non-zero, immediately calibrate `bgwriter_lru_maxpages` and `bgwriter_delay` to guarantee clean buffers for transactions.
+    - Enforce **Zero Temp Relation Disk Spills**: assert $\Delta \text{writes} = 0$ for `target = 'temp relation'` on all standard query paths; elevate transaction-scoped `work_mem` or index sorting columns.
+    - Enforce **Differential Window Flux Profiling**: never evaluate raw cumulative counters; evaluate delta rates $\Delta \mathbf{\Phi}_{\text{io}} = (\mathbf{M}(t_2) - \mathbf{M}(t_1)) / \Delta t$ over 60-second observation windows.
+    - Enforce **Bulkread Containment Sentinel**: track $\mathcal{R}_{\text{bulk\_pressure}} = \Delta R_{\text{bulkread}} / (\Delta R_{\text{normal}} + \Delta R_{\text{bulkread}})$; flag any workload with ratio $> 0.40$ as suffering from unindexed sequential scans.
+
+
 
 
 

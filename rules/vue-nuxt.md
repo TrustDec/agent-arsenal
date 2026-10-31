@@ -5470,6 +5470,71 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   </template>
   ```
 
+- **Vue 3.5 Reactive Props Destructuring for Database Storage Telemetry (`pg_stat_io`)**:
+  - ✅ **Production Invariant**: Leverage Vue 3.5's reactive props destructure and `computed` to evaluate storage health and synchronous write anomalies without boilerplate:
+  ```vue
+  <script setup lang="ts">
+  import { computed } from 'vue';
+
+  interface IoRow {
+    backend_type: string;
+    target: string;
+    context: string;
+    deltaWrites: number;
+    deltaReads: number;
+  }
+
+  // Vue 3.5 native reactive props destructuring with defaults
+  const { metrics = [], windowSeconds = 60 } = defineProps<{
+    metrics?: IoRow[];
+    windowSeconds?: number;
+  }>();
+
+  const clientDirtyWrites = computed(() =>
+    metrics
+      .filter((m) => m.backend_type === 'client backend' && m.context === 'normal')
+      .reduce((acc, m) => acc + m.deltaWrites, 0)
+  );
+
+  const tempSpillBlocks = computed(() =>
+    metrics
+      .filter((m) => m.target === 'temp relation')
+      .reduce((acc, m) => acc + m.deltaWrites, 0)
+  );
+
+  const storageHealthScore = computed(() =>
+    Math.max(0, 100 - clientDirtyWrites.value * 2 - tempSpillBlocks.value)
+  );
+  </script>
+
+  <template>
+    <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 space-y-3">
+      <div class="flex items-center justify-between">
+        <div>
+          <h4 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Storage Subsystem (pg_stat_io)</h4>
+          <span class="text-xs text-zinc-500">Window: {{ windowSeconds }}s</span>
+        </div>
+        <span
+          class="font-mono text-xs px-2.5 py-1 rounded-full font-semibold"
+          :class="storageHealthScore >= 90 ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400' : 'bg-rose-50 text-rose-700 dark:bg-rose-950 dark:text-rose-400'"
+        >
+          Score: {{ storageHealthScore }}/100
+        </span>
+      </div>
+
+      <div v-if="clientDirtyWrites > 0 || tempSpillBlocks > 0" class="p-3 rounded-lg bg-rose-50 dark:bg-rose-950/40 text-xs text-rose-700 dark:text-rose-300 space-y-1">
+        <p v-if="clientDirtyWrites > 0" class="font-medium">
+          CRITICAL: {{ clientDirtyWrites }} synchronous client dirty writes! Tune bgwriter_lru_maxpages.
+        </p>
+        <p v-if="tempSpillBlocks > 0">
+          HIGH: {{ tempSpillBlocks }} temp relation disk spill blocks! Elevate work_mem.
+        </p>
+      </div>
+    </div>
+  </template>
+  ```
+
+
 
 
 

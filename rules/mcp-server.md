@@ -6533,6 +6533,97 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         }
       }
     );
+
+    // MCP Tool: Multi-Dimensional Storage I/O Profiling via PostgreSQL 16+ pg_stat_io
+    server.tool(
+      'diagnose_storage_pg_stat_io',
+      'Inspects PostgreSQL 16+ pg_stat_io to isolate storage bottlenecks, client dirty buffer evictions, and temp file spills across backend roles.',
+      {
+        sampleWindowSeconds: z.number().int().min(1).max(300).default(5).describe('Differential window duration to measure I/O flux'),
+      },
+      async (args) => {
+        const client = await dbPool.connect();
+        try {
+          const fetchIoSql = `
+            SELECT
+              backend_type, target, context,
+              reads, writes, hits, evictions, reuses, fsyncs, fsync_time, op_bytes
+            FROM pg_stat_io;
+          `;
+
+          const firstSnap = await client.query(fetchIoSql);
+          const firstMap = new Map(firstSnap.rows.map(r => [`${r.backend_type}::${r.target}::${r.context}`, r]));
+
+          await new Promise(r => setTimeout(r, args.sampleWindowSeconds * 1000));
+
+          const secondSnap = await client.query(fetchIoSql);
+          const anomalies: any[] = [];
+          const recommendations: string[] = [];
+
+          let clientDirtyWrites = 0;
+          let tempSpills = 0;
+          let bulkreadBlocks = 0;
+
+          for (const curr of secondSnap.rows) {
+            const key = `${curr.backend_type}::${curr.target}::${curr.context}`;
+            const prev = firstMap.get(key) || { reads: 0, writes: 0, hits: 0, evictions: 0 };
+
+            const deltaWrites = Math.max(0, Number(curr.writes) - Number(prev.writes));
+            const deltaReads = Math.max(0, Number(curr.reads) - Number(prev.reads));
+
+            if (curr.backend_type === 'client backend' && curr.context === 'normal' && deltaWrites > 0) {
+              clientDirtyWrites += deltaWrites;
+              anomalies.push({
+                severity: 'CRITICAL',
+                type: 'CLIENT_DIRTY_WRITE',
+                description: `Client backend synchronously flushed ${deltaWrites} dirty buffers. bgwriter is falling behind.`,
+              });
+            }
+
+            if (curr.target === 'temp relation' && deltaWrites > 0) {
+              tempSpills += deltaWrites;
+              anomalies.push({
+                severity: 'HIGH',
+                type: 'TEMP_RELATION_SPILL',
+                description: `Temporary relations wrote ${deltaWrites} disk blocks. work_mem is undersized.`,
+              });
+            }
+
+            if (curr.context === 'bulkread' && deltaReads > 500) {
+              bulkreadBlocks += deltaReads;
+            }
+          }
+
+          if (clientDirtyWrites > 0) {
+            recommendations.push('Elevate bgwriter_lru_maxpages and verify bgwriter_delay to absorb dirty buffer flushes.');
+          }
+          if (tempSpills > 0) {
+            recommendations.push('Increase work_mem or add B-Tree indexes matching ORDER BY clauses to stop temp spills.');
+          }
+          if (bulkreadBlocks > 1000) {
+            recommendations.push('High bulkread block activity indicates unindexed full table scans bypassing shared buffers.');
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                status: 'success',
+                sampleWindowSeconds: args.sampleWindowSeconds,
+                clientDirtyWrites,
+                tempSpills,
+                bulkreadBlocks,
+                healthScore: Math.max(0, 100 - (clientDirtyWrites * 2) - tempSpills),
+                anomalies,
+                recommendations,
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
   }
   ```
 

@@ -6213,6 +6213,84 @@ In SvelteKit administrative consoles and system diagnostics:
   </div>
   ```
 
+- **Svelte 5 Runes for Real-Time Multi-Dimensional Storage I/O Telemetry (`pg_stat_io`)**:
+  - ✅ **Production Invariant**: Use Svelte 5 `$state` and `$derived` to compute differential I/O metrics across backend contexts without re-rendering unnecessary DOM trees:
+  ```svelte
+  <script lang="ts">
+    interface IoMetric {
+      backend_type: string;
+      target: string;
+      context: string;
+      deltaWrites: number;
+      deltaReads: number;
+      readHitRatio: number;
+    }
+
+    interface Props {
+      metrics: IoMetric[];
+      sampleDurationSec: number;
+      onRefresh?: () => void;
+    }
+
+    const { metrics, sampleDurationSec, onRefresh }: Props = $props();
+
+    // Svelte 5 $derived runes for reactive health evaluation
+    const clientDirtyWrites = $derived(
+      metrics
+        .filter((m) => m.backend_type === 'client backend' && m.context === 'normal')
+        .reduce((sum, m) => sum + m.deltaWrites, 0)
+    );
+
+    const tempSpillBlocks = $derived(
+      metrics
+        .filter((m) => m.target === 'temp relation')
+        .reduce((sum, m) => sum + m.deltaWrites, 0)
+    );
+
+    const storageHealthScore = $derived(
+      Math.max(0, 100 - (clientDirtyWrites * 2) - tempSpillBlocks)
+    );
+  </script>
+
+  <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 p-5 shadow-sm space-y-4">
+    <div class="flex items-center justify-between border-b border-zinc-100 dark:border-zinc-850 pb-3">
+      <div>
+        <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Storage I/O Subsystem (pg_stat_io)</h3>
+        <p class="text-xs text-zinc-500 font-mono">Sample window: {sampleDurationSec}s</p>
+      </div>
+      <div class="flex items-center gap-2">
+        <span class="text-xs font-mono font-medium px-2 py-0.5 rounded-full {storageHealthScore >= 90 ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800' : 'bg-rose-50 text-rose-700 dark:bg-rose-950/40 dark:text-rose-400 border border-rose-200 dark:border-rose-800'}">
+          Health: {storageHealthScore}/100
+        </span>
+        {#if onRefresh}
+          <button
+            onclick={onRefresh}
+            class="text-xs font-medium px-2.5 py-1 rounded bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-200 transition-colors"
+          >
+            Refresh
+          </button>
+        {/if}
+      </div>
+    </div>
+
+    {#if clientDirtyWrites > 0 || tempSpillBlocks > 0}
+      <div class="p-3 rounded-lg bg-rose-50 dark:bg-rose-950/30 border border-rose-200 dark:border-rose-900 text-xs space-y-1">
+        {#if clientDirtyWrites > 0}
+          <div class="text-rose-700 dark:text-rose-300 font-medium">
+            CRITICAL: Client backend wrote {clientDirtyWrites} dirty blocks synchronously to disk! Tune bgwriter_lru_maxpages.
+          </div>
+        {/if}
+        {#if tempSpillBlocks > 0}
+          <div class="text-rose-600 dark:text-rose-400">
+            HIGH: Temp relations wrote {tempSpillBlocks} blocks to disk. Elevate transaction work_mem.
+          </div>
+        {/if}
+      </div>
+    {/if}
+  </div>
+  ```
+
+
 
 
 

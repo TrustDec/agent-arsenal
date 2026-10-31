@@ -8852,6 +8852,107 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **PostgreSQL 16+ `pg_stat_io` Multi-Dimensional Storage Telemetry Sentinel & Anomaly Triage in Go**:
+  - ❌ **Anti-Pattern**: Polling legacy `pg_statio_user_tables` or executing destructive resets; failing to isolate whether NVMe disk I/O spikes are driven by `client backend` synchronous dirty page evictions, `temp relation` sort/hash disk spills, or unindexed `bulkread` sequential sweeps.
+  - ✅ **Production Invariant**: Implement a non-blocking background sentinel using Go's `pgxpool.Pool` and `log/slog` to compute differential I/O flux $\Delta \mathbf{\Phi}_{\text{io}} = (\mathbf{M}(t_2) - \mathbf{M}(t_1)) / \Delta t$ across 60-second windows. Enforce zero synchronous client writes ($\Delta \text{writes} = 0$ for `backend_type = 'client backend'` and `context = 'normal'`) and zero temp relation spills:
+  ```go
+  // StorageIoMetric captures PostgreSQL 16+ pg_stat_io dimensional telemetry
+  type StorageIoMetric struct {
+  	BackendType string  `db:"backend_type"`
+  	Target      string  `db:"target"`
+  	Context     string  `db:"context"`
+  	Reads       int64   `db:"reads"`
+  	Writes      int64   `db:"writes"`
+  	Hits        int64   `db:"hits"`
+  	Evictions   int64   `db:"evictions"`
+  	Fsyncs      int64   `db:"fsyncs"`
+  	FsyncTime   float64 `db:"fsync_time"`
+  	OpBytes     int64   `db:"op_bytes"`
+  }
+
+  type StorageIoWindowAudit struct {
+  	ElapsedSeconds    float64
+  	ClientDirtyWrites int64
+  	TempDiskSpills    int64
+  	BulkreadBytesRate float64
+  	FsyncStallTimeMs  float64
+  	HealthScore       int
+  	Violations        []string
+  }
+
+  // AuditPgStatIoDifferential computes dimensional storage deltas between two snapshots
+  func AuditPgStatIoDifferential(
+  	prevMap, currMap map[string]StorageIoMetric,
+  	elapsedSec float64,
+  ) *StorageIoWindowAudit {
+  	if elapsedSec <= 0 {
+  		elapsedSec = 1.0
+  	}
+
+  	audit := &StorageIoWindowAudit{
+  		ElapsedSeconds: elapsedSec,
+  		HealthScore:    100,
+  	}
+
+  	for key, curr := range currMap {
+  		prev, ok := prevMap[key]
+  		if !ok {
+  			continue
+  		}
+
+  		deltaWrites := curr.Writes - prev.Writes
+  		deltaReads := curr.Reads - prev.Reads
+  		deltaFsyncTime := curr.FsyncTime - prev.FsyncTime
+  		blockSize := curr.OpBytes
+  		if blockSize <= 0 {
+  			blockSize = 8192
+  		}
+
+  		// Invariant 1: Zero Client Backend Synchronous Dirty Writes
+  		if curr.BackendType == "client backend" && curr.Context == "normal" && deltaWrites > 0 {
+  			audit.ClientDirtyWrites += deltaWrites
+  			audit.Violations = append(audit.Violations,
+  				fmt.Sprintf("CRITICAL: Client backend synchronously wrote %d dirty buffers to disk (%d KB). Elevate bgwriter_lru_maxpages.",
+  					deltaWrites, (deltaWrites*blockSize)/1024))
+  		}
+
+  		// Invariant 2: Zero Temp Relation Disk Spills
+  		if curr.Target == "temp relation" && deltaWrites > 0 {
+  			audit.TempDiskSpills += deltaWrites
+  			audit.Violations = append(audit.Violations,
+  				fmt.Sprintf("HIGH: Temp relations spilled %d blocks to disk. Elevate transaction work_mem.", deltaWrites))
+  		}
+
+  		// Invariant 3: Bulkread Ring Buffer Pressure
+  		if curr.Context == "bulkread" && deltaReads > 5000 {
+  			rateBps := float64(deltaReads*blockSize) / elapsedSec
+  			audit.BulkreadBytesRate += rateBps
+  		}
+
+  		if deltaFsyncTime > 100.0 {
+  			audit.FsyncStallTimeMs += deltaFsyncTime
+  		}
+  	}
+
+  	// Score penalty deduction
+  	if audit.ClientDirtyWrites > 0 {
+  		audit.HealthScore -= int(math.Min(40, float64(audit.ClientDirtyWrites)*2))
+  	}
+  	if audit.TempDiskSpills > 0 {
+  		audit.HealthScore -= int(math.Min(35, float64(audit.TempDiskSpills)))
+  	}
+  	if audit.FsyncStallTimeMs > 100 {
+  		audit.HealthScore -= int(math.Min(25, (audit.FsyncStallTimeMs/100.0)*5))
+  	}
+  	if audit.HealthScore < 0 {
+  		audit.HealthScore = 0
+  	}
+
+  	return audit
+  }
+  ```
+
+
 
 
 
