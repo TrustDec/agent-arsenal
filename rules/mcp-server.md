@@ -4626,5 +4626,72 @@ alwaysApply: false
           };
         }
       );
+
+      // Tool 12: audit_database_xid_wraparound
+      // Inspects PostgreSQL transaction ID (XID) horizon, autovacuum cost throttle, and saboteurs
+      this.server.tool(
+        'audit_database_xid_wraparound',
+        'Audits PostgreSQL transaction ID (XID) wraparound horizon, autovacuum cost throttling, and horizon-pinning saboteurs (slots, idle-in-tx, prepared 2PC).',
+        {
+          maxAgeDatfrozenxid: z.number().describe('Current maximum age(datfrozenxid) across cluster databases'),
+          maxAgeDatminmxid: z.number().optional().default(10000000).describe('Current maximum age(datminmxid) MultiXact ID age'),
+          burnRatePerSec: z.number().optional().default(3000).describe('Estimated transaction consumption rate per second'),
+          autovacuumCostLimit: z.number().optional().default(200).describe('Current autovacuum_vacuum_cost_limit setting'),
+          abandonedSlotsCount: z.number().optional().default(0).describe('Count of disconnected replication slots older than 10M xid'),
+          idleInTxCount: z.number().optional().default(0).describe('Count of idle in transaction sessions older than 60s'),
+        },
+        async ({ maxAgeDatfrozenxid, maxAgeDatminmxid, burnRatePerSec, autovacuumCostLimit, abandonedSlotsCount, idleInTxCount }) => {
+          const FATAL_HORIZON = 2_137_483_648; // 2^31 - 10M
+          const remainingXids = Math.max(0, FATAL_HORIZON - maxAgeDatfrozenxid);
+          const ttwHours = Math.round((remainingXids / burnRatePerSec / 3600) * 10) / 10;
+
+          const anomalies: string[] = [];
+          const remedies: string[] = [];
+
+          if (maxAgeDatfrozenxid >= 1_500_000_000 || ttwHours < 24) {
+            anomalies.push(`EMERGENCY_WRAPAROUND_RISK: age(datfrozenxid)=${maxAgeDatfrozenxid}, TTW=${ttwHours}h to postmaster stop-the-world lockout!`);
+            remedies.push('Immediately pause non-essential batch jobs and trigger manual VACUUM (FREEZE, ANALYZE) on highest age tables.');
+          } else if (maxAgeDatfrozenxid >= 200_000_000) {
+            anomalies.push(`ELEVATED_FREEZE_AGE: age(datfrozenxid)=${maxAgeDatfrozenxid} exceeds autovacuum_freeze_max_age (200M).`);
+          }
+
+          if (abandonedSlotsCount > 0) {
+            anomalies.push(`PINNED_VACUUM_HORIZON: ${abandonedSlotsCount} inactive replication slot(s) are pinning global vacuum horizon.`);
+            remedies.push("Drop inactive slots using SELECT pg_drop_replication_slot(slot_name) from pg_replication_slots WHERE active = false;");
+          }
+
+          if (idleInTxCount > 0) {
+            anomalies.push(`IDLE_IN_TRANSACTION_SABOTEURS: ${idleInTxCount} session(s) holding backend_xmin.`);
+            remedies.push("Configure idle_in_transaction_session_timeout = '60s' and terminate lingering sessions with pg_terminate_backend().");
+          }
+
+          if (autovacuumCostLimit < 1000) {
+            anomalies.push(`THROTTLED_AUTOVACUUM: cost limit (${autovacuumCostLimit}) throttles NVMe freeze throughput to ~20-40 MB/s.`);
+            remedies.push("Increase autovacuum_vacuum_cost_limit = 3000 and lower autovacuum_vacuum_cost_delay = 2ms.");
+          }
+
+          let state = 'NOMINAL';
+          if (maxAgeDatfrozenxid >= FATAL_HORIZON - 100_000) state = 'STOP_THE_WORLD_LOCKOUT';
+          else if (anomalies.some(a => a.startsWith('EMERGENCY'))) state = 'CRITICAL_EMERGENCY';
+          else if (abandonedSlotsCount > 0 || idleInTxCount > 0) state = 'HORIZON_STARVED';
+          else if (maxAgeDatfrozenxid >= 200_000_000) state = 'AGGRESSIVE_FREEZE_ACTIVE';
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                state,
+                maxAgeDatfrozenxid,
+                remainingXids,
+                timeToWraparoundHours: ttwHours,
+                anomaliesCount: anomalies.length,
+                anomalies,
+                remedies,
+                status: anomalies.length === 0 ? 'HEALTHY' : (ttwHours < 48 ? 'CRITICAL_ALERT' : 'MAINTENANCE_REQUIRED'),
+              }, null, 2),
+            }],
+          };
+        }
+      );
     }
     ```

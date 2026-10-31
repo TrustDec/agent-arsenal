@@ -4832,5 +4832,42 @@ alwaysApply: false
           client.release();
         }
       },
+
+      // Ops form action to reap abandoned replication slots and terminate vacuum-pinning idle sessions
+      reapHorizonSaboteurs: async ({ locals }) => {
+        const client = await locals.dbPool.connect();
+        try {
+          // 1. Terminate idle-in-transaction connections pinning backend_xmin for > 60s
+          const killRes = await client.query(`
+            SELECT pid, pg_terminate_backend(pid) as terminated
+            FROM pg_stat_activity
+            WHERE state = 'idle in transaction'
+              AND age(backend_xmin) > 5000000
+              AND (now() - state_change) > interval '60 seconds';
+          `);
+
+          // 2. Discover abandoned replication slots pinning vacuum horizon
+          const slotRes = await client.query(`
+            SELECT slot_name
+            FROM pg_replication_slots
+            WHERE active = false
+              AND (COALESCE(age(xmin), 0) > 10000000 OR COALESCE(age(catalog_xmin), 0) > 10000000);
+          `);
+
+          for (const row of slotRes.rows) {
+            await client.query(`SELECT pg_drop_replication_slot($1)`, [row.slot_name]);
+          }
+
+          return {
+            success: true,
+            terminatedIdleConnections: killRes.rowCount ?? 0,
+            droppedAbandonedSlots: slotRes.rowCount ?? 0,
+          };
+        } catch (err: any) {
+          return fail(500, { message: `Saboteur cleanup failed: ${err.message}` });
+        } finally {
+          client.release();
+        }
+      },
     };
     ```

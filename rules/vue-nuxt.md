@@ -4027,4 +4027,53 @@ alwaysApply: false
         throw createError({ statusCode: 500, message: 'Internal registration failure.' });
       }
     });
+
+    // server/api/v1/ops/xid-wraparound.get.ts - Server Endpoint Auditing PostgreSQL XID Wraparound Posture
+    export default defineEventHandler(async (event) => {
+      const db = useDatabase();
+      const query = `
+        SELECT
+          d.datname,
+          age(d.datfrozenxid) AS age_datfrozenxid,
+          age(d.datminmxid) AS age_datminmxid,
+          (2137483648 - age(d.datfrozenxid)) AS remaining_xids,
+          (
+            SELECT count(*)
+            FROM pg_replication_slots s
+            WHERE s.active = false AND (age(s.xmin) > 10000000 OR age(s.catalog_xmin) > 10000000)
+          ) AS abandoned_slots
+        FROM pg_database d
+        WHERE d.datallowconn = true
+        ORDER BY age(d.datfrozenxid) DESC;
+      `;
+      const result = await db.query(query);
+      const burnRatePerSec = 3500; // Expected baseline transactions per second
+
+      const databases = result.rows.map((row: any) => {
+        const remaining = Number(row.remaining_xids);
+        const ttwHours = Math.max(0, Math.round((remaining / burnRatePerSec / 3600) * 10) / 10);
+        const age = Number(row.age_datfrozenxid);
+
+        let riskLevel = 'NOMINAL';
+        if (age >= 1_500_000_000 || ttwHours < 24) riskLevel = 'EMERGENCY';
+        else if (age >= 1_000_000_000 || ttwHours < 48) riskLevel = 'CRITICAL';
+        else if (age >= 200_000_000) riskLevel = 'WARNING';
+
+        return {
+          datname: row.datname,
+          ageDatfrozenxid: age,
+          ageDatminmxid: Number(row.age_datminmxid),
+          remainingXids: remaining,
+          timeToWraparoundHours: ttwHours,
+          abandonedSlots: Number(row.abandoned_slots),
+          riskLevel,
+        };
+      });
+
+      return {
+        timestamp: new Date().toISOString(),
+        databases,
+        hasCriticalRisk: databases.some((d: any) => d.riskLevel === 'CRITICAL' || d.riskLevel === 'EMERGENCY'),
+      };
+    });
     ```

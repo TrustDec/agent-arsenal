@@ -3578,6 +3578,21 @@ alwaysApply: false
     - Always specify `text_pattern_ops` or `varchar_pattern_ops` when creating B-Tree indexes intended for wildcard prefix matching under locale collations.
     - Establish automated CI/CD and deployment sentinels to monitor `pg_collation.collversion` vs `pg_collation_actual_version(oid)` and run zero-downtime `REINDEX CONCURRENTLY` runbooks on OS upgrades.
 
+- **Database Transaction ID (XID) Wraparound, Freeze Map & Autovacuum Horizon Starvation Defense**:
+  - ❌ **Anti-Pattern: Abandoned Slots, Pinned xmin & Antiquated Cost Limits**:
+    - Permitting unconsumed logical/physical replication slots (`pg_replication_slots`) or uncommitted 2PC transactions (`pg_prepared_xacts`) to pin the global vacuum horizon $x_{\text{min}}$, rendering routine autovacuum passes completely futile while `age(datfrozenxid)` climbs toward $2^{31}$.
+    - Leaving connections in `idle in transaction` without strict `idle_in_transaction_session_timeout`, holding `backend_xmin` and blocking dead tuple freezing across all database relations.
+    - Running modern NVMe cloud databases with legacy 2005-era autovacuum throttles (`vacuum_cost_limit = 200`, `vacuum_cost_delay = 2ms` or `20ms`), limiting freeze throughput to 20–40 MB/s and making terabyte-scale anti-wraparound vacuums take days.
+    - Ignoring MultiXact ID (`mxid`) consumption from excessive `SELECT ... FOR SHARE / FOR KEY SHARE` row locking, leading to `pg_multixact` SLRU member exhaustion and stop-the-world database shutdown.
+    - Allowing `age(datfrozenxid)` to reach $2^{31} - 10,000,000$ ($2,137,483,648$), triggering postmaster `FATAL: database is not accepting commands` and requiring 24+ hours of offline single-user mode `postgres --single` maintenance.
+  - ✅ **Production Invariant**:
+    - Continuously monitor cluster transaction horizon age: trigger Tier 1 alerts at $\ge 100\text{M}$ transactions, Tier 2 proactive freeze actions at $\ge 200\text{M}$ (`autovacuum_freeze_max_age`), and Tier 3 emergency intervention at $\ge 1.0\text{B}$.
+    - Calibrate autovacuum for modern high-IOPS NVMe storage: configure `autovacuum_vacuum_cost_limit = 3000`–`5000`, `autovacuum_vacuum_cost_delay = 2ms` (or 0ms on dedicated I/O), and dedicate `autovacuum_work_mem = 1GB`–`2GB` for single-pass TID collection.
+    - Deploy autonomous saboteur watchdogs to terminate `idle in transaction` sessions older than 60 seconds, roll back orphaned prepared transactions older than 10 minutes, and drop disconnected replication slots where `age(xmin) > 10,000,000`.
+    - Range-partition high-churn historical/audit tables and execute explicit one-time `VACUUM (FREEZE, ANALYZE)` on cold partitions, marking Visibility Map `all-frozen` bits and permanently eliminating them from future anti-wraparound scans.
+    - Track Time-to-Wraparound (TTW): $T_{\text{ttw}} = \frac{2,137,483,648 - \text{age}(datfrozenxid)}{\lambda_{\text{xid}}}$; enforce automated canary alerts if $T_{\text{ttw}} < 72\text{ hours}$.
+
+
 
 
 

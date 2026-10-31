@@ -6194,4 +6194,115 @@ func VerifyDatabaseCollationIntegrity(ctx context.Context, pool *pgxpool.Pool) (
 
 	return true, "All PostgreSQL collations are in sync with host OS/ICU libraries.", nil
 }
+
+// ClusterWraparoundReport encapsulates PostgreSQL transaction ID (XID) horizon telemetry.
+type ClusterWraparoundReport struct {
+	DatabaseName        string
+	AgeDatfrozenxid     int64
+	AgeDatminmxid       int64
+	RemainingXids       int64
+	EstimatedTTWHours   float64
+	IsCriticalEmergency bool
+	ActiveSaboteurs     int
+}
+
+// AuditClusterWraparoundHorizon evaluates transaction horizon age across all cluster databases,
+// detects horizon-pinning replication slots, and computes remaining hours to stop-the-world lockout.
+func AuditClusterWraparoundHorizon(ctx context.Context, pool *pgxpool.Pool, burnRateTxPerSec float64) ([]ClusterWraparoundReport, error) {
+	if burnRateTxPerSec <= 0 {
+		burnRateTxPerSec = 4000.0 // conservative default for high-concurrency OLTP
+	}
+
+	query := `
+		SELECT
+			d.datname,
+			age(d.datfrozenxid) AS age_datfrozenxid,
+			age(d.datminmxid) AS age_datminmxid,
+			(2137483648 - age(d.datfrozenxid)) AS remaining_xids,
+			(
+				SELECT count(*)
+				FROM pg_replication_slots s
+				WHERE s.active = false AND (age(s.xmin) > 10000000 OR age(s.catalog_xmin) > 10000000)
+			) AS active_saboteurs
+		FROM pg_database d
+		WHERE d.datallowconn = true
+		ORDER BY age(d.datfrozenxid) DESC;
+	`
+	rows, err := pool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed querying database transaction horizon: %w", err)
+	}
+	defer rows.Close()
+
+	var reports []ClusterWraparoundReport
+	for rows.Next() {
+		var r ClusterWraparoundReport
+		if err := rows.Scan(
+			&r.DatabaseName,
+			&r.AgeDatfrozenxid,
+			&r.AgeDatminmxid,
+			&r.RemainingXids,
+			&r.ActiveSaboteurs,
+		); err != nil {
+			return nil, fmt.Errorf("scanning wraparound report failed: %w", err)
+		}
+
+		if r.RemainingXids > 0 {
+			r.EstimatedTTWHours = float64(r.RemainingXids) / burnRateTxPerSec / 3600.0
+		} else {
+			r.EstimatedTTWHours = 0.0
+		}
+
+		// Critical if age > 1.0B or TTW < 48 hours
+		r.IsCriticalEmergency = r.AgeDatfrozenxid >= 1_000_000_000 || (r.EstimatedTTWHours > 0 && r.EstimatedTTWHours < 48.0)
+		reports = append(reports, r)
+	}
+
+	return reports, nil
+}
+
+// TerminateHorizonSaboteurs safely identifies and reaps idle-in-transaction connections
+// and unconsumed replication slots pinning PostgreSQL's global vacuum horizon xmin.
+func TerminateHorizonSaboteurs(ctx context.Context, pool *pgxpool.Pool, maxIdleTxDuration time.Duration) (int, error) {
+	// 1. Terminate idle-in-transaction connections pinning backend_xmin
+	killQuery := `
+		SELECT pg_terminate_backend(pid)
+		FROM pg_stat_activity
+		WHERE state = 'idle in transaction'
+		  AND age(backend_xmin) > 5000000
+		  AND (now() - state_change) > $1::interval;
+	`
+	durStr := fmt.Sprintf("%d seconds", int(maxIdleTxDuration.Seconds()))
+	cmdTag, err := pool.Exec(ctx, killQuery, durStr)
+	if err != nil {
+		return 0, fmt.Errorf("terminating idle-in-transaction sessions failed: %w", err)
+	}
+	terminated := int(cmdTag.RowsAffected())
+
+	// 2. Rollback orphaned prepared transactions older than 10 minutes
+	preparedQuery := `
+		SELECT gid
+		FROM pg_prepared_xacts
+		WHERE (now() - prepared) > interval '10 minutes'
+		  AND age(transaction) > 10000000;
+	`
+	rows, err := pool.Query(ctx, preparedQuery)
+	if err == nil {
+		var gids []string
+		for rows.Next() {
+			var gid string
+			if err := rows.Scan(&gid); err == nil {
+				gids = append(gids, gid)
+			}
+		}
+		rows.Close()
+
+		for _, gid := range gids {
+			_, _ = pool.Exec(ctx, fmt.Sprintf("ROLLBACK PREPARED %s", pool.Query(ctx, "SELECT $1", gid)))
+			terminated++
+		}
+	}
+
+	return terminated, nil
+}
 ```
