@@ -6592,6 +6592,63 @@ In SvelteKit administrative consoles and system diagnostics:
   </div>
   ```
 
+- **PostgreSQL Bitmap Scan Lossy Heap Degradation Sentinel (Svelte 5 Runes)**:
+  - ❌ **Anti-Pattern**: Omitting observability for lossy bitmap degradation, hiding CPU-intensive tuple recheck avalanches behind generic database latency spikes.
+  - ✅ **Production Invariant**: Use Svelte 5 `$props()` and `$derived()` runes to monitor exact vs lossy heap block ratios and recheck discards with high-visibility visual alerting:
+  ```svelte
+  <script lang="ts">
+    interface Props {
+      queryTitle: string;
+      exactBlocks: number;
+      lossyBlocks: number;
+      recheckRows: number;
+      isLimitSortTrap?: boolean;
+    }
+
+    let {
+      queryTitle,
+      exactBlocks,
+      lossyBlocks,
+      recheckRows,
+      isLimitSortTrap = false,
+    }: Props = $props();
+
+    const isLossy = $derived(lossyBlocks > 0 || recheckRows > 0);
+    const totalBlocks = $derived(exactBlocks + lossyBlocks);
+    const exactPercentage = $derived(
+      totalBlocks > 0 ? ((exactBlocks / totalBlocks) * 100).toFixed(1) : '100.0'
+    );
+  </script>
+
+  <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 space-y-4">
+    <div class="flex items-center justify-between">
+      <div>
+        <h4 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{queryTitle}</h4>
+        <span class="text-xs text-zinc-500">PostgreSQL Bitmap Scan Lossy Guard</span>
+      </div>
+      <span class="px-2.5 py-1 rounded-full text-xs font-medium {!isLossy ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-400' : 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-400'}">
+        {!isLossy ? 'Exact TIDBitmap (lossy=0)' : `Lossy Degradation (${lossyBlocks.toLocaleString()} blks)`}
+      </span>
+    </div>
+
+    <div class="grid grid-cols-3 gap-3 text-xs">
+      <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+        <span class="text-zinc-500">Exact Ratio:</span>
+        <span class="block font-mono font-medium {!isLossy ? 'text-zinc-900 dark:text-zinc-100' : 'text-rose-600'}">{exactPercentage}%</span>
+      </div>
+      <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+        <span class="text-zinc-500">Recheck Discards:</span>
+        <span class="block font-mono font-medium {recheckRows === 0 ? 'text-zinc-900 dark:text-zinc-100' : 'text-rose-600'}">{recheckRows.toLocaleString()}</span>
+      </div>
+      <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+        <span class="text-zinc-500">LIMIT / Sort Risk:</span>
+        <span class="block font-mono font-medium {!isLimitSortTrap ? 'text-emerald-600' : 'text-amber-600'}">{!isLimitSortTrap ? 'Optimal Scan' : 'Full Scan Trap'}</span>
+      </div>
+    </div>
+  </div>
+  ```
+
+
 
 
 

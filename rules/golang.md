@@ -9247,6 +9247,87 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **PostgreSQL Bitmap Scan Lossy Degradation & Index Recheck Defense in Go**:
+  - ❌ **Anti-Pattern**: Allowing TIDBitmaps to degrade into lossy page-level mode due to default 4MB `work_mem`, triggering millions of discarded tuple rechecks and CPU saturation during high-volume filtered scans.
+  - ✅ **Production Invariant**: Use `jackc/pgx/v5` with transaction-scoped `SET LOCAL work_mem` calibration and plan auditing to assert zero lossy heap blocks and zero index recheck rows:
+  ```go
+  // BitmapScanGovernor audits and safeguards Bitmap Heap Scan operations against lossy degradation
+  type BitmapScanGovernor struct {
+  	Pool *pgxpool.Pool
+  }
+
+  // ExecuteWithExactBitmapMemory wraps a query in a transaction with dynamically calibrated work_mem
+  func (g *BitmapScanGovernor) ExecuteWithExactBitmapMemory(ctx context.Context, targetMemMB int, fn func(tx pgx.Tx) error) error {
+  	tx, err := g.Pool.BeginTx(ctx, pgx.TxOptions{})
+  	if err != nil {
+  		return fmt.Errorf("begin transaction: %w", err)
+  	}
+  	defer tx.Rollback(ctx)
+
+  	setSQL := fmt.Sprintf("SET LOCAL work_mem = '%dMB'", targetMemMB)
+  	if _, err := tx.Exec(ctx, setSQL); err != nil {
+  		return fmt.Errorf("set local work_mem: %w", err)
+  	}
+
+  	if err := fn(tx); err != nil {
+  		return err
+  	}
+
+  	return tx.Commit(ctx)
+  }
+
+  // AuditBitmapPlan asserts that an EXPLAIN plan contains zero lossy blocks and zero index recheck discards
+  func (g *BitmapScanGovernor) AuditBitmapPlan(ctx context.Context, querySQL string, args ...any) error {
+  	explainSQL := fmt.Sprintf("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) %s", querySQL)
+
+  	ctxTimeout, cancel := context.WithTimeout(ctx, 10*time.Second)
+  	defer cancel()
+
+  	var rawJSON []byte
+  	if err := g.Pool.QueryRow(ctxTimeout, explainSQL, args...).Scan(&rawJSON); err != nil {
+  		return fmt.Errorf("explain query failed: %w", err)
+  	}
+
+  	var plans []struct {
+  		Plan map[string]any `json:"Plan"`
+  	}
+  	if err := json.Unmarshal(rawJSON, &plans); err != nil || len(plans) == 0 {
+  		return fmt.Errorf("parse explain json: %w", err)
+  	}
+
+  	var lossyBlocks float64
+  	var recheckRows float64
+
+  	var inspect func(node map[string]any)
+  	inspect = func(node map[string]any) {
+  		if nodeType, _ := node["Node Type"].(string); nodeType == "Bitmap Heap Scan" {
+  			if lossy, ok := node["Lossy Heap Blocks"].(float64); ok {
+  				lossyBlocks += lossy
+  			}
+  			if rechecks, ok := node["Rows Removed by Index Recheck"].(float64); ok {
+  				recheckRows += rechecks
+  			}
+  		}
+  		if children, ok := node["Plans"].([]any); ok {
+  			for _, c := range children {
+  				if childMap, ok := c.(map[string]any); ok {
+  					inspect(childMap)
+  				}
+  			}
+  		}
+  	}
+
+  	inspect(plans[0].Plan)
+
+  	if lossyBlocks > 0 || recheckRows > 0 {
+  		return fmt.Errorf("bitmap scan violation: %.0f lossy blocks and %.0f discarded recheck rows detected", lossyBlocks, recheckRows)
+  	}
+
+  	return nil
+  }
+  ```
+
+
 
 
 

@@ -5846,6 +5846,68 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   </template>
   ```
 
+- **PostgreSQL Bitmap Scan Lossy Degradation Monitor (Vue 3 / Nuxt 3)**:
+  - ❌ **Anti-Pattern**: Failing to observe lossy degradation in real-time APM interfaces, masking index recheck CPU stalls as unexplained query latency.
+  - ✅ **Production Invariant**: Implement Vue 3 Composition API reactive components displaying exact vs lossy heap block ratios and discarded recheck rows:
+  ```vue
+  <script setup lang="ts">
+  import { computed } from 'vue';
+
+  const props = withDefaults(defineProps<{
+    queryTitle?: string;
+    exactBlocks?: number;
+    lossyBlocks?: number;
+    recheckRows?: number;
+    isLimitSortTrap?: boolean;
+  }>(), {
+    queryTitle: 'Filtered Query',
+    exactBlocks: 0,
+    lossyBlocks: 0,
+    recheckRows: 0,
+    isLimitSortTrap: false,
+  });
+
+  const isLossy = computed(() => props.lossyBlocks > 0 || props.recheckRows > 0);
+  const totalBlocks = computed(() => props.exactBlocks + props.lossyBlocks);
+  const exactPercentage = computed(() =>
+    totalBlocks.value > 0 ? ((props.exactBlocks / totalBlocks.value) * 100).toFixed(1) : '100.0'
+  );
+  </script>
+
+  <template>
+    <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 space-y-4">
+      <div class="flex items-center justify-between">
+        <div>
+          <h4 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{{ queryTitle }}</h4>
+          <span class="text-xs text-zinc-500">PostgreSQL Bitmap Scan Lossy Monitor</span>
+        </div>
+        <span
+          class="px-2.5 py-1 rounded-full text-xs font-medium"
+          :class="!isLossy ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-400' : 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-400'"
+        >
+          {{ !isLossy ? 'Exact TIDBitmap (lossy=0)' : `Lossy Degradation (${lossyBlocks.toLocaleString()} blks)` }}
+        </span>
+      </div>
+
+      <div class="grid grid-cols-3 gap-3 text-xs">
+        <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+          <span class="text-zinc-500">Exact Ratio:</span>
+          <span class="block font-mono font-medium" :class="!isLossy ? 'text-zinc-900 dark:text-zinc-100' : 'text-rose-600'">{{ exactPercentage }}%</span>
+        </div>
+        <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+          <span class="text-zinc-500">Recheck Discards:</span>
+          <span class="block font-mono font-medium" :class="recheckRows === 0 ? 'text-zinc-900 dark:text-zinc-100' : 'text-rose-600'">{{ recheckRows.toLocaleString() }}</span>
+        </div>
+        <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+          <span class="text-zinc-500">LIMIT / Sort Risk:</span>
+          <span class="block font-mono font-medium" :class="!isLimitSortTrap ? 'text-emerald-600' : 'text-amber-600'">{{ !isLimitSortTrap ? 'Optimal Scan' : 'Full Scan Trap' }}</span>
+        </div>
+      </div>
+    </div>
+  </template>
+  ```
+
+
 
 
 

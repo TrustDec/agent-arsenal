@@ -3931,6 +3931,18 @@ alwaysApply: false
     - Enforce **Physical Correlation & Bitmap Heap Guard**: verify inner column correlation $\ge 0.8$ or leverage `Bitmap Index Scan` with dynamic block sorting to eliminate random NVMe seeks.
     - Enforce **LATERAL Top-K Composite Index Alignment**: pair `CROSS JOIN LATERAL ... ORDER BY col DESC LIMIT K` with composite B-Tree indexes matching `(foreign_key, sort_col DESC)` to achieve sub-millisecond point seeks.
 
+- **Bitmap Index Scans, TIDBitmap Lossy Degradation & Index Recheck Defense (PostgreSQL)**:
+  - ❌ **Anti-Pattern: Lossy Bitmaps, 4MB Default work_mem, BitmapAnd Overhead & LIMIT Traps**:
+    - Permitting TIDBitmaps to degrade into lossy page-level markers when result sets exceed `work_mem`, forcing `Bitmap Heap Scan` to evaluate every tuple on flagged pages and discarding millions of non-matching rows (`Rows Removed by Index Recheck > 0`), locking CPU at 100%.
+    - Relying on runtime `BitmapAnd` or `BitmapOr` across multiple unaligned single-column indexes instead of deploying a single unified composite B-Tree index, incurring redundant B-Tree traversals and bitmap allocations.
+    - Using `Bitmap Heap Scan` for queries containing `ORDER BY ... LIMIT K`, destroying B-Tree ordering, forcing complete table evaluation and explicit sorting, and losing early pipeline termination.
+  - ✅ **Production Invariant**:
+    - Enforce **Exact Tuple-Level Bitmaps**: assert `Lossy Heap Blocks == 0` and `Rows Removed by Index Recheck == 0` in all execution plans via automated CI checks.
+    - Enforce **Transaction-Scoped Memory Calibration**: dynamically size `SET LOCAL work_mem` to accommodate $M_{\text{TIDBitmap}} \approx P_{\text{match}} \times 160 \times 1.5$ bytes on high-volume filtering pipelines.
+    - Enforce **Composite Index Consolidation**: replace disjoint multi-index bitmap boolean operations with composite indexes matching `(equality_cols..., range_or_sort_cols...)`.
+    - Enforce **LIMIT Early-Termination Invariance**: preserve B-Tree index ordering for `ORDER BY ... LIMIT K` queries using plain `Index Scan` or `Index Only Scan` to stream results in $O(K)$ time.
+
+
 
 
 

@@ -6930,6 +6930,79 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         };
       }
     );
+
+    // Tool: Audit Bitmap Scan execution plan for lossy heap degradation & rechecks
+    this.server.tool(
+      'audit_bitmap_scan_plan',
+      'Parses EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) execution trees to verify zero-lossy Bitmap Scan compliance (exact TIDBitmaps, lossy blocks == 0, rows removed by recheck == 0, and early-terminating LIMIT preservation)',
+      {
+        planJson: z.string().describe('Raw JSON output from EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)'),
+        maxPermittedLossyBlocks: z.number().default(0).describe('Maximum allowed lossy heap blocks'),
+      },
+      async (args) => {
+        const parsed = JSON.parse(args.planJson);
+        const rootPlan = parsed[0]?.Plan;
+        if (!rootPlan) {
+          throw new Error('Invalid EXPLAIN JSON format: missing root Plan node');
+        }
+
+        let hasBitmapScan = false;
+        let totalExactBlocks = 0;
+        let totalLossyBlocks = 0;
+        let totalRowsRemovedByRecheck = 0;
+        let hasMultiIndexOp = false;
+        let hasSortNode = false;
+        let hasLimitNode = false;
+
+        const traverse = (node: any) => {
+          const nodeType = node['Node Type'] ?? '';
+          if (nodeType === 'Bitmap Heap Scan') {
+            hasBitmapScan = true;
+            totalExactBlocks += node['Exact Heap Blocks'] ?? 0;
+            totalLossyBlocks += node['Lossy Heap Blocks'] ?? 0;
+            totalRowsRemovedByRecheck += node['Rows Removed by Index Recheck'] ?? 0;
+          }
+          if (nodeType === 'BitmapAnd' || nodeType === 'BitmapOr') {
+            hasMultiIndexOp = true;
+          }
+          if (nodeType === 'Sort') hasSortNode = true;
+          if (nodeType === 'Limit') hasLimitNode = true;
+
+          if (Array.isArray(node.Plans)) {
+            for (const child of node.Plans) {
+              traverse(child);
+            }
+          }
+        };
+
+        traverse(rootPlan);
+
+        const isCompliant = hasBitmapScan && totalLossyBlocks <= args.maxPermittedLossyBlocks && totalRowsRemovedByRecheck === 0;
+        const hasSortLimitTrap = hasBitmapScan && hasSortNode && hasLimitNode;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              hasBitmapScan,
+              totalExactBlocks,
+              totalLossyBlocks,
+              totalRowsRemovedByRecheck,
+              hasMultiIndexOp,
+              hasSortLimitTrap,
+              status: isCompliant ? 'compliant' : totalLossyBlocks > 0 ? 'lossy_degradation_detected' : 'recheck_detected',
+              recommendation: totalLossyBlocks > 0
+                ? `CRITICAL: Lossy TIDBitmap detected (${totalLossyBlocks} blocks). Increase transaction work_mem via SET LOCAL work_mem.`
+                : hasSortLimitTrap
+                ? 'WARNING: Bitmap Heap Scan used for ORDER BY ... LIMIT query. Consolidate into composite index for early termination.'
+                : isCompliant
+                ? '-- Bitmap scan execution is fully compliant (exact tuple bitmaps)'
+                : '-- Audit index selection',
+            }, null, 2),
+          }],
+        };
+      }
+    );
   }
   ```
 
