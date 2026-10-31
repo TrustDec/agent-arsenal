@@ -4773,6 +4773,93 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   </template>
   ```
 
+- **PostgreSQL Wait Event & Active Session History (ASH) Dashboard Card (Vue 3 / Nuxt 3)**:
+  - Implement a real-time reactive card visualizing Average Active Sessions (AAS) breakdown across CPU, IO, Lock, and Zombie sessions using `<script setup lang="ts">` and `computed()`.
+
+  ```vue
+  <!-- components/database/WaitEventAshCard.vue -->
+  <script setup lang="ts">
+  import { computed } from 'vue';
+
+  export interface AshMetrics {
+    cpuAas: number;
+    ioAas: number;
+    lockAas: number;
+    lwlockAas: number;
+    clientZombieAas: number;
+    cpuCores: number;
+  }
+
+  const props = defineProps<{
+    metrics: AshMetrics;
+  }>();
+
+  const totalAas = computed(() =>
+    props.metrics.cpuAas + props.metrics.ioAas + props.metrics.lockAas + props.metrics.lwlockAas
+  );
+
+  const isCpuSaturated = computed(() => props.metrics.cpuAas > props.metrics.cpuCores * 0.8);
+  const isLockContended = computed(() => props.metrics.lockAas > 1.0 && props.metrics.lockAas / (totalAas.value || 1) > 0.3);
+  const hasZombies = computed(() => props.metrics.clientZombieAas > 0.5);
+
+  const statusSeverity = computed(() => {
+    if (hasZombies.value) return 'bg-amber-50 text-amber-700 dark:bg-amber-950/50 dark:text-amber-400';
+    if (isLockContended.value) return 'bg-rose-50 text-rose-700 dark:bg-rose-950/50 dark:text-rose-400';
+    if (isCpuSaturated.value) return 'bg-orange-50 text-orange-700 dark:bg-orange-950/50 dark:text-orange-400';
+    return 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400';
+  });
+
+  const statusLabel = computed(() => {
+    if (hasZombies.value) return 'ZOMBIE IDLE-IN-TX';
+    if (isLockContended.value) return 'LOCK CONTENTION';
+    if (isCpuSaturated.value) return 'CPU SATURATED';
+    return 'HEALTHY AAS';
+  });
+  </script>
+
+  <template>
+    <div class="p-4 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-xs">
+      <div class="flex items-center justify-between pb-3 border-b border-zinc-100 dark:border-zinc-800/80">
+        <div>
+          <h3 class="font-medium text-sm text-zinc-900 dark:text-zinc-100">Wait Events & Active Session History</h3>
+          <p class="text-xs text-zinc-500 font-mono mt-0.5">Total AAS: {{ totalAas.toFixed(2) }} / {{ metrics.cpuCores }} Cores</p>
+        </div>
+        <span class="text-xs px-2 py-0.5 rounded font-mono font-medium" :class="statusSeverity">
+          {{ statusLabel }}
+        </span>
+      </div>
+
+      <div class="grid grid-cols-4 gap-2 text-xs mt-3">
+        <div class="p-2 rounded bg-zinc-50 dark:bg-zinc-800/50 text-center">
+          <div class="text-zinc-400 text-2xs mb-0.5">CPU</div>
+          <div class="font-mono font-bold" :class="isCpuSaturated ? 'text-orange-500' : 'text-zinc-800 dark:text-zinc-200'">
+            {{ metrics.cpuAas.toFixed(1) }}
+          </div>
+        </div>
+        <div class="p-2 rounded bg-zinc-50 dark:bg-zinc-800/50 text-center">
+          <div class="text-zinc-400 text-2xs mb-0.5">IO</div>
+          <div class="font-mono font-bold text-sky-600 dark:text-sky-400">
+            {{ metrics.ioAas.toFixed(1) }}
+          </div>
+        </div>
+        <div class="p-2 rounded bg-zinc-50 dark:bg-zinc-800/50 text-center">
+          <div class="text-zinc-400 text-2xs mb-0.5">LOCK</div>
+          <div class="font-mono font-bold" :class="isLockContended ? 'text-rose-600 animate-pulse' : 'text-zinc-800 dark:text-zinc-200'">
+            {{ metrics.lockAas.toFixed(1) }}
+          </div>
+        </div>
+        <div class="p-2 rounded bg-zinc-50 dark:bg-zinc-800/50 text-center">
+          <div class="text-zinc-400 text-2xs mb-0.5">ZOMBIE</div>
+          <div class="font-mono font-bold" :class="hasZombies ? 'text-amber-600 animate-pulse' : 'text-zinc-400'">
+            {{ metrics.clientZombieAas.toFixed(1) }}
+          </div>
+        </div>
+      </div>
+    </div>
+  </template>
+  ```
+
+
 
 
 

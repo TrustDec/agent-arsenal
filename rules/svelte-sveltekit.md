@@ -5522,6 +5522,91 @@ In SvelteKit administrative consoles and system diagnostics:
   </div>
   ```
 
+- **PostgreSQL Wait Event & Active Session History (ASH) Dashboard Card (Svelte 5 Runes)**:
+  - Implement a real-time reactive card visualizing Average Active Sessions (AAS) breakdown across CPU, IO, Lock, and Zombie sessions using Svelte 5 `$derived`.
+
+  ```svelte
+  <!-- src/lib/components/WaitEventAshCard.svelte -->
+  <script lang="ts">
+    export interface AshMetrics {
+      cpuAas: number;
+      ioAas: number;
+      lockAas: number;
+      lwlockAas: number;
+      clientZombieAas: number;
+      cpuCores: number;
+    }
+
+    interface Props {
+      metrics: AshMetrics;
+    }
+
+    let { metrics }: Props = $props();
+
+    let totalAas = $derived(
+      metrics.cpuAas + metrics.ioAas + metrics.lockAas + metrics.lwlockAas
+    );
+
+    let isCpuSaturated = $derived(metrics.cpuAas > metrics.cpuCores * 0.8);
+    let isLockContended = $derived(metrics.lockAas > 1.0 && metrics.lockAas / (totalAas || 1) > 0.3);
+    let hasZombies = $derived(metrics.clientZombieAas > 0.5);
+
+    let statusSeverity = $derived.by(() => {
+      if (hasZombies) return 'bg-amber-50 text-amber-700 dark:bg-amber-950/50 dark:text-amber-400';
+      if (isLockContended) return 'bg-rose-50 text-rose-700 dark:bg-rose-950/50 dark:text-rose-400';
+      if (isCpuSaturated) return 'bg-orange-50 text-orange-700 dark:bg-orange-950/50 dark:text-orange-400';
+      return 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400';
+    });
+
+    let statusLabel = $derived.by(() => {
+      if (hasZombies) return 'ZOMBIE IDLE-IN-TX';
+      if (isLockContended) return 'LOCK CONTENTION';
+      if (isCpuSaturated) return 'CPU SATURATED';
+      return 'HEALTHY AAS';
+    });
+  </script>
+
+  <div class="p-4 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-xs">
+    <div class="flex items-center justify-between pb-3 border-b border-zinc-100 dark:border-zinc-800/80">
+      <div>
+        <h3 class="font-medium text-sm text-zinc-900 dark:text-zinc-100">Wait Events & Active Session History</h3>
+        <p class="text-xs text-zinc-500 font-mono mt-0.5">Total AAS: {totalAas.toFixed(2)} / {metrics.cpuCores} Cores</p>
+      </div>
+      <span class="text-xs px-2 py-0.5 rounded font-mono font-medium {statusSeverity}">
+        {statusLabel}
+      </span>
+    </div>
+
+    <div class="grid grid-cols-4 gap-2 text-xs mt-3">
+      <div class="p-2 rounded bg-zinc-50 dark:bg-zinc-800/50 text-center">
+        <div class="text-zinc-400 text-2xs mb-0.5">CPU</div>
+        <div class="font-mono font-bold {isCpuSaturated ? 'text-orange-500' : 'text-zinc-800 dark:text-zinc-200'}">
+          {metrics.cpuAas.toFixed(1)}
+        </div>
+      </div>
+      <div class="p-2 rounded bg-zinc-50 dark:bg-zinc-800/50 text-center">
+        <div class="text-zinc-400 text-2xs mb-0.5">IO</div>
+        <div class="font-mono font-bold text-sky-600 dark:text-sky-400">
+          {metrics.ioAas.toFixed(1)}
+        </div>
+      </div>
+      <div class="p-2 rounded bg-zinc-50 dark:bg-zinc-800/50 text-center">
+        <div class="text-zinc-400 text-2xs mb-0.5">LOCK</div>
+        <div class="font-mono font-bold {isLockContended ? 'text-rose-600 animate-pulse' : 'text-zinc-800 dark:text-zinc-200'}">
+          {metrics.lockAas.toFixed(1)}
+        </div>
+      </div>
+      <div class="p-2 rounded bg-zinc-50 dark:bg-zinc-800/50 text-center">
+        <div class="text-zinc-400 text-2xs mb-0.5">ZOMBIE</div>
+        <div class="font-mono font-bold {hasZombies ? 'text-amber-600 animate-pulse' : 'text-zinc-400'}">
+          {metrics.clientZombieAas.toFixed(1)}
+        </div>
+      </div>
+    </div>
+  </div>
+  ```
+
+
 
 
 

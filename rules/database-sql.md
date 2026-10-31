@@ -3754,6 +3754,21 @@ alwaysApply: false
     - Enforce **Surgical Tuple Salvaging**: when block corruption strikes, inspect the raw page via `SELECT * FROM heap_page_items(get_raw_page('table', block_num))` to extract surviving tuples before attempting standby page transplantation or PITR repair.
     - Zero-Downtime Index Remediation: rebuild verified corrupted indexes using `SET lock_timeout = '2000ms'; REINDEX INDEX CONCURRENTLY idx_name;`.
 
+- **Wait Events, Active Session History (ASH), Lock Contention Profiling & Bottleneck Triaging (PostgreSQL 12–17+)**:
+  - ❌ **Anti-Pattern: Speculative Index Blindness, Zombie Idle-in-Tx & Missing ASH Ring Buffers**:
+    - Speculatively adding B-Tree indexes when query latency spikes, unaware that the target query was blocked on `Lock:relation` (exclusive lock contention) or `LWLock:BufferContent`; adding indexes inflates write amplification and worsens lock wait times without reducing wait latency.
+    - Allowing application backends to open transactions (`BEGIN`), make external network HTTP/LLM calls, and park on `Client:ClientRead` in `state = 'idle in transaction'` while holding row locks, starving concurrent writers and pinning the cluster-wide $x_{\min}$ horizon.
+    - Disregarding `IO:DataFileRead` spikes indicating working sets outgrowing `shared_buffers` / RAM, attempting speculative SQL rewrites instead of cache sizing and keyset pagination.
+    - Unbatched high-frequency single-row mutations generating synchronous `IO:WALSync` fsync storms ($10,000$ fsyncs/sec) saturating storage controllers.
+    - Relying exclusively on ad-hoc point-in-time snapshots of `pg_stat_activity` that miss sub-second lock spikes and transient stalls, leaving post-incident RCA completely blind.
+  - ✅ **Production Invariant**:
+    - Enforce **Telemetry Baseline**: configure `track_activities = on`, `track_io_timing = on`, and `track_activity_query_size >= 2048` in `postgresql.conf`.
+    - Deploy **Zombie Idle-in-Transaction Hard Fencing**: configure `idle_in_transaction_session_timeout = '5000ms'`; strictly prohibit outbound HTTP/gRPC/LLM network I/O inside open transactions.
+    - Establish **1Hz Active Session History (ASH) Ring Buffer**: continuously sample active sessions via `pg_wait_sampling` or custom background collector, recording `wait_event_type`, `wait_event`, `query_id`, and `pg_blocking_pids()`.
+    - Apply **Cary Millsap's Method R Decomposition**: decompose Average Active Sessions (AAS) into CPU, IO, Lock, LWLock, and Client; only propose secondary indexes when queries are compute- or IO-read bound ($\text{AAS}_{\text{CPU}} + \text{AAS}_{\text{IO:DataFileRead}} > 60\%$).
+    - Deploy **Lock Wait Tree Resolver**: continuously walk the `pg_blocking_pids()` DAG to isolate root blocker PIDs with bounded sub-second latency.
+
+
 
 
 

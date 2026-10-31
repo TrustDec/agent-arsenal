@@ -7554,6 +7554,251 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **PostgreSQL Wait Event Profiling, Active Session History (ASH) & Lock Tree Resolver**:
+  - Implement real-time 1Hz ASH wait event sampling, Average Active Sessions (AAS) calculation, and root lock blocker tree tracing using `jackc/pgx/v5`.
+  - Distinguish compute load (`CPU`) from off-CPU wait events (`Lock`, `IO`, `LWLock`, `Client`) and alert on zombie `idle in transaction` sessions.
+
+  ```go
+  // internal/store/wait_event_profiler.go
+  package store
+
+  import (
+  	"context"
+  	"fmt"
+  	"log/slog"
+  	"sync"
+  	"time"
+
+  	"github.com/jackc/pgx/v5/pgxpool"
+  )
+
+  type SessionSample struct {
+  	PID              int       `json:"pid"`
+  	Username         string    `json:"username"`
+  	State            string    `json:"state"`
+  	WaitEventType    string    `json:"wait_event_type"`
+  	WaitEvent        string    `json:"wait_event"`
+  	QuerySnippet     string    `json:"query_snippet"`
+  	TransactionAgeMs float64   `json:"transaction_age_ms"`
+  	BlockingPIDs     []int32   `json:"blocking_pids"`
+  	SampledAt        time.Time `json:"sampled_at"`
+  }
+
+  type AASSummary struct {
+  	TotalAAS         float64   `json:"total_aas"`
+  	CPUAAS           float64   `json:"cpu_aas"`
+  	IOAAS            float64   `json:"io_aas"`
+  	LockAAS          float64   `json:"lock_aas"`
+  	LWLockAAS        float64   `json:"lwlock_aas"`
+  	ClientZombieAAS  float64   `json:"client_zombie_aas"`
+  	PrimaryBottleneck string   `json:"primary_bottleneck"`
+  	AuditedAt        time.Time `json:"audited_at"`
+  }
+
+  type BlockingChain struct {
+  	BlockedPID       int     `json:"blocked_pid"`
+  	BlockedQuery     string  `json:"blocked_query"`
+  	WaitEvent        string  `json:"wait_event"`
+  	BlockerPID       int     `json:"blocker_pid"`
+  	BlockerQuery     string  `json:"blocker_query"`
+  	BlockerState     string  `json:"blocker_state"`
+  	BlockerTxAgeSec  float64 `json:"blocker_tx_age_sec"`
+  }
+
+  type WaitEventProfiler struct {
+  	pool     *pgxpool.Pool
+  	logger   *slog.Logger
+  	cpuCores int
+  	mu       sync.RWMutex
+  	buffer   [][]SessionSample
+  	capacity int
+  }
+
+  func NewWaitEventProfiler(pool *pgxpool.Pool, logger *slog.Logger, cpuCores int, capacity int) *WaitEventProfiler {
+  	if capacity <= 0 {
+  		capacity = 60
+  	}
+  	return &WaitEventProfiler{
+  		pool:     pool,
+  		logger:   logger,
+  		cpuCores: cpuCores,
+  		capacity: capacity,
+  		buffer:   make([][]SessionSample, 0, capacity),
+  	}
+  }
+
+  // SampleTick records a single 1-second ASH snapshot from pg_stat_activity.
+  func (p *WaitEventProfiler) SampleTick(ctx context.Context) error {
+  	reqCtx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
+  	defer cancel()
+
+  	const q = `
+  		SELECT
+  			pid,
+  			COALESCE(usename, '') AS username,
+  			state,
+  			COALESCE(wait_event_type, 'CPU') AS wait_event_type,
+  			COALESCE(wait_event, '') AS wait_event,
+  			LEFT(query, 250) AS query_snippet,
+  			EXTRACT(EPOCH FROM (clock_timestamp() - xact_start)) * 1000.0 AS transaction_age_ms,
+  			pg_blocking_pids(pid) AS blocking_pids
+  		FROM pg_stat_activity
+  		WHERE state IN ('active', 'idle in transaction')
+  		  AND pid <> pg_backend_pid();
+  	`
+
+  	rows, err := p.pool.Query(reqCtx, q)
+  	if err != nil {
+  		return fmt.Errorf("sample pg_stat_activity failed: %w", err)
+  	}
+  	defer rows.Close()
+
+  	now := time.Now()
+  	var currentTick []SessionSample
+
+  	for rows.Next() {
+  		var s SessionSample
+  		s.SampledAt = now
+  		var txAge *float64
+
+  		if err := rows.Scan(
+  			&s.PID,
+  			&s.Username,
+  			&s.State,
+  			&s.WaitEventType,
+  			&s.WaitEvent,
+  			&s.QuerySnippet,
+  			&txAge,
+  			&s.BlockingPIDs,
+  		); err != nil {
+  			return fmt.Errorf("scan sample failed: %w", err)
+  		}
+  		if txAge != nil {
+  			s.TransactionAgeMs = *txAge
+  		}
+  		currentTick = append(currentTick, s)
+  	}
+
+  	p.mu.Lock()
+  	defer p.mu.Unlock()
+
+  	if len(p.buffer) >= p.capacity {
+  		p.buffer = p.buffer[1:]
+  	}
+  	p.buffer = append(p.buffer, currentTick)
+
+  	return nil
+  }
+
+  // ComputeAAS decomposes the rolling buffer into Average Active Sessions metrics.
+  func (p *WaitEventProfiler) ComputeAAS() AASSummary {
+  	p.mu.RLock()
+  	defer p.mu.RUnlock()
+
+  	summary := AASSummary{
+  		AuditedAt: time.Now(),
+  		PrimaryBottleneck: "HEALTHY",
+  	}
+
+  	windowSize := float64(len(p.buffer))
+  	if windowSize == 0 {
+  		return summary
+  	}
+
+  	var activeCount, cpuCount, ioCount, lockCount, lwlockCount, zombieCount float64
+
+  	for _, tick := range p.buffer {
+  		for _, s := range tick {
+  			if s.State == "active" {
+  				activeCount++
+  				switch s.WaitEventType {
+  				case "CPU":
+  					cpuCount++
+  				case "IO":
+  					ioCount++
+  				case "Lock":
+  					lockCount++
+  				case "LWLock":
+  					lwlockCount++
+  				}
+  			} else if s.State == "idle in transaction" {
+  				zombieCount++
+  			}
+  		}
+  	}
+
+  	summary.TotalAAS = activeCount / windowSize
+  	summary.CPUAAS = cpuCount / windowSize
+  	summary.IOAAS = ioCount / windowSize
+  	summary.LockAAS = lockCount / windowSize
+  	summary.LWLockAAS = lwlockCount / windowSize
+  	summary.ClientZombieAAS = zombieCount / windowSize
+
+  	if summary.ClientZombieAAS > 1.5 {
+  		summary.PrimaryBottleneck = "CLIENT_ZOMBIE"
+  	} else if summary.LockAAS > 1.0 && (summary.LockAAS/summary.TotalAAS) > 0.30 {
+  		summary.PrimaryBottleneck = "LOCK_CONTENTION"
+  	} else if summary.LWLockAAS > 1.0 && (summary.LWLockAAS/summary.TotalAAS) > 0.30 {
+  		summary.PrimaryBottleneck = "LWLOCK_CONTENTION"
+  	} else if summary.IOAAS > 1.0 && (summary.IOAAS/summary.TotalAAS) > 0.40 {
+  		summary.PrimaryBottleneck = "IO_STORAGE"
+  	} else if summary.CPUAAS > float64(p.cpuCores)*0.80 {
+  		summary.PrimaryBottleneck = "CPU_SATURATION"
+  	}
+
+  	return summary
+  }
+
+  // ResolveLockBlockers returns any root blockers creating wait lock queues.
+  func (p *WaitEventProfiler) ResolveLockBlockers(ctx context.Context) ([]BlockingChain, error) {
+  	const q = `
+  		SELECT
+  			blocked_act.pid AS blocked_pid,
+  			LEFT(blocked_act.query, 150) AS blocked_query,
+  			COALESCE(blocked_act.wait_event, 'unknown') AS wait_event,
+  			blocker_act.pid AS blocker_pid,
+  			LEFT(blocker_act.query, 150) AS blocker_query,
+  			blocker_act.state AS blocker_state,
+  			EXTRACT(EPOCH FROM (clock_timestamp() - blocker_act.xact_start)) AS blocker_tx_age_sec
+  		FROM pg_stat_activity blocked_act
+  		JOIN unnest(pg_blocking_pids(blocked_act.pid)) blocker_pid ON TRUE
+  		JOIN pg_stat_activity blocker_act ON blocker_act.pid = blocker_pid
+  		WHERE blocked_act.wait_event_type = 'Lock'
+  		ORDER BY blocker_tx_age_sec DESC;
+  	`
+
+  	rows, err := p.pool.Query(ctx, q)
+  	if err != nil {
+  		return nil, fmt.Errorf("resolve lock blockers failed: %w", err)
+  	}
+  	defer rows.Close()
+
+  	var chains []BlockingChain
+  	for rows.Next() {
+  		var c BlockingChain
+  		var age *float64
+  		if err := rows.Scan(
+  			&c.BlockedPID,
+  			&c.BlockedQuery,
+  			&c.WaitEvent,
+  			&c.BlockerPID,
+  			&c.BlockerQuery,
+  			&c.BlockerState,
+  			&age,
+  		); err != nil {
+  			return nil, err
+  		}
+  		if age != nil {
+  			c.BlockerTxAgeSec = *age
+  		}
+  		chains = append(chains, c)
+  	}
+
+  	return chains, nil
+  }
+  ```
+
+
 
 
 

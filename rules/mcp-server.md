@@ -5711,5 +5711,109 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
   }
   ```
 
+- **PostgreSQL Wait Event & Active Session History (ASH) Profiler Tool**:
+  - Expose an MCP tool `profile_database_wait_events_ash` that inspects `pg_stat_activity`, computes instantaneous Average Active Sessions (AAS) decomposed across CPU vs wait types, and traces active lock blocking trees.
+
+  ```typescript
+  // src/tools/profile_wait_events_ash.ts
+  import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+  import { z } from 'zod';
+  import { Pool } from 'pg';
+
+  export function registerWaitEventAshProfileTool(server: McpServer, pool: Pool): void {
+    server.tool(
+      'profile_database_wait_events_ash',
+      'Profiles current PostgreSQL active session history, wait events (CPU, IO, Lock, LWLock, ClientRead), and lock blocking trees',
+      {
+        includeLockTree: z.boolean().optional().default(true).describe('Whether to resolve lock blocker hierarchy'),
+      },
+      async ({ includeLockTree }) => {
+        const client = await pool.connect();
+        try {
+          const activityRes = await client.query(`
+            SELECT
+              pid,
+              COALESCE(usename, '') AS username,
+              state,
+              COALESCE(wait_event_type, 'CPU') AS wait_event_type,
+              COALESCE(wait_event, '') AS wait_event,
+              LEFT(query, 120) AS query_snippet,
+              EXTRACT(EPOCH FROM (clock_timestamp() - xact_start)) AS tx_duration_sec,
+              pg_blocking_pids(pid) AS blocking_pids
+            FROM pg_stat_activity
+            WHERE state IN ('active', 'idle in transaction')
+              AND pid <> pg_backend_pid();
+          `);
+
+          let cpuCount = 0;
+          let ioCount = 0;
+          let lockCount = 0;
+          let lwlockCount = 0;
+          let clientZombieCount = 0;
+
+          for (const row of activityRes.rows) {
+            if (row.state === 'active') {
+              if (row.wait_event_type === 'CPU') cpuCount++;
+              else if (row.wait_event_type === 'IO') ioCount++;
+              else if (row.wait_event_type === 'Lock') lockCount++;
+              else if (row.wait_event_type === 'LWLock') lwlockCount++;
+            } else if (row.state === 'idle in transaction') {
+              clientZombieCount++;
+            }
+          }
+
+          let lockChains: any[] = [];
+          if (includeLockTree) {
+            const lockRes = await client.query(`
+              SELECT
+                blocked.pid AS blocked_pid,
+                LEFT(blocked.query, 100) AS blocked_query,
+                blocked.wait_event AS wait_event,
+                blocker.pid AS blocker_pid,
+                LEFT(blocker.query, 100) AS blocker_query,
+                blocker.state AS blocker_state,
+                EXTRACT(EPOCH FROM (clock_timestamp() - blocker.xact_start)) AS blocker_tx_sec
+              FROM pg_stat_activity blocked
+              JOIN unnest(pg_blocking_pids(blocked.pid)) blocker_pid ON TRUE
+              JOIN pg_stat_activity blocker ON blocker.pid = blocker_pid
+              WHERE blocked.wait_event_type = 'Lock'
+              ORDER BY blocker_tx_sec DESC;
+            `);
+            lockChains = lockRes.rows;
+          }
+
+          const findings = {
+            totalActiveSessions: activityRes.rowCount,
+            breakdown: {
+              cpu: cpuCount,
+              io: ioCount,
+              lock: lockCount,
+              lwlock: lwlockCount,
+              clientZombieIdleInTx: clientZombieCount,
+            },
+            blockingChains: lockChains,
+            recommendation:
+              clientZombieCount > 0
+                ? 'FENCE ZOMBIES: Sessions are idle in transaction holding locks. Enforce idle_in_transaction_session_timeout.'
+                : lockCount > 0
+                ? 'RESOLVE LOCK QUEUES: Sessions are waiting on Lock:relation. Do NOT add indexes; resolve transaction lock ordering.'
+                : 'CONTINUE SAMPLING: System load profile normal.',
+          };
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify(findings, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
+  }
+  ```
+
+
 
 
