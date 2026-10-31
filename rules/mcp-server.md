@@ -6252,6 +6252,140 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
   }
   ```
 
+- **MCP Tool: `db_triage_query_regressions`**:
+  - Expose a non-destructive query regression triage tool that analyzes `pg_stat_statements` differential metrics across deployments or canaries without executing `pg_stat_statements_reset()`.
+  - Computes Coefficient of Variation ($c_v$), Cache Hit Ratio, disk spillover (`temp_blks_written`), and classifies queries into Actionable Performance Defect categories.
+
+  ```typescript
+  // src/mcp/tools/dbTriageQueryRegressions.ts
+  import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+  import { z } from 'zod';
+  import { Pool } from 'pg';
+
+  export function registerDbTriageQueryRegressionsTool(server: McpServer, pool: Pool) {
+    server.tool(
+      'db_triage_query_regressions',
+      'Audits pg_stat_statements for slow queries, parameter sniffing tail variance (c_v >= 2.0), buffer cache hit deficits (< 98.5%), and work_mem temp disk spills without resetting global statistics.',
+      {
+        limit: z.number().int().min(1).max(50).default(15).describe('Maximum number of top-workload queries to return'),
+        minCalls: z.number().int().min(1).default(10).describe('Minimum call threshold to filter transient one-off queries'),
+        filterAnomaliesOnly: z.boolean().default(false).describe('When true, only returns queries breaching variance, CHR, or temp spill thresholds'),
+      },
+      async (args) => {
+        const client = await pool.connect();
+        try {
+          // Preflight: check track_io_timing
+          const ioCheck = await client.query<{ setting: string }>("SHOW track_io_timing;");
+          const ioEnabled = ioCheck.rows[0]?.setting === 'on';
+
+          // Query normalized statements
+          const res = await client.query<{
+            queryid: string;
+            query: string;
+            calls: string;
+            total_exec_time: number;
+            mean_exec_time: number;
+            stddev_exec_time: number;
+            min_exec_time: number;
+            max_exec_time: number;
+            shared_blks_hit: string;
+            shared_blks_read: string;
+            temp_blks_written: string;
+            blk_read_time: number;
+            blk_write_time: number;
+          }>(`
+            SELECT
+              queryid::text,
+              query,
+              calls::text,
+              total_exec_time,
+              mean_exec_time,
+              stddev_exec_time,
+              min_exec_time,
+              max_exec_time,
+              shared_blks_hit::text,
+              shared_blks_read::text,
+              temp_blks_written::text,
+              blk_read_time,
+              blk_write_time
+            FROM pg_stat_statements
+            WHERE query NOT LIKE '%pg_stat_statements%'
+              AND calls >= $1
+            ORDER BY total_exec_time DESC
+            LIMIT $2;
+          `, [args.minCalls, args.limit * 2]);
+
+          const triaged = res.rows.map((row) => {
+            const calls = parseInt(row.calls, 10);
+            const mean = row.mean_exec_time;
+            const stddev = row.stddev_exec_time;
+            const cv = mean > 0 ? stddev / mean : 0;
+
+            const hit = parseInt(row.shared_blks_hit, 10);
+            const read = parseInt(row.shared_blks_read, 10);
+            const totalBlks = hit + read;
+            const chr = totalBlks > 0 ? (hit / totalBlks) * 100 : 100;
+
+            const tempBlocks = parseInt(row.temp_blks_written, 10);
+            const ioTime = row.blk_read_time + row.blk_write_time;
+            const ioPercent = row.total_exec_time > 0 ? (ioTime / row.total_exec_time) * 100 : 0;
+
+            const anomalies: string[] = [];
+            if (cv >= 2.0 && mean >= 5.0) {
+              anomalies.push(`TAIL_VARIANCE_SKEW: c_v=${cv.toFixed(2)} >= 2.0 (High risk of parameter sniffing or lock contention)`);
+            }
+            if (chr < 98.5 && totalBlks > 500) {
+              anomalies.push(`BUFFER_CACHE_MISS: Cache Hit Ratio ${chr.toFixed(1)}% < 98.5% (${read} disk reads)`);
+            }
+            if (tempBlocks > 0) {
+              anomalies.push(`WORK_MEM_TEMP_SPILL: ${tempBlocks} 8KB blocks spilled to disk during sort/hash operations`);
+            }
+            if (ioPercent >= 40.0 && row.total_exec_time >= 50.0) {
+              anomalies.push(`IO_WAIT_STALL: ${ioPercent.toFixed(1)}% of query duration spent waiting on disk I/O`);
+            }
+
+            return {
+              queryId: row.queryid,
+              querySnippet: row.query.length > 120 ? `${row.query.slice(0, 120)}...` : row.query,
+              calls,
+              totalTimeMs: Math.round(row.total_exec_time),
+              meanTimeMs: Number(mean.toFixed(2)),
+              stddevMs: Number(stddev.toFixed(2)),
+              coefficientOfVariation: Number(cv.toFixed(2)),
+              cacheHitRatioPct: `${chr.toFixed(1)}%`,
+              tempSpillBlocks: tempBlocks,
+              ioWaitPercent: `${ioPercent.toFixed(1)}%`,
+              hasAnomalies: anomalies.length > 0,
+              anomalies,
+            };
+          });
+
+          const filtered = args.filterAnomaliesOnly
+            ? triaged.filter((q) => q.hasAnomalies)
+            : triaged.slice(0, args.limit);
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                status: 'success',
+                trackIoTimingEnabled: ioEnabled,
+                evaluatedCount: filtered.length,
+                anomalyCount: filtered.filter((q) => q.hasAnomalies).length,
+                queries: filtered,
+                zeroResetGuarantee: 'Baseline telemetry preserved intact. Zero destructive resets executed.',
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
+  }
+  ```
+
+
 
 
 

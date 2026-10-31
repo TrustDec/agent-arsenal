@@ -5251,6 +5251,147 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   </template>
   ```
 
+- **Vue 3 Composition API: `QueryPerformanceDiffViewer.vue` (`pg_stat_statements` Differential Canary Dashboard)**:
+  - Construct a production canary diff inspector in Vue 3 script setup + TypeScript.
+  - Automatically compares pre- and post-deployment snapshots, flagging queries with tail latency variance ($c_v \ge 2.0$), disk spillage (`temp_blks_written > 0`), or buffer cache hit degradation ($< 98.5\%$) with zero destructive database resets.
+
+  ```vue
+  <!-- src/components/telemetry/QueryPerformanceDiffViewer.vue -->
+  <script setup lang="ts">
+  import { computed } from 'vue';
+
+  export interface QueryDiffItem {
+    queryId: string;
+    querySnippet: string;
+    deltaCalls: number;
+    meanLatencyMs: number;
+    stddevMs: number;
+    cacheHitRatioPct: number;
+    tempSpillBlocks: number;
+    ioWaitPercent: number;
+    isRegressed: boolean;
+    defects: string[];
+  }
+
+  interface Props {
+    queries: QueryDiffItem[];
+    canaryTag?: string;
+  }
+
+  const props = withDefaults(defineProps<Props>(), {
+    canaryTag: 'v2.4.0-canary',
+  });
+
+  const emit = defineEmits<{
+    (e: 'inspect', queryId: string): void;
+    (e: 'rollback'): void;
+  }>();
+
+  const regressedQueries = computed(() => props.queries.filter((q) => q.isRegressed));
+  const hasRegressions = computed(() => regressedQueries.value.length > 0);
+  </script>
+
+  <template>
+    <div class="rounded-xl border border-zinc-200 bg-white p-5 shadow-xs dark:border-zinc-800 dark:bg-zinc-900">
+      <div class="flex items-center justify-between mb-4 pb-3 border-b border-zinc-100 dark:border-zinc-800">
+        <div>
+          <div class="flex items-center gap-2">
+            <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">pg_stat_statements Canary Audit</h3>
+            <span class="font-mono text-3xs px-2 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300">
+              {{ canaryTag }}
+            </span>
+          </div>
+          <p class="text-xs text-zinc-500 dark:text-zinc-400">Differential snapshot analysis (Zero-reset baseline preservation)</p>
+        </div>
+
+        <div class="flex items-center gap-3">
+          <span
+            class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium"
+            :class="hasRegressions ? 'bg-rose-50 text-rose-700 dark:bg-rose-950/40 dark:text-rose-400 border border-rose-200 dark:border-rose-900' : 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-900'"
+          >
+            <span class="w-1.5 h-1.5 rounded-full" :class="hasRegressions ? 'bg-rose-500 animate-pulse' : 'bg-emerald-500'"></span>
+            {{ hasRegressions ? `${regressedQueries.length} Regressions` : 'Baseline Verified Clean' }}
+          </span>
+
+          <button
+            v-if="hasRegressions"
+            type="button"
+            @click="emit('rollback')"
+            class="px-3 py-1 text-xs font-semibold rounded bg-rose-600 hover:bg-rose-700 text-white shadow-xs transition-colors"
+          >
+            Trigger Rollback
+          </button>
+        </div>
+      </div>
+
+      <div class="space-y-3">
+        <div
+          v-for="item in queries"
+          :key="item.queryId"
+          class="p-3.5 rounded-lg border transition-colors"
+          :class="item.isRegressed ? 'border-rose-200 bg-rose-50/30 dark:border-rose-900/50 dark:bg-rose-950/20' : 'border-zinc-100 bg-zinc-50/50 dark:border-zinc-800 dark:bg-zinc-800/30'"
+        >
+          <div class="flex items-start justify-between gap-3 mb-2">
+            <div class="flex items-center gap-2">
+              <span class="font-mono text-3xs font-medium px-1.5 py-0.5 rounded bg-zinc-200/70 dark:bg-zinc-700/60 text-zinc-700 dark:text-zinc-300">
+                {{ item.queryId.slice(0, 8) }}
+              </span>
+              <span
+                v-for="defect in item.defects"
+                :key="defect"
+                class="px-1.5 py-0.5 rounded text-3xs font-medium bg-rose-100 text-rose-800 dark:bg-rose-950/80 dark:text-rose-300"
+              >
+                {{ defect }}
+              </span>
+            </div>
+            <button
+              type="button"
+              @click="emit('inspect', item.queryId)"
+              class="text-2xs font-medium text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
+            >
+              EXPLAIN (BUFFERS)
+            </button>
+          </div>
+
+          <code class="block font-mono text-2xs text-zinc-700 dark:text-zinc-300 truncate mb-3">
+            {{ item.querySnippet }}
+          </code>
+
+          <div class="grid grid-cols-4 gap-2 text-center text-xs">
+            <div class="p-2 rounded bg-white dark:bg-zinc-900/60 border border-zinc-100 dark:border-zinc-800">
+              <div class="text-3xs text-zinc-400">MEAN LATENCY</div>
+              <div class="font-mono font-bold text-zinc-900 dark:text-zinc-100">{{ item.meanLatencyMs.toFixed(1) }}ms</div>
+            </div>
+            <div class="p-2 rounded bg-white dark:bg-zinc-900/60 border border-zinc-100 dark:border-zinc-800">
+              <div class="text-3xs text-zinc-400">STDDEV (c_v)</div>
+              <div
+                class="font-mono font-bold"
+                :class="(item.stddevMs / (item.meanLatencyMs || 1)) >= 2.0 ? 'text-amber-600 dark:text-amber-400' : 'text-zinc-700 dark:text-zinc-300'"
+              >
+                {{ (item.stddevMs / (item.meanLatencyMs || 1)).toFixed(2) }}
+              </div>
+            </div>
+            <div class="p-2 rounded bg-white dark:bg-zinc-900/60 border border-zinc-100 dark:border-zinc-800">
+              <div class="text-3xs text-zinc-400">CACHE HIT RATIO</div>
+              <div
+                class="font-mono font-bold"
+                :class="item.cacheHitRatioPct < 98.5 ? 'text-indigo-600 dark:text-indigo-400' : 'text-zinc-700 dark:text-zinc-300'"
+              >
+                {{ item.cacheHitRatioPct.toFixed(1) }}%
+              </div>
+            </div>
+            <div class="p-2 rounded bg-white dark:bg-zinc-900/60 border border-zinc-100 dark:border-zinc-800">
+              <div class="text-3xs text-zinc-400">DELTA CALLS</div>
+              <div class="font-mono font-bold text-zinc-700 dark:text-zinc-300">{{ item.deltaCalls.toLocaleString() }}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </template>
+  ```
+
+
 
 
 

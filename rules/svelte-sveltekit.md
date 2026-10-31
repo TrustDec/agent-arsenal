@@ -5954,6 +5954,135 @@ In SvelteKit administrative consoles and system diagnostics:
   </div>
   ```
 
+- **Svelte 5 Runes: `QueryLatencyVarianceMonitor.svelte` (`pg_stat_statements` Telemetry Dashboard)**:
+  - Deliver industrial database query variance observability using Svelte 5 `$state` and `$derived` runes.
+  - Automatically flags queries exhibiting Coefficient of Variation $c_v \ge 2.0$ (parameter sniffing / bimodal tail risk), Cache Hit Ratio $< 98.5\%$, and temp disk file spilling without triggering full component tree re-renders.
+
+  ```svelte
+  <!-- src/lib/components/QueryLatencyVarianceMonitor.svelte -->
+  <script lang="ts">
+    interface QueryTelemetryItem {
+      queryId: string;
+      querySnippet: string;
+      calls: number;
+      meanLatencyMs: number;
+      stddevMs: number;
+      cacheHitRatioPct: number;
+      tempSpillBlocks: number;
+      ioWaitPercent: number;
+    }
+
+    interface Props {
+      queries: QueryTelemetryItem[];
+      minCallsThreshold?: number;
+      onInspect?: (queryId: string) => void;
+    }
+
+    let { queries, minCallsThreshold = 10, onInspect }: Props = $props();
+
+    // Svelte 5 Derived: compute variance & anomaly classification
+    let analyzedQueries = $derived(
+      queries
+        .filter((q) => q.calls >= minCallsThreshold)
+        .map((q) => {
+          const cv = q.meanLatencyMs > 0 ? q.stddevMs / q.meanLatencyMs : 0;
+          const isHighVariance = cv >= 2.0 && q.meanLatencyMs >= 5.0;
+          const isCacheDeficit = q.cacheHitRatioPct < 98.5;
+          const isTempSpill = q.tempSpillBlocks > 0;
+          const isIoBound = q.ioWaitPercent >= 40.0;
+          const isSevere = isHighVariance || isTempSpill || (isCacheDeficit && q.calls > 500);
+
+          return {
+            ...q,
+            cv,
+            isHighVariance,
+            isCacheDeficit,
+            isTempSpill,
+            isIoBound,
+            isSevere,
+          };
+        })
+        .sort((a, b) => (b.isSevere ? 1 : 0) - (a.isSevere ? 1 : 0) || b.cv - a.cv)
+    );
+
+    let severeCount = $derived(analyzedQueries.filter((q) => q.isSevere).length);
+  </script>
+
+  <div class="rounded-xl border border-zinc-200 bg-white p-5 shadow-xs dark:border-zinc-800 dark:bg-zinc-900">
+    <div class="flex items-center justify-between mb-4">
+      <div>
+        <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">PostgreSQL Query Tail Variance & Cache Audit</h3>
+        <p class="text-xs text-zinc-500 dark:text-zinc-400">pg_stat_statements telemetry (c_v ≥ 2.0 flags parameter sniffing risks)</p>
+      </div>
+      <div class="flex items-center gap-2">
+        <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium {severeCount > 0 ? 'bg-rose-50 text-rose-700 dark:bg-rose-950/40 dark:text-rose-400 border border-rose-200 dark:border-rose-900' : 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-900'}">
+          <span class="w-1.5 h-1.5 rounded-full {severeCount > 0 ? 'bg-rose-500 animate-pulse' : 'bg-emerald-500'}"></span>
+          {severeCount} Anomalies
+        </span>
+      </div>
+    </div>
+
+    <div class="divide-y divide-zinc-100 dark:divide-zinc-800/80">
+      {#each analyzedQueries as item (item.queryId)}
+        <div class="py-3 flex flex-col md:flex-row md:items-center justify-between gap-3 text-xs">
+          <div class="min-w-0 flex-1">
+            <div class="flex items-center gap-2 mb-1">
+              <span class="font-mono text-3xs font-medium px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400">
+                {item.queryId.slice(0, 8)}
+              </span>
+              {#if item.isHighVariance}
+                <span class="px-1.5 py-0.5 rounded text-3xs font-semibold bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300">
+                  Tail Skew c_v={item.cv.toFixed(2)}
+                </span>
+              {/if}
+              {#if item.isTempSpill}
+                <span class="px-1.5 py-0.5 rounded text-3xs font-semibold bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-300">
+                  Temp Disk Spill ({item.tempSpillBlocks} blks)
+                </span>
+              {/if}
+              {#if item.isCacheDeficit}
+                <span class="px-1.5 py-0.5 rounded text-3xs font-semibold bg-indigo-100 text-indigo-800 dark:bg-indigo-950/60 dark:text-indigo-300">
+                  CHR {item.cacheHitRatioPct.toFixed(1)}%
+                </span>
+              {/if}
+            </div>
+            <code class="block font-mono text-2xs text-zinc-700 dark:text-zinc-300 truncate">
+              {item.querySnippet}
+            </code>
+          </div>
+
+          <div class="flex items-center gap-4 text-right shrink-0">
+            <div>
+              <div class="text-3xs text-zinc-400">MEAN LATENCY</div>
+              <div class="font-mono font-medium text-zinc-900 dark:text-zinc-100">{item.meanLatencyMs.toFixed(1)}ms</div>
+            </div>
+            <div>
+              <div class="text-3xs text-zinc-400">VARIANCE (c_v)</div>
+              <div class="font-mono font-medium {item.isHighVariance ? 'text-amber-600 dark:text-amber-400 font-bold' : 'text-zinc-700 dark:text-zinc-300'}">
+                {item.cv.toFixed(2)}
+              </div>
+            </div>
+            <div>
+              <div class="text-3xs text-zinc-400">CALLS</div>
+              <div class="font-mono text-zinc-600 dark:text-zinc-400">{item.calls.toLocaleString()}</div>
+            </div>
+            {#if onInspect}
+              <button
+                type="button"
+                onclick={() => onInspect(item.queryId)}
+                class="px-2.5 py-1 text-2xs font-medium rounded border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200 transition-colors"
+              >
+                Inspect
+              </button>
+            {/if}
+          </div>
+        </div>
+      {/each}
+    </div>
+  </div>
+  ```
+
+
 
 
 

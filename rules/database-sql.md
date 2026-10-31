@@ -3828,6 +3828,21 @@ alwaysApply: false
     - Deploy **Guaranteed Ephemeral Session Reset**: wrap all HypoPG evaluations in `defer` / `finally` blocks that execute `SELECT hypopg_reset()` to prevent cross-query or pooler connection pollution.
     - Enforce **Two-Phase Online Migration Promotion**: generate final migrations using `CREATE INDEX CONCURRENTLY IF NOT EXISTS` guarded with `SET lock_timeout = '2000ms'` and `SET statement_timeout = '2h'`.
 
+- **`pg_stat_statements` Query Fingerprinting, Coefficient of Variation Profiling & Zero-Reset Canary Regression Containment (PostgreSQL 12–17+)**:
+  - ❌ **Anti-Pattern: Global Mean Latency Masking & Destructive pg_stat_statements_reset()**:
+    - Sorting slow queries naively by `mean_exec_time` or `total_exec_time`, masking catastrophic bimodal distribution and parameter sniffing where `stddev_exec_time > 10 * mean_exec_time` (p99 latency 20x higher than mean).
+    - Executing `SELECT pg_stat_statements_reset()` globally on production or staging environments, destroying APM baselines, alerting thresholds, and DBA telemetry.
+    - Operating with `track_io_timing = off` (PostgreSQL default), causing `blk_read_time` and `blk_write_time` to register 0.0ms and misleading agents into misdiagnosing heavy disk I/O bottlenecks as CPU work.
+    - Allowing unparameterized dynamic SQL string interpolation or unbounded `WHERE id IN (...)` clause permutations, triggering continuous ring buffer LRU deallocations (`pg_stat_statements_info.dealloc`) and losing critical slow query metrics.
+    - Ignoring `temp_blks_written > 0`, allowing OLTP queries to thrash NVMe storage by spilling large merge sort / hash aggregations to disk.
+  - ✅ **Production Invariant**:
+    - Enforce **Coefficient of Variation ($c_v$) Tail Profiling**: compute $c_v = \text{stddev\_exec\_time} / \text{mean\_exec\_time}$; flag any query with $c_v \ge 2.0$ as a critical tail regression / parameter sniffing candidate requiring `plan_cache_mode = force_custom` or index stabilization.
+    - Enforce **Zero-Reset Differential Canary Snapshotting**: never wipe global statements; measure release impact via delta snapshots $\Delta M = M(t_2) - M(t_1)$ over an observation window.
+    - Enforce **Mandatory I/O Timer Instrumentation**: guarantee `track_io_timing = on` and `compute_query_id = on` (PG 14+) across all environments to isolate NVMe read/write wait stalls.
+    - Deploy **Zero Temp Spill Defense**: assert $\Delta \text{temp\_blks\_written} = 0$ on all OLTP query paths; hoist sorting to indexes or tune per-node `work_mem`.
+    - Enforce **Parameterized Bind Normalization**: eliminate variable-length dynamic IN lists via `= ANY($1::type[])` to maintain stable normalized query hashes and prevent ring buffer evictions.
+
+
 
 
 

@@ -8419,6 +8419,239 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **PostgreSQL `pg_stat_statements` Query Fingerprinting & Canary Differential Regression Verifier**:
+  - Implement zero-reset differential performance verification using `jackc/pgx/v5` across canaries, blue-green deployments, or performance integration tests.
+  - Compute normalized execution time variance ($c_v = \sigma / \mu$), cache hit ratio ($\text{CHR}$), disk I/O wait percentages, and detect parameter sniffing regressions without executing destructive global resets.
+
+  ```go
+  // internal/telemetry/pgstat_canary.go
+  package telemetry
+
+  import (
+  	"context"
+  	"fmt"
+  	"log/slog"
+  	"math"
+  	"strings"
+  	"sync"
+  	"time"
+
+  	"github.com/jackc/pgx/v5"
+  	"github.com/jackc/pgx/v5/pgxpool"
+  )
+
+  type QueryStatementTelemetry struct {
+  	QueryID          int64     `json:"query_id"`
+  	QueryText        string    `json:"query_text"`
+  	Calls            int64     `json:"calls"`
+  	TotalExecTimeMs  float64   `json:"total_exec_time_ms"`
+  	MeanExecTimeMs   float64   `json:"mean_exec_time_ms"`
+  	StddevExecTimeMs float64   `json:"stddev_exec_time_ms"`
+  	MinExecTimeMs    float64   `json:"min_exec_time_ms"`
+  	MaxExecTimeMs    float64   `json:"max_exec_time_ms"`
+  	SharedBlksHit    int64     `json:"shared_blks_hit"`
+  	SharedBlksRead   int64     `json:"shared_blks_read"`
+  	TempBlksWritten  int64     `json:"temp_blks_written"`
+  	BlkReadTimeMs    float64   `json:"blk_read_time_ms"`
+  	BlkWriteTimeMs   float64   `json:"blk_write_time_ms"`
+  	RecordedAt       time.Time `json:"recorded_at"`
+  }
+
+  type CanaryRegressionReport struct {
+  	QueryID         int64    `json:"query_id"`
+  	QueryText       string   `json:"query_text"`
+  	DeltaCalls      int64    `json:"delta_calls"`
+  	DeltaTimeMs     float64  `json:"delta_time_ms"`
+  	MeanLatencyMs   float64  `json:"mean_latency_ms"`
+  	CoefVariation   float64  `json:"coef_variation"`
+  	CacheHitRatio   float64  `json:"cache_hit_ratio"`
+  	TempSpillBlocks int64    `json:"temp_spill_blocks"`
+  	IOWaitPercent   float64  `json:"io_wait_percent"`
+  	WorkloadScore   float64  `json:"workload_score"`
+  	IsRegressed     bool     `json:"is_regressed"`
+  	Defects         []string `json:"defects,omitempty"`
+  }
+
+  type PgStatCanaryAuditor struct {
+  	pool   *pgxpool.Pool
+  	logger *slog.Logger
+  	mu     sync.RWMutex
+  }
+
+  func NewPgStatCanaryAuditor(pool *pgxpool.Pool, logger *slog.Logger) *PgStatCanaryAuditor {
+  	return &PgStatCanaryAuditor{
+  		pool:   pool,
+  		logger: logger,
+  	}
+  }
+
+  // PreflightChecks verifies required GUC parameters without altering production state.
+  func (a *PgStatCanaryAuditor) PreflightChecks(ctx context.Context) error {
+  	var trackIOTiming string
+  	if err := a.pool.QueryRow(ctx, "SHOW track_io_timing;").Scan(&trackIOTiming); err != nil {
+  		return fmt.Errorf("failed to query track_io_timing: %w", err)
+  	}
+  	if strings.ToLower(trackIOTiming) != "on" {
+  		a.logger.WarnContext(ctx, "CRITICAL: track_io_timing is DISABLED; blk_read_time will be 0.0ms")
+  	}
+  	return nil
+  }
+
+  // CaptureBaseline takes an immutable snapshot without resetting global counters.
+  func (a *PgStatCanaryAuditor) CaptureBaseline(ctx context.Context) (map[int64]QueryStatementTelemetry, error) {
+  	rows, err := a.pool.Query(ctx, `
+  		SELECT
+  			queryid,
+  			query,
+  			calls,
+  			total_exec_time,
+  			mean_exec_time,
+  			stddev_exec_time,
+  			min_exec_time,
+  			max_exec_time,
+  			shared_blks_hit,
+  			shared_blks_read,
+  			temp_blks_written,
+  			blk_read_time,
+  			blk_write_time
+  		FROM pg_stat_statements
+  		WHERE query NOT LIKE '%pg_stat_statements%'
+  		  AND query NOT LIKE '/* telemetry */%'
+  	`)
+  	if err != nil {
+  		return nil, fmt.Errorf("failed to capture pg_stat_statements snapshot: %w", err)
+  	}
+  	defer rows.Close()
+
+  	snapshot := make(map[int64]QueryStatementTelemetry)
+  	now := time.Now()
+
+  	for rows.Next() {
+  		var s QueryStatementTelemetry
+  		s.RecordedAt = now
+  		if err := rows.Scan(
+  			&s.QueryID,
+  			&s.QueryText,
+  			&s.Calls,
+  			&s.TotalExecTimeMs,
+  			&s.MeanExecTimeMs,
+  			&s.StddevExecTimeMs,
+  			&s.MinExecTimeMs,
+  			&s.MaxExecTimeMs,
+  			&s.SharedBlksHit,
+  			&s.SharedBlksRead,
+  			&s.TempBlksWritten,
+  			&s.BlkReadTimeMs,
+  			&s.BlkWriteTimeMs,
+  		); err != nil {
+  			return nil, fmt.Errorf("error scanning statement record: %w", err)
+  		}
+  		snapshot[s.QueryID] = s
+  	}
+  	return snapshot, nil
+  }
+
+  // EvaluateCanaryDiff analyzes window delta between T1 and T2 snapshots.
+  func (a *PgStatCanaryAuditor) EvaluateCanaryDiff(
+  	t1, t2 map[int64]QueryStatementTelemetry,
+  ) []CanaryRegressionReport {
+  	var reports []CanaryRegressionReport
+
+  	for qid, post := range t2 {
+  		pre, existed := t1[qid]
+
+  		var deltaCalls int64
+  		var deltaTimeMs, deltaReadTime, deltaWriteTime float64
+  		var deltaHit, deltaRead, deltaTemp int64
+
+  		if existed {
+  			deltaCalls = post.Calls - pre.Calls
+  			deltaTimeMs = math.Max(0, post.TotalExecTimeMs-pre.TotalExecTimeMs)
+  			deltaReadTime = math.Max(0, post.BlkReadTimeMs-pre.BlkReadTimeMs)
+  			deltaWriteTime = math.Max(0, post.BlkWriteTimeMs-pre.BlkWriteTimeMs)
+  			deltaHit = post.SharedBlksHit - pre.SharedBlksHit
+  			deltaRead = post.SharedBlksRead - pre.SharedBlksRead
+  			deltaTemp = post.TempBlksWritten - pre.TempBlksWritten
+  		} else {
+  			deltaCalls = post.Calls
+  			deltaTimeMs = post.TotalExecTimeMs
+  			deltaReadTime = post.BlkReadTimeMs
+  			deltaWriteTime = post.BlkWriteTimeMs
+  			deltaHit = post.SharedBlksHit
+  			deltaRead = post.SharedBlksRead
+  			deltaTemp = post.TempBlksWritten
+  		}
+
+  		if deltaCalls <= 0 {
+  			continue
+  		}
+
+  		meanLatencyMs := deltaTimeMs / float64(deltaCalls)
+  		cv := 0.0
+  		if meanLatencyMs > 0 {
+  			cv = post.StddevExecTimeMs / meanLatencyMs
+  		}
+
+  		totalBlocks := deltaHit + deltaRead
+  		chr := 1.0
+  		if totalBlocks > 0 {
+  			chr = float64(deltaHit) / float64(totalBlocks)
+  		}
+
+  		ioTotalTime := deltaReadTime + deltaWriteTime
+  		ioPercent := 0.0
+  		if deltaTimeMs > 0 {
+  			ioPercent = (ioTotalTime / deltaTimeMs) * 100.0
+  		}
+
+  		// Total Workload Impact Score
+  		ioPenalty := 0.0
+  		if deltaTimeMs > 0 {
+  			ioPenalty = ioTotalTime / deltaTimeMs
+  		}
+  		tempPenalty := 0.0
+  		if totalBlocks > 0 {
+  			tempPenalty = float64(deltaTemp) / float64(totalBlocks+1)
+  		} else if deltaTemp > 0 {
+  			tempPenalty = 1.0
+  		}
+  		workloadScore := deltaTimeMs * (1.0 + 2.5*ioPenalty + 5.0*tempPenalty)
+
+  		var defects []string
+  		if deltaTemp > 0 {
+  			defects = append(defects, fmt.Sprintf("TEMP_DISK_SPILL: %d blocks written to disk (work_mem exceeded)", deltaTemp))
+  		}
+  		if cv >= 2.0 && meanLatencyMs >= 5.0 {
+  			defects = append(defects, fmt.Sprintf("TAIL_LATENCY_VARIANCE: c_v=%.2f >= 2.0 (Parameter sniffing or lock queue)", cv))
+  		}
+  		if chr < 0.985 && totalBlocks > 500 {
+  			defects = append(defects, fmt.Sprintf("CACHE_HIT_DEFICIT: CHR=%.1f%% < 98.5%% (%d buffer misses)", chr*100, deltaRead))
+  		}
+  		if ioPercent >= 50.0 && deltaTimeMs >= 100.0 {
+  			defects = append(defects, fmt.Sprintf("DISK_IO_STALL: %.1f%% of query duration spent in I/O wait", ioPercent))
+  		}
+
+  		reports = append(reports, CanaryRegressionReport{
+  			QueryID:         qid,
+  			QueryText:       post.QueryText,
+  			DeltaCalls:      deltaCalls,
+  			DeltaTimeMs:     deltaTimeMs,
+  			MeanLatencyMs:   meanLatencyMs,
+  			CoefVariation:   cv,
+  			CacheHitRatio:   chr,
+  			TempSpillBlocks: deltaTemp,
+  			IOWaitPercent:   ioPercent,
+  			WorkloadScore:   workloadScore,
+  			IsRegressed:     len(defects) > 0,
+  			Defects:         defects,
+  		})
+  	}
+
+  	return reports
+  }
+  ```
+
+
 
 
 
