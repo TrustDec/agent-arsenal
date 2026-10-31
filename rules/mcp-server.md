@@ -4254,5 +4254,77 @@ alwaysApply: false
           };
         }
       );
+
+      // Audit LATERAL Join and Correlated Subquery Invariants Tool
+      server.tool(
+        'audit_lateral_join_invariants',
+        'Audits SQL query patterns for Top-K window function anti-patterns, correlated scalar subquery proliferation, and LATERAL join null-safety',
+        {
+          sqlQuery: z.string().describe('The SQL query string to audit for LATERAL patterns'),
+          estimatedParentRows: z.number().default(1000).describe('Estimated outer table row count'),
+          estimatedChildRows: z.number().default(1000000).describe('Estimated inner child table row count'),
+        },
+        async ({ sqlQuery, estimatedParentRows, estimatedChildRows }) => {
+          const warnings: string[] = [];
+          const recommendations: string[] = [];
+          const suggestedIndexes: string[] = [];
+          const normalized = sqlQuery.trim().replace(/\s+/g, ' ');
+
+          // 1. Detect Window Function Partition Top-K Anti-Pattern
+          const windowTopK = /ROW_NUMBER\s*\(\s*\)\s*OVER\s*\(\s*PARTITION\s+BY\s+([a-zA-Z0-9_.,\s]+)\s+ORDER\s+BY\s+([a-zA-Z0-9_.,\s]+)\)/i;
+          const filterRank = /WHERE[\s\S]*?\brn\s*(<=|<|=)\s*(\d+)/i;
+
+          if (windowTopK.test(normalized) && filterRank.test(normalized)) {
+            const match = normalized.match(windowTopK);
+            const partKeys = match ? match[1].trim() : 'partition_key';
+            const orderKeys = match ? match[2].trim() : 'order_key';
+
+            warnings.push(
+              `WINDOW_FUNCTION_TOP_K_INEFFICIENCY: Query computes ROW_NUMBER() over entire partitioned relation (${estimatedChildRows} rows). Incurs O(N log N) sort and disk temp spill.`
+            );
+            recommendations.push(
+              `Refactor to CROSS JOIN LATERAL or LEFT JOIN LATERAL with ORDER BY ${orderKeys} LIMIT K. Add composite index on (${partKeys}, ${orderKeys}).`
+            );
+            suggestedIndexes.push(`CREATE INDEX idx_child_lateral_seek ON child_table (${partKeys}, ${orderKeys});`);
+          }
+
+          // 2. Correlated scalar subquery proliferation in SELECT
+          const projectionMatch = normalized.match(/SELECT\b([\s\S]*?)\bFROM\b/i);
+          if (projectionMatch) {
+            const projection = projectionMatch[1];
+            const scalarCount = (projection.match(/\(\s*SELECT\b[\s\S]*?\bFROM\b/gi) || []).length;
+            if (scalarCount >= 2) {
+              warnings.push(
+                `SCALAR_SUBQUERY_PROLIFERATION: Detected ${scalarCount} correlated scalar subqueries in SELECT projection. Multiplies index seeks by ${scalarCount}x per parent row (${estimatedParentRows * scalarCount} total seeks).`
+              );
+              recommendations.push(
+                'Consolidate independent scalar subqueries into a single LEFT JOIN LATERAL clause computing all aggregates in one pass.'
+              );
+            }
+          }
+
+          // 3. CROSS JOIN LATERAL null loss risk
+          if (/\bCROSS\s+JOIN\s+LATERAL\b/i.test(normalized) && !/\bWITH\s+ORDINALITY\b/i.test(normalized)) {
+            warnings.push(
+              'CROSS_JOIN_LATERAL_NULL_LOSS: CROSS JOIN LATERAL drops parent entities with 0 matching child records. If parent entities must survive, use LEFT JOIN LATERAL ... ON true.'
+            );
+            recommendations.push('Replace CROSS JOIN LATERAL with LEFT JOIN LATERAL ... ON true.');
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                hasWarnings: warnings.length > 0,
+                warningsCount: warnings.length,
+                warnings,
+                recommendations,
+                suggestedIndexes,
+                status: warnings.length === 0 ? 'OPTIMAL' : 'REMEDIATION_REQUIRED',
+              }, null, 2),
+            }],
+          };
+        }
+      );
     }
     ```

@@ -3488,4 +3488,37 @@ alwaysApply: false
     TRUNCATE TABLE staging_sensor_metrics;
     ```
 
+- **LATERAL Joins, Per-Group Top-K Optimization & Correlated Subquery Consolidation**:
+  - ❌ **Anti-Pattern: Full-Table Window Partition Scans & Scalar Subquery Proliferation**:
+    - Using `ROW_NUMBER() OVER (PARTITION BY group_id ORDER BY created_at DESC)` in a CTE or subquery to fetch Top-$K$ items per category or user, forcing the database engine to sequence-scan and sort 50 million rows ($O(N \log N)$) and spill to disk temp files when only 3 rows per group are needed.
+    - Proliferating multiple independent scalar subqueries `(SELECT count(*) FROM orders WHERE customer_id = c.id)`, `(SELECT max(total) FROM orders WHERE customer_id = c.id)` inside the `SELECT` projection, multiplying index seeks by $M \times N$ and thrashing `shared_buffers`.
+    - Using `CROSS JOIN LATERAL` when parent entities may have zero matching children, causing newly registered users or empty categories to vanish silently from query results.
+    - Omitting the composite index on the child table `(foreign_key, sort_column DESC)`, causing the query planner to execute a sequential scan of the child table for every outer row ($O(|R| \cdot |S|)$ nested loop disaster).
+  - ✅ **Production Invariant**:
+    - Mandate `CROSS JOIN LATERAL` or `LEFT JOIN LATERAL` with `ORDER BY child.sort_col DESC LIMIT K` paired with a composite B-Tree index on `(foreign_key, sort_col DESC)`. The executor performs a Nested Loop with Index Scan seeking directly to the $K$ tuples per parent, reducing computational complexity from $O(N \log N)$ to $O(G \cdot K \log N)$ and query latency by over $4,000\times$.
+    - Mandate `LEFT JOIN LATERAL ... ON true` when parent rows must survive zero matching child rows.
+    - Consolidate multiple correlated scalar subqueries into a single `LEFT JOIN LATERAL` computing all counts, sums, and latest child attributes in a single pass.
+    - Use `CROSS JOIN LATERAL (VALUES (...)) AS calc(val)` to factor expensive mathematical formulas or JSON extractions once per row and reuse the alias across `WHERE`, `SELECT`, and `ORDER BY`.
+
+    ```sql
+    -- High-Performance Top-3 Items Per Category with Zero Full-Table Sort
+    -- Prerequisite Index: CREATE INDEX idx_products_cat_sales ON products (category_id, sales_count DESC) WHERE is_active = true;
+    SELECT
+        c.id AS category_id,
+        c.name AS category_name,
+        top_p.id AS product_id,
+        top_p.name AS product_name,
+        top_p.sales_count
+    FROM categories c
+    LEFT JOIN LATERAL (
+        SELECT p.id, p.name, p.sales_count
+        FROM products p
+        WHERE p.category_id = c.id AND p.is_active = true
+        ORDER BY p.sales_count DESC
+        LIMIT 3
+    ) top_p ON true
+    WHERE c.is_visible = true;
+    ```
+
+
 

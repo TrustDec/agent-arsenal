@@ -3737,4 +3737,47 @@ alwaysApply: false
         client.release();
       }
     });
+
+    // server/api/v1/categories/top-products.get.ts - Per-Group Top-K Lateral Endpoint
+    // Enforces LEFT JOIN LATERAL seek with clamped limit and zero full-table window sort
+    export default defineEventHandler(async (event) => {
+      const tenantId = event.context.auth?.tenantId;
+      if (!tenantId) {
+        throw createError({ statusCode: 401, message: 'Unauthorized' });
+      }
+
+      const query = getQuery(event);
+      const limitParam = parseInt(query.limit as string || '3', 10);
+      const topK = Math.max(1, Math.min(limitParam, 20));
+
+      const client = await useDatabase().connect();
+      try {
+        const result = await client.query(
+          `SELECT
+             c.id AS category_id,
+             c.name AS category_name,
+             top_p.id AS product_id,
+             top_p.name AS product_name,
+             top_p.price,
+             top_p.sales_count
+           FROM categories c
+           LEFT JOIN LATERAL (
+             SELECT p.id, p.name, p.price, p.sales_count
+             FROM products p
+             WHERE p.category_id = c.id AND p.is_active = true
+             ORDER BY p.sales_count DESC
+             LIMIT $2
+           ) top_p ON true
+           WHERE c.tenant_id = $1 AND c.is_visible = true
+           ORDER BY c.name ASC, top_p.sales_count DESC NULLS LAST;`,
+          [tenantId, topK]
+        );
+
+        return { categories: result.rows };
+      } catch (err: any) {
+        throw createError({ statusCode: 500, message: `Failed querying category top products: ${err.message}` });
+      } finally {
+        client.release();
+      }
+    });
     ```

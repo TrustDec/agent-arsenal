@@ -5791,4 +5791,77 @@ func BulkStreamCopyIngest(
 
 	return rowsCopied, nil
 }
+
+// CategoryTopProduct models a category paired with its top-ranked active product.
+type CategoryTopProduct struct {
+	CategoryID   string
+	CategoryName string
+	ProductID    *string
+	ProductName  *string
+	Price        *float64
+	SalesCount   *int64
+}
+
+// FetchCategoriesTopProductsLateral executes an index-driven LEFT JOIN LATERAL query
+// using jackc/pgx/v5 to retrieve top K products per category in a single round-trip,
+// completely avoiding full-table window function scans and memory spills.
+func FetchCategoriesTopProductsLateral(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	tenantID string,
+	topK int,
+) ([]CategoryTopProduct, error) {
+	if topK <= 0 || topK > 50 {
+		topK = 3 // Enforce safety bound against unbounded memory allocation
+	}
+
+	// Invariant: Requires composite index on products (category_id, sales_count DESC) WHERE is_active = true
+	const querySQL = `
+		SELECT
+			c.id AS category_id,
+			c.name AS category_name,
+			p.id AS product_id,
+			p.name AS product_name,
+			p.price AS price,
+			p.sales_count AS sales_count
+		FROM categories c
+		LEFT JOIN LATERAL (
+			SELECT prod.id, prod.name, prod.price, prod.sales_count
+			FROM products prod
+			WHERE prod.category_id = c.id AND prod.is_active = true
+			ORDER BY prod.sales_count DESC
+			LIMIT $2
+		) p ON true
+		WHERE c.tenant_id = $1 AND c.is_visible = true
+		ORDER BY c.name ASC, p.sales_count DESC NULLS LAST;
+	`
+
+	rows, err := pool.Query(ctx, querySQL, tenantID, topK)
+	if err != nil {
+		return nil, fmt.Errorf("failed executing lateral query: %w", err)
+	}
+	defer rows.Close()
+
+	var results []CategoryTopProduct
+	for rows.Next() {
+		var item CategoryTopProduct
+		if err := rows.Scan(
+			&item.CategoryID,
+			&item.CategoryName,
+			&item.ProductID,
+			&item.ProductName,
+			&item.Price,
+			&item.SalesCount,
+		); err != nil {
+			return nil, fmt.Errorf("failed scanning category top product: %w", err)
+		}
+		results = append(results, item)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error during row iteration: %w", err)
+	}
+
+	return results, nil
+}
 ```

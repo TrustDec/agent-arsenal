@@ -4610,5 +4610,40 @@ alwaysApply: false
           return fail(500, { message: `Bulk import failed: ${err.message}` });
         }
       },
+
+      // Per-Category Top-K products loader action
+      // Enforces LEFT JOIN LATERAL index-driven seek with null preservation and clamped limit
+      loadCategoryTopProducts: async ({ url, locals }) => {
+        const tenantId = locals.tenantId;
+        const requestedLimit = parseInt(url.searchParams.get('limit') || '3', 10);
+        const topK = Math.max(1, Math.min(requestedLimit, 20));
+
+        const lateralQuery = `
+          SELECT
+            c.id AS category_id,
+            c.name AS category_name,
+            top_p.id AS product_id,
+            top_p.name AS product_name,
+            top_p.price,
+            top_p.sales_count
+          FROM categories c
+          LEFT JOIN LATERAL (
+            SELECT p.id, p.name, p.price, p.sales_count
+            FROM products p
+            WHERE p.category_id = c.id AND p.is_active = true
+            ORDER BY p.sales_count DESC
+            LIMIT $2
+          ) top_p ON true
+          WHERE c.tenant_id = $1 AND c.is_visible = true
+          ORDER BY c.name ASC, top_p.sales_count DESC NULLS LAST;
+        `;
+
+        try {
+          const rows = await locals.db.any(lateralQuery, [tenantId, topK]);
+          return { categoriesWithProducts: rows };
+        } catch (err: any) {
+          return fail(500, { message: `Failed fetching category top products: ${err.message}` });
+        }
+      },
     };
     ```
