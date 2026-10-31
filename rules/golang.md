@@ -8231,6 +8231,194 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **PostgreSQL HypoPG Virtual Index Advisor & Cost Differential Evaluator**:
+  - Implement non-destructive query optimization using `jackc/pgx/v5` with connection lease isolation and guaranteed `SELECT hypopg_reset()` deferred cleanup.
+  - Evaluate candidate B-Tree index hypotheses, verify query planner adoption, calculate cost reduction ratio $\Delta \text{Cost} \ge 60\%$, and project physical index footprints without emitting WAL or acquiring table locks.
+
+  ```go
+  // internal/store/hypopg_advisor.go
+  package store
+
+  import (
+  	"context"
+  	"encoding/json"
+  	"fmt"
+  	"log/slog"
+  	"strings"
+
+  	"github.com/jackc/pgx/v5"
+  	"github.com/jackc/pgx/v5/pgxpool"
+  )
+
+  type HypoIndexCandidate struct {
+  	TableName      string   `json:"table_name"`
+  	Columns        []string `json:"columns"`
+  	IncludeColumns []string `json:"include_columns,omitempty"`
+  	WhereClause    string   `json:"where_clause,omitempty"`
+  }
+
+  type HypoEvaluationReport struct {
+  	Candidate         HypoIndexCandidate `json:"candidate"`
+  	HypoIndexOID      uint32             `json:"hypo_index_oid"`
+  	HypoIndexName     string             `json:"hypo_index_name"`
+  	BaselineTotalCost float64            `json:"baseline_total_cost"`
+  	OptimizedTotalCost float64           `json:"optimized_total_cost"`
+  	CostReductionPct  float64            `json:"cost_reduction_pct"`
+  	EstimatedSizeBytes int64             `json:"estimated_size_bytes"`
+  	IsAdopted         bool               `json:"is_adopted"`
+  	IsApproved        bool               `json:"is_approved"`
+  	RejectionReason   string             `json:"rejection_reason,omitempty"`
+  }
+
+  type explainJSONPlan struct {
+  	Plan struct {
+  		NodeType  string            `json:"Node Type"`
+  		IndexName string            `json:"Index Name,omitempty"`
+  		TotalCost float64           `json:"Total Cost"`
+  		Plans     []explainJSONPlan `json:"Plans,omitempty"`
+  	} `json:"Plan"`
+  }
+
+  type HypoPGIndexAdvisor struct {
+  	pool   *pgxpool.Pool
+  	logger *slog.Logger
+  }
+
+  func NewHypoPGIndexAdvisor(pool *pgxpool.Pool, logger *slog.Logger) *HypoPGIndexAdvisor {
+  	return &HypoPGIndexAdvisor{pool: pool, logger: logger}
+  }
+
+  // EvaluateCandidate evaluates an index proposal non-destructively in an isolated session.
+  // It guarantees that SELECT hypopg_reset() runs upon completion to prevent connection pollution.
+  func (a *HypoPGIndexAdvisor) EvaluateCandidate(
+  	ctx context.Context,
+  	targetQuery string,
+  	candidate HypoIndexCandidate,
+  ) (*HypoEvaluationReport, error) {
+  	conn, err := a.pool.Acquire(ctx)
+  	if err != nil {
+  		return nil, fmt.Errorf("failed to acquire dedicated connection: %w", err)
+  	}
+  	defer conn.Release()
+
+  	// Invariant: Guaranteed deferred reset of hypothetical indexes
+  	defer func() {
+  		if _, resetErr := conn.Exec(ctx, "SELECT hypopg_reset()"); resetErr != nil {
+  			a.logger.Error("failed to reset hypopg session", "error", resetErr)
+  		}
+  	}()
+
+  	// Step 1: Pre-clean and verify hypopg availability
+  	if _, err := conn.Exec(ctx, "SELECT hypopg_reset()"); err != nil {
+  		return nil, fmt.Errorf("failed to reset hypopg session: %w", err)
+  	}
+
+  	// Step 2: Capture baseline query cost
+  	baselineCost, _, err := a.runExplainCost(ctx, conn.Conn(), targetQuery)
+  	if err != nil {
+  		return nil, fmt.Errorf("baseline explain failed: %w", err)
+  	}
+
+  	// Step 3: Build HypoPG DDL
+  	var quotedCols []string
+  	for _, c := range candidate.Columns {
+  		quotedCols = append(quotedCols, fmt.Sprintf("%q", c))
+  	}
+  	ddl := fmt.Sprintf("CREATE INDEX ON %q (%s)", candidate.TableName, strings.Join(quotedCols, ", "))
+  	if len(candidate.IncludeColumns) > 0 {
+  		var quotedInc []string
+  		for _, inc := range candidate.IncludeColumns {
+  			quotedInc = append(quotedInc, fmt.Sprintf("%q", inc))
+  		}
+  		ddl += fmt.Sprintf(" INCLUDE (%s)", strings.Join(quotedInc, ", "))
+  	}
+  	if candidate.WhereClause != "" {
+  		ddl += fmt.Sprintf(" WHERE %s", candidate.WhereClause)
+  	}
+
+  	// Step 4: Create hypothetical index in process relcache
+  	var hypoOID uint32
+  	var hypoName string
+  	createSQL := "SELECT indexrelid, indexname FROM hypopg_create_index($1)"
+  	if err := conn.QueryRow(ctx, createSQL, ddl).Scan(&hypoOID, &hypoName); err != nil {
+  		return nil, fmt.Errorf("hypopg_create_index failed: %w", err)
+  	}
+
+  	// Step 5: Query estimated size
+  	var estSizeBytes int64
+  	sizeSQL := "SELECT hypopg_relation_size($1)"
+  	if err := conn.QueryRow(ctx, sizeSQL, hypoOID).Scan(&estSizeBytes); err != nil {
+  		return nil, fmt.Errorf("hypopg_relation_size failed: %w", err)
+  	}
+
+  	// Step 6: Capture optimized cost with virtual index active
+  	optimizedCost, usedHypo, err := a.runExplainCost(ctx, conn.Conn(), targetQuery)
+  	if err != nil {
+  		return nil, fmt.Errorf("hypo explain failed: %w", err)
+  	}
+
+  	report := &HypoEvaluationReport{
+  		Candidate:          candidate,
+  		HypoIndexOID:       hypoOID,
+  		HypoIndexName:      hypoName,
+  		BaselineTotalCost:  baselineCost,
+  		OptimizedTotalCost: optimizedCost,
+  		EstimatedSizeBytes: estSizeBytes,
+  		IsAdopted:          usedHypo,
+  	}
+
+  	if baselineCost > 0 {
+  		report.CostReductionPct = ((baselineCost - optimizedCost) / baselineCost) * 100.0
+  	}
+
+  	// Step 7: Check acceptance invariants (Adoption & >= 60% cost reduction)
+  	if !usedHypo {
+  		report.RejectionReason = "Planner did not adopt hypothetical index; query plan remained unchanged"
+  	} else if report.CostReductionPct < 60.0 {
+  		report.RejectionReason = fmt.Sprintf("Cost reduction (%.1f%%) fell below 60.0%% threshold", report.CostReductionPct)
+  	} else {
+  		report.IsApproved = true
+  	}
+
+  	return report, nil
+  }
+
+  func (a *HypoPGIndexAdvisor) runExplainCost(
+  	ctx context.Context,
+  	conn *pgx.Conn,
+  	query string,
+  ) (totalCost float64, usesHypo bool, err error) {
+  	explainSQL := fmt.Sprintf("EXPLAIN (FORMAT JSON, COSTS ON) %s", query)
+  	var rawJSON []byte
+  	if err := conn.QueryRow(ctx, explainSQL).Scan(&rawJSON); err != nil {
+  		return 0, false, err
+  	}
+
+  	var rootPlans []explainJSONPlan
+  	if err := json.Unmarshal(rawJSON, &rootPlans); err != nil || len(rootPlans) == 0 {
+  		return 0, false, fmt.Errorf("invalid explain plan json: %w", err)
+  	}
+
+  	root := rootPlans[0].Plan
+  	totalCost = root.TotalCost
+
+  	var walkPlan func(p explainJSONPlan)
+  	walkPlan = func(p explainJSONPlan) {
+  		if strings.Contains(p.Plan.IndexName, "hypo") || strings.Contains(p.Plan.NodeType, "Index") {
+  			if strings.Contains(p.Plan.IndexName, "hypo") {
+  				usesHypo = true
+  			}
+  		}
+  		for _, child := range p.Plan.Plans {
+  			walkPlan(child)
+  		}
+  	}
+  	walkPlan(rootPlans[0])
+
+  	return totalCost, usesHypo, nil
+  }
+  ```
+
 
 
 

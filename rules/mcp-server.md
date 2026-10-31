@@ -6142,6 +6142,117 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
   }
   ```
 
+- **PostgreSQL HypoPG Virtual Index Simulation MCP Tool**:
+  - Expose a non-destructive What-If indexing tool allowing agents to evaluate candidate B-Tree index hypotheses against slow queries using `hypopg`.
+  - Enforce strict `try ... finally` execution of `SELECT hypopg_reset()`, return planner adoption status, cost reduction ratio, and projected physical footprint without taking table locks.
+
+  ```ts
+  // src/tools/hypopgAdvisorTool.ts
+  import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+  import { z } from 'zod';
+  import { Pool } from 'pg';
+
+  export function registerHypoPGAdvisorTool(server: McpServer, pool: Pool) {
+    server.tool(
+      'database_hypopg_evaluate_index',
+      'Non-destructively evaluate an index hypothesis on PostgreSQL using HypoPG. Computes baseline vs hypothetical plan cost, verifies whether the optimizer picks the index, and estimates physical footprint without creating real disk pages.',
+      {
+        tableName: z.string().describe('Target table name (e.g., "orders")'),
+        columns: z.array(z.string()).min(1).describe('Ordered list of columns for candidate index'),
+        includeColumns: z.array(z.string()).optional().describe('Optional non-key INCLUDE columns for covering index'),
+        targetQuery: z.string().describe('The slow SELECT query to optimize'),
+        queryParams: z.array(z.any()).optional().default([]).describe('Parameterized arguments for the query'),
+      },
+      async (args) => {
+        const client = await pool.connect();
+        try {
+          // Pre-flight: Reset any lingering hypothetical indexes
+          await client.query('SELECT hypopg_reset()');
+
+          // 1. Baseline Cost
+          const baseRes = await client.query(
+            `EXPLAIN (FORMAT JSON, COSTS ON) ${args.targetQuery}`,
+            args.queryParams
+          );
+          const baseCost = Number(baseRes.rows[0]['QUERY PLAN'][0]['Plan']['Total Cost']);
+
+          // 2. Build and inject virtual index
+          const colsQuoted = args.columns.map((c) => `"${c}"`).join(', ');
+          let ddl = `CREATE INDEX ON "${args.tableName}" (${colsQuoted})`;
+          if (args.includeColumns && args.includeColumns.length > 0) {
+            ddl += ` INCLUDE (${args.includeColumns.map((c) => `"${c}"`).join(', ')})`;
+          }
+
+          const createRes = await client.query(
+            'SELECT indexrelid, indexname FROM hypopg_create_index($1)',
+            [ddl]
+          );
+          const hypoOid = Number(createRes.rows[0].indexrelid);
+          const hypoName = String(createRes.rows[0].indexname);
+
+          // 3. Projected Size
+          const sizeRes = await client.query(
+            'SELECT hypopg_relation_size($1) AS bytes, pg_size_pretty(hypopg_relation_size($1)) AS pretty',
+            [hypoOid]
+          );
+          const estBytes = Number(sizeRes.rows[0].bytes);
+          const estPretty = String(sizeRes.rows[0].pretty);
+
+          // 4. Optimized Cost
+          const optRes = await client.query(
+            `EXPLAIN (FORMAT JSON, COSTS ON) ${args.targetQuery}`,
+            args.queryParams
+          );
+          const rootPlan = optRes.rows[0]['QUERY PLAN'][0]['Plan'];
+          const optCost = Number(rootPlan['Total Cost']);
+
+          // 5. Check if hypo index was adopted
+          const planStr = JSON.stringify(rootPlan);
+          const isAdopted = planStr.includes('hypo') || planStr.includes(String(hypoOid));
+          const reductionRatio = baseCost > 0 ? (baseCost - optCost) / baseCost : 0;
+
+          const isApproved = isAdopted && reductionRatio >= 0.60;
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                tableName: args.tableName,
+                candidateColumns: args.columns,
+                hypoIndexOID: hypoOid,
+                hypoIndexName: hypoName,
+                baselineTotalCost: baseCost,
+                optimizedTotalCost: optCost,
+                costReductionPct: `${(reductionRatio * 100).toFixed(1)}%`,
+                estimatedSizeBytes: estBytes,
+                estimatedSizePretty: estPretty,
+                isAdoptedByPlanner: isAdopted,
+                isApprovedForProduction: isApproved,
+                safeMigrationDDL: isApproved
+                  ? `SET statement_timeout = '2h'; SET lock_timeout = '2000ms'; CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_${args.tableName}_${args.columns.join('_')} ON ${args.tableName} (${colsQuoted});`
+                  : null,
+                recommendation: isApproved
+                  ? 'Strong performance improvement (>=60% cost reduction). Recommended for deployment.'
+                  : !isAdopted
+                    ? 'Planner chose not to use this index. Check column cardinality or leftmost prefix alignment.'
+                    : 'Insufficient cost reduction (<60%). Discard candidate.',
+              }, null, 2),
+            }],
+          };
+        } finally {
+          // Guaranteed reset of session memory
+          try {
+            await client.query('SELECT hypopg_reset()');
+          } finally {
+            client.release();
+          }
+        }
+      }
+    );
+  }
+  ```
+
+
 
 
 

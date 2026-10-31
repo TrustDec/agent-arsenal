@@ -5161,6 +5161,97 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   </template>
   ```
 
+- **Vue 3 / Nuxt Composition API HypoPG Virtual Index Advisor & Cost Inspector**:
+  - Implement a real-time What-If index recommendation inspector visualizing baseline vs hypothetical planner costs, adoption status, and physical size estimates.
+
+  ```vue
+  <!-- components/database/HypoPGAdvisorResultCard.vue -->
+  <script setup lang="ts">
+  import { computed } from 'vue';
+
+  interface HypoEvaluation {
+    tableName: string;
+    columns: string[];
+    baselineCost: number;
+    hypoCost: number;
+    costReductionPct: number;
+    estimatedSizePretty: string;
+    isAdopted: boolean;
+    isApproved: boolean;
+    suggestedMigrationDDL?: string;
+  }
+
+  const props = defineProps<{
+    evaluation: HypoEvaluation;
+  }>();
+
+  const isApproved = computed(() => props.evaluation.isApproved);
+  const isAdopted = computed(() => props.evaluation.isAdopted);
+
+  const badgeClass = computed(() => {
+    if (isApproved.value) {
+      return 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800';
+    }
+    if (!isAdopted.value) {
+      return 'bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400 border-zinc-200 dark:border-zinc-700';
+    }
+    return 'bg-amber-50 text-amber-700 dark:bg-amber-950/60 dark:text-amber-400 border-amber-200 dark:border-amber-800';
+  });
+
+  const badgeText = computed(() => {
+    if (isApproved.value) return 'APPROVED (>=60% BOOST)';
+    if (!isAdopted.value) return 'REJECTED BY PLANNER';
+    return 'SUB-OPTIMAL (<60%)';
+  });
+  </script>
+
+  <template>
+    <div class="rounded-xl border p-4 bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 shadow-xs">
+      <div class="flex items-center justify-between pb-3 border-b border-zinc-100 dark:border-zinc-800">
+        <div>
+          <span class="text-2xs font-semibold text-zinc-400 tracking-wider uppercase">HypoPG Virtual Index</span>
+          <h4 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100 font-mono mt-0.5">
+            {{ evaluation.tableName }} ({{ evaluation.columns.join(', ') }})
+          </h4>
+        </div>
+        <span class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold border" :class="badgeClass">
+          {{ badgeText }}
+        </span>
+      </div>
+
+      <div class="grid grid-cols-4 gap-3 my-3 text-xs">
+        <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+          <div class="text-zinc-400 text-2xs mb-0.5">BASELINE COST</div>
+          <div class="font-mono font-bold text-zinc-900 dark:text-zinc-100">{{ evaluation.baselineCost.toFixed(1) }}</div>
+        </div>
+        <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+          <div class="text-zinc-400 text-2xs mb-0.5">VIRTUAL COST</div>
+          <div class="font-mono font-bold text-zinc-900 dark:text-zinc-100">{{ evaluation.hypoCost.toFixed(1) }}</div>
+        </div>
+        <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+          <div class="text-zinc-400 text-2xs mb-0.5">COST REDUCTION</div>
+          <div
+            class="font-mono font-bold"
+            :class="evaluation.costReductionPct >= 60 ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-400'"
+          >
+            {{ evaluation.costReductionPct.toFixed(1) }}%
+          </div>
+        </div>
+        <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+          <div class="text-zinc-400 text-2xs mb-0.5">EST. FOOTPRINT</div>
+          <div class="font-mono font-bold text-zinc-900 dark:text-zinc-100">{{ evaluation.estimatedSizePretty }}</div>
+        </div>
+      </div>
+
+      <div v-if="evaluation.suggestedMigrationDDL && isApproved" class="mt-3 pt-3 border-t border-zinc-100 dark:border-zinc-800">
+        <div class="text-2xs font-semibold text-zinc-400 uppercase tracking-wider mb-1">Safe Online Migration</div>
+        <pre class="p-2 rounded bg-zinc-900 text-zinc-200 text-2xs font-mono overflow-x-auto selection:bg-zinc-700">{{ evaluation.suggestedMigrationDDL }}</pre>
+      </div>
+    </div>
+  </template>
+  ```
+
+
 
 
 

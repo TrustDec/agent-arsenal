@@ -3816,6 +3816,18 @@ alwaysApply: false
     - Deploy **Transaction-Scoped `work_mem` Fencing**: elevate `work_mem` to $\ge 64\text{MB}$ in faceted search transactions to ensure zero lossy bitmap degradation (`Lossy: 0`).
     - Enforce **Proactive Autovacuum Compaction**: set `autovacuum_vacuum_scale_factor = 0.05` on Bloom-indexed relations to purge dead signatures and prevent index bloat.
 
+- **HypoPG Virtual Index Simulation, What-If Query Plan Evaluation & Non-Destructive Index Recommendation (PostgreSQL 11–17+)**:
+  - ❌ **Anti-Pattern: Unverified Physical DDL Hallucination & EXPLAIN ANALYZE Blindness**:
+    - Generating physical `CREATE INDEX` or `CREATE INDEX CONCURRENTLY` directly on multi-gigabyte tables without verifying if the planner will actually adopt the proposed index, burning I/O, emitting gigabytes of WAL spikes, and causing replication lag.
+    - Executing `EXPLAIN ANALYZE` on hypothetical indexes; because hypothetical pages exist only in backend memory without physical disk storage, `EXPLAIN ANALYZE` falls back to physical sequential scans, leading agents to falsely discard viable index candidates.
+    - Testing dozens of hypothetical indexes in a single long-lived connection without issuing `SELECT hypopg_reset()`, leaking memory in PostgreSQL backend `relcache` structures and distorting subsequent planning decisions.
+    - Recommending multiple indexes without knapsack storage constraints, exceeding disk capacity thresholds and risking full disk shutdowns.
+  - ✅ **Production Invariant**:
+    - Enforce **Zero-I/O Virtual Index Evaluation**: create ephemeral 0-byte indexes via `SELECT * FROM hypopg_create_index('CREATE INDEX ON table (cols)')` and test query cost using `EXPLAIN (FORMAT JSON, COSTS ON, VERBOSE ON)` without `ANALYZE`.
+    - Enforce **Mathematical Cost Reduction Threshold**: reject any index hypothesis that does not reduce estimated plan cost by at least 60% ($\Delta \text{Cost} = (C_{\text{base}} - C_{\text{hypo}}) / C_{\text{base}} \ge 0.60$) or is not actively selected by the optimizer.
+    - Deploy **Guaranteed Ephemeral Session Reset**: wrap all HypoPG evaluations in `defer` / `finally` blocks that execute `SELECT hypopg_reset()` to prevent cross-query or pooler connection pollution.
+    - Enforce **Two-Phase Online Migration Promotion**: generate final migrations using `CREATE INDEX CONCURRENTLY IF NOT EXISTS` guarded with `SET lock_timeout = '2000ms'` and `SET statement_timeout = '2h'`.
+
 
 
 
