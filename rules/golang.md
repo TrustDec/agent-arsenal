@@ -5693,4 +5693,102 @@ func FetchWindowedLedgerStreaming(
 	}
 	return entries, nil
 }
+
+// BulkIngestRecord models high-throughput telemetry or event payloads.
+type BulkIngestRecord struct {
+	DeviceID   string
+	Metric     string
+	Val        float64
+	RecordedAt time.Time
+}
+
+// ChannelCopySource implements pgx.CopyFromSource over a Go channel,
+// enabling zero-memory buffering streaming bulk ingestion for tens of millions of records.
+type ChannelCopySource struct {
+	ch      <-chan BulkIngestRecord
+	current BulkIngestRecord
+	err     error
+}
+
+func NewChannelCopySource(ch <-chan BulkIngestRecord) *ChannelCopySource {
+	return &ChannelCopySource{ch: ch}
+}
+
+func (s *ChannelCopySource) Next() bool {
+	item, ok := <-s.ch
+	if !ok {
+		return false
+	}
+	s.current = item
+	return true
+}
+
+func (s *ChannelCopySource) Values() ([]any, error) {
+	return []any{
+		s.current.DeviceID,
+		s.current.Metric,
+		s.current.Val,
+		s.current.RecordedAt,
+	}, nil
+}
+
+func (s *ChannelCopySource) Err() error {
+	return s.err
+}
+
+// BulkStreamCopyIngest ingests records using the native PostgreSQL binary COPY protocol.
+// Enforces local synchronous_commit=off for staging and atomic set-based merge reconciliation.
+func BulkStreamCopyIngest(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	recordCh <-chan BulkIngestRecord,
+) (int64, error) {
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed acquiring connection from pool: %w", err)
+	}
+	defer conn.Release()
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed starting ingestion transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Bypass fsync overhead on staging table
+	if _, err := tx.Exec(ctx, "SET LOCAL synchronous_commit = off"); err != nil {
+		return 0, fmt.Errorf("failed setting synchronous_commit: %w", err)
+	}
+
+	source := NewChannelCopySource(recordCh)
+	cols := []string{"device_id", "metric", "val", "recorded_at"}
+
+	rowsCopied, err := tx.CopyFrom(
+		ctx,
+		pgx.Identifier{"staging_sensor_metrics"},
+		cols,
+		source,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("pgx copy failed: %w", err)
+	}
+
+	const reconcileSQL = `
+		INSERT INTO sensor_metrics (device_id, metric, val, recorded_at)
+		SELECT device_id, metric, val, recorded_at
+		FROM staging_sensor_metrics
+		ON CONFLICT (device_id, recorded_at, metric) DO UPDATE
+		SET val = EXCLUDED.val;
+		TRUNCATE TABLE staging_sensor_metrics;
+	`
+	if _, err := tx.Exec(ctx, reconcileSQL); err != nil {
+		return 0, fmt.Errorf("failed reconciling staging data: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("failed committing bulk ingest: %w", err)
+	}
+
+	return rowsCopied, nil
+}
 ```

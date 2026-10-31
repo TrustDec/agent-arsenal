@@ -4559,5 +4559,56 @@ alwaysApply: false
           return fail(500, { message: `Failed to load windowed ledger: ${err.message}` });
         }
       },
+
+      // Bulk CSV / JSON telemetry ingestion action
+      // Enforces parameter limit bounding (max 1000 rows or safe parameter quotient) and atomic batching
+      bulkImportTelemetry: async ({ request, locals }) => {
+        const tenantId = locals.tenantId;
+        const formData = await request.formData();
+        const rawJson = formData.get('records') as string;
+
+        if (!rawJson) {
+          return fail(400, { message: 'Missing records payload' });
+        }
+
+        let records: Array<{ deviceId: string; metric: string; val: number; recordedAt: string }>;
+        try {
+          records = JSON.parse(rawJson);
+        } catch {
+          return fail(400, { message: 'Invalid JSON payload format' });
+        }
+
+        const columnCount = 5; // tenant_id, device_id, metric, val, recorded_at
+        const safeBatchSize = Math.min(1000, Math.floor((65535 - 500) / columnCount));
+
+        try {
+          await locals.db.tx(async (t: any) => {
+            // Process in parameter-safe bounded chunks to prevent SQLSTATE 54000
+            for (let i = 0; i < records.length; i += safeBatchSize) {
+              const chunk = records.slice(i, i + safeBatchSize);
+              const values: any[] = [];
+              const placeholders: string[] = [];
+
+              chunk.forEach((rec, idx) => {
+                const offset = idx * columnCount;
+                placeholders.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5})`);
+                values.push(tenantId, rec.deviceId, rec.metric, rec.val, rec.recordedAt);
+              });
+
+              const sql = `
+                INSERT INTO sensor_metrics (tenant_id, device_id, metric, val, recorded_at)
+                VALUES ${placeholders.join(', ')}
+                ON CONFLICT (tenant_id, device_id, recorded_at, metric) DO UPDATE
+                SET val = EXCLUDED.val;
+              `;
+              await t.none(sql, values);
+            }
+          });
+
+          return { success: true, count: records.length };
+        } catch (err: any) {
+          return fail(500, { message: `Bulk import failed: ${err.message}` });
+        }
+      },
     };
     ```

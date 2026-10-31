@@ -3685,4 +3685,56 @@ alwaysApply: false
         client.release();
       }
     });
+
+    // server/api/v1/telemetry/bulk.post.ts - Bulk Ingestion Handler
+    // Enforces parameter safety bounds (chunkSize <= 1000) and atomic set reconciliation
+    export default defineEventHandler(async (event) => {
+      const tenantId = event.context.auth?.tenantId;
+      if (!tenantId) {
+        throw createError({ statusCode: 401, message: 'Unauthorized' });
+      }
+
+      const body = await readBody(event);
+      const readings = body?.readings as Array<{ deviceId: string; metric: string; val: number; recordedAt: string }>;
+      if (!Array.isArray(readings) || readings.length === 0) {
+        throw createError({ statusCode: 400, message: 'Invalid or empty readings payload' });
+      }
+
+      const cols = 5; // tenant_id, device_id, metric, val, recorded_at
+      const chunkSize = Math.min(1000, Math.floor((65535 - 500) / cols));
+      const client = await useDatabase().connect();
+
+      try {
+        await client.query('BEGIN');
+        await client.query('SET LOCAL synchronous_commit = off');
+
+        for (let i = 0; i < readings.length; i += chunkSize) {
+          const chunk = readings.slice(i, i + chunkSize);
+          const params: any[] = [];
+          const rowsSql: string[] = [];
+
+          chunk.forEach((r, idx) => {
+            const base = idx * cols;
+            rowsSql.push(`($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5})`);
+            params.push(tenantId, r.deviceId, r.metric, r.val, r.recordedAt);
+          });
+
+          await client.query(
+            `INSERT INTO sensor_metrics (tenant_id, device_id, metric, val, recorded_at)
+             VALUES ${rowsSql.join(', ')}
+             ON CONFLICT (tenant_id, device_id, recorded_at, metric) DO UPDATE
+             SET val = EXCLUDED.val;`,
+            params
+          );
+        }
+
+        await client.query('COMMIT');
+        return { success: true, ingested: readings.length };
+      } catch (err: any) {
+        await client.query('ROLLBACK');
+        throw createError({ statusCode: 500, message: `Bulk ingestion failed: ${err.message}` });
+      } finally {
+        client.release();
+      }
+    });
     ```

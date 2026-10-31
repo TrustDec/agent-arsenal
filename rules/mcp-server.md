@@ -4184,5 +4184,75 @@ alwaysApply: false
           };
         }
       );
+
+      // Audit Bulk Ingestion Invariants Tool
+      server.tool(
+        'audit_bulk_ingestion_invariants',
+        'Audits SQL query patterns, parameter cardinality, and protocol selection for bulk data ingestion pipelines',
+        {
+          sqlQuery: z.string().describe('The SQL ingestion statement or script to audit'),
+          estimatedRowCount: z.number().describe('Estimated number of records to ingest'),
+          columnCount: z.number().describe('Number of columns per record being ingested'),
+          engine: z.enum(['postgresql', 'sqlite', 'mysql']).default('postgresql').describe('Target relational database engine'),
+        },
+        async ({ sqlQuery, estimatedRowCount, columnCount, engine }) => {
+          const warnings: string[] = [];
+          const recommendations: string[] = [];
+          const normalized = sqlQuery.trim();
+
+          const maxParams = engine === 'sqlite' ? 32766 : 65535;
+          const estimatedParams = estimatedRowCount * columnCount;
+          const safeChunkSize = Math.min(1000, Math.floor((maxParams - 500) / Math.max(1, columnCount)));
+
+          // 1. Parameter explosion check
+          if (estimatedParams > maxParams && /\bVALUES\b/i.test(normalized)) {
+            warnings.push(
+              `PARAMETER_LIMIT_OVERFLOW: Inserting ${estimatedRowCount} rows with ${columnCount} columns requires ${estimatedParams} parameters, exceeding ${engine} limit of ${maxParams} (SQLSTATE 54000/08P01).`
+            );
+            recommendations.push(
+              `Chunk data into batches of at most ${safeChunkSize} rows, or stream via native PostgreSQL COPY protocol.`
+            );
+          }
+
+          // 2. High volume without COPY protocol
+          if (estimatedRowCount > 5000 && !/\bCOPY\b/i.test(normalized) && engine === 'postgresql') {
+            warnings.push(
+              `MISSING_COPY_PROTOCOL: High volume dataset (${estimatedRowCount} rows) uses standard INSERT. Ingestion will be 10x-50x slower and multiply WAL overhead.`
+            );
+            recommendations.push('Migrate to native COPY FROM STDIN protocol (e.g. pgx.CopyFrom, pg-copy-streams).');
+          }
+
+          // 3. UNLOGGED staging table lifecycle
+          if (/CREATE\s+UNLOGGED\s+TABLE/i.test(normalized) && !/TRUNCATE\s+(TABLE\s+)?staging_/i.test(normalized)) {
+            warnings.push(
+              'UNLOGGED_STAGING_LEAK: UNLOGGED staging table created without matching TRUNCATE. Space will not be reclaimed post-merge.'
+            );
+            recommendations.push('Append TRUNCATE staging_table after the atomic ON CONFLICT merge.');
+          }
+
+          // 4. Initial table load without FREEZE
+          if (/CREATE\s+TABLE\s+.*?(PARTITION\s+OF)?/i.test(normalized) && /\bCOPY\b/i.test(normalized) && !/\bFREEZE\b/i.test(normalized)) {
+            warnings.push(
+              'MISSING_COPY_FREEZE: New partition or table bulk loaded without FREEZE. Will trigger aggressive autovacuum freeze scans later.'
+            );
+            recommendations.push('Add WITH (FREEZE on) to the COPY command inside the creation transaction.');
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                hasWarnings: warnings.length > 0,
+                warningsCount: warnings.length,
+                warnings,
+                recommendations,
+                safeChunkSize,
+                estimatedParams,
+                status: warnings.length === 0 ? 'OPTIMAL' : 'REMEDIATION_REQUIRED',
+              }, null, 2),
+            }],
+          };
+        }
+      );
     }
     ```

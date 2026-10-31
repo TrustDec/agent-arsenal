@@ -3454,3 +3454,38 @@ alwaysApply: false
     ORDER BY store_id, revenue_rank ASC;
     ```
 
+- **Bulk Ingestion, PostgreSQL COPY Protocol, UNLOGGED Staging & Parameter Limits**:
+  - ❌ **Anti-Pattern: Single-Row INSERT Loops, Parameter Limit Crashes & Active Index Thrashing**:
+    - Executing single-row `INSERT` inside loops, multiplying network latency by $10^5$, exhausting connection pool slots, and thrashing WAL fsync commits.
+    - Emitting dynamic multi-row `INSERT INTO t VALUES ($1, ...)` without parameter bounds, crashing with `SQLSTATE 54000 / 08P01` when exceeding PostgreSQL's 65,535 parameter limit or SQLite's 999/32,766 limit.
+    - Inserting millions of rows directly into tables with active secondary indexes and foreign keys, causing random B-tree page splits ($O(M \log N)$ random I/O) and 20x WAL write amplification.
+    - Wrapping multi-hour batch loads in a monolithic transaction, pinning the cluster-wide $x_{\text{min}}$ horizon and triggering autovacuum table bloat across concurrent OLTP tables.
+  - ✅ **Production Invariant**:
+    - For small batches ($< 5,000$ rows), bound multi-row inserts to $B = \min(1000, \lfloor 65535 / C_{\text{cols}} \rfloor)$ to guarantee parameter safety.
+    - For large datasets ($> 5,000$ rows), mandate the native streaming `COPY` protocol (`COPY table FROM STDIN WITH (FORMAT binary)`), streaming records with $O(1)$ memory residency.
+    - Ingest ETL data into an `UNLOGGED` staging table with `SET LOCAL synchronous_commit = off`, perform an atomic set-based `INSERT INTO ... SELECT ... ON CONFLICT DO UPDATE`, and immediately `TRUNCATE` the staging relation.
+    - For partition loads created in the same transaction, mandate `COPY ... FREEZE` to mark tuples as `FrozenTransactionId`, eliminating future emergency autovacuum freezing I/O debt.
+
+    ```sql
+    -- High-Throughput UNLOGGED Staging + Set-Based Atomic Merge Pattern
+    CREATE UNLOGGED TABLE staging_sensor_metrics (
+        device_id UUID NOT NULL,
+        metric VARCHAR(64) NOT NULL,
+        val DOUBLE PRECISION NOT NULL,
+        recorded_at TIMESTAMPTZ NOT NULL
+    );
+
+    -- Streamed via native COPY protocol from application runner:
+    -- COPY staging_sensor_metrics (device_id, metric, val, recorded_at) FROM STDIN WITH (FORMAT binary);
+
+    -- Atomic set-based merge into target relation
+    INSERT INTO sensor_metrics (device_id, metric, val, recorded_at)
+    SELECT device_id, metric, val, recorded_at
+    FROM staging_sensor_metrics
+    ON CONFLICT (device_id, recorded_at, metric) DO UPDATE
+    SET val = EXCLUDED.val;
+
+    TRUNCATE TABLE staging_sensor_metrics;
+    ```
+
+
