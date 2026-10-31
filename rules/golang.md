@@ -5569,4 +5569,63 @@ func FetchOrgHierarchyCycleSafe(
 	}
 	return nodes, nil
 }
+
+// KeysetPaginationCursor represents the boundary values for deterministic cursor seek.
+type KeysetPaginationCursor struct {
+	CreatedAt time.Time `json:"t"`
+	ID        string    `json:"i"`
+}
+
+// KeysetPaginatedResponse encapsulates items with tamper-evident cursor tokens.
+type KeysetPaginatedResponse[T any] struct {
+	Items      []T     `json:"items"`
+	NextCursor *string `json:"next_cursor"`
+	HasMore    bool    `json:"has_more"`
+}
+
+// EncodeKeysetCursor generates an HMAC-SHA256 authenticated, URL-safe Base64 cursor token.
+func EncodeKeysetCursor(createdAt time.Time, id string, secretKey []byte) string {
+	payloadBytes, _ := json.Marshal(KeysetPaginationCursor{
+		CreatedAt: createdAt.UTC(),
+		ID:        id,
+	})
+	payloadB64 := base64.RawURLEncoding.EncodeToString(payloadBytes)
+
+	mac := hmac.New(sha256.New, secretKey)
+	mac.Write([]byte(payloadB64))
+	sigB64 := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+
+	return fmt.Sprintf("%s.%s", payloadB64, sigB64)
+}
+
+// DecodeKeysetCursor parses and validates an HMAC-SHA256 signed cursor token, preventing tampering.
+func DecodeKeysetCursor(token string, secretKey []byte) (*KeysetPaginationCursor, error) {
+	if token == "" {
+		return nil, nil
+	}
+	var payloadB64, sigB64 string
+	if _, err := fmt.Sscanf(token, "%s.%s", &payloadB64, &sigB64); err != nil {
+		return nil, errors.New("malformed cursor token format")
+	}
+
+	mac := hmac.New(sha256.New, secretKey)
+	mac.Write([]byte(payloadB64))
+	expectedSig := mac.Sum(nil)
+
+	actualSig, err := base64.RawURLEncoding.DecodeString(sigB64)
+	if err != nil || !hmac.Equal(expectedSig, actualSig) {
+		return nil, errors.New("invalid or tampered cursor signature")
+	}
+
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(payloadB64)
+	if err != nil {
+		return nil, errors.New("invalid base64 payload in cursor")
+	}
+
+	var cursor KeysetPaginationCursor
+	if err := json.Unmarshal(payloadBytes, &cursor); err != nil {
+		return nil, errors.New("corrupted cursor json payload")
+	}
+	return &cursor, nil
+}
 ```

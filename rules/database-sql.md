@@ -3352,3 +3352,52 @@ alwaysApply: false
     FROM org_hierarchy
     WHERE NOT is_cycle;
     ```
+
+- **Keyset Pagination, Seek Method, Row-Value Comparisons, Deferred Joins & Cursor Drift Defense**:
+  - ❌ **Anti-Pattern: High-Offset Scans, Missing Tie-Breakers & Early Join Bloat**:
+    - Writing `LIMIT 20 OFFSET 100000`: PostgreSQL/MySQL must traverse and visibility-check 100,000 tuples, evicting the buffer pool and causing latencies to jump from 2ms to 15s.
+    - Sorting by non-unique columns (`ORDER BY created_at DESC`) without primary key tie-breaker: duplicate timestamps return arbitrary heap order, causing random page jitter and skipped/duplicated items.
+    - Multi-column row-value comparisons `(created_at, id) < ($1, $2)` with mismatched index direction or nullability, causing the planner to abandon index seeks.
+    - Joining multiple wide dimension tables before applying pagination bounds, forcing the engine to materialize wide tuples in memory before discarding 99.9% of them.
+  - ✅ **Production Invariant**:
+    - Mandate Keyset Seek Method `(sort_col, id) < (:last_val, :last_id)` for $O(1)$ constant-time page retrieval.
+    - Always append primary key `id` as the deterministic terminal tie-breaker with explicit `NULLS LAST` / `NULLS FIRST`.
+    - Align composite B-Tree indexes precisely with equality filters, sort column, and tie-breaker: `(tenant_id, created_at DESC, id DESC)`.
+    - Implement Deferred Joins (Late Lookup) for wide queries: seek only primary keys via compact index scan in a CTE with `LIMIT K`, then join wide dimension tables on matched keys.
+    - Over-fetch by 1 (`LIMIT K + 1`) to determine `has_more` without expensive `COUNT(*)` scans.
+
+    ```sql
+    -- 1. Deterministic Keyset Seek with Composite Leftmost Index Alignment
+    -- Supporting index: CREATE INDEX idx_invoices_seek ON customer_invoices (tenant_id, issue_date DESC, id DESC);
+    SELECT id, tenant_id, customer_id, amount_cents, status, issue_date
+    FROM customer_invoices
+    WHERE tenant_id = :tenant_id
+      AND (
+        (:cursor_issue_date::timestamptz IS NULL AND :cursor_id::uuid IS NULL)
+        OR (issue_date, id) < (:cursor_issue_date, :cursor_id)
+      )
+    ORDER BY issue_date DESC NULLS LAST, id DESC
+    LIMIT 21; -- Over-fetch by 1 to compute has_more
+
+    -- 2. Deferred Join (Late Lookup) for Wide Multi-Table Projection
+    WITH target_keys AS (
+      SELECT id
+      FROM orders
+      WHERE tenant_id = :tenant_id
+        AND (
+          (:cursor_created_at::timestamptz IS NULL AND :cursor_id::uuid IS NULL)
+          OR (created_at, id) < (:cursor_created_at, :cursor_id)
+        )
+      ORDER BY created_at DESC, id DESC
+      LIMIT 21
+    )
+    SELECT 
+      o.id, o.order_number, o.total_amount, o.created_at,
+      c.name AS customer_name, c.email AS customer_email,
+      a.city AS shipping_city
+    FROM target_keys k
+    JOIN orders o ON o.id = k.id
+    JOIN customers c ON c.id = o.customer_id
+    JOIN addresses a ON a.id = o.shipping_address_id
+    ORDER BY o.created_at DESC, o.id DESC;
+    ```

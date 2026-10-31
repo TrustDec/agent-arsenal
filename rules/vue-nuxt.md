@@ -3559,4 +3559,83 @@ alwaysApply: false
         client.release();
       }
     });
+
+    // server/api/orders/feed.get.ts
+    // Invariant: Keyset cursor pagination with Deferred Join (Late Lookup).
+    // Avoids O(N) offset scans and eliminates wide tuple materialization in work_mem.
+    export const getOrdersFeedHandler = defineEventHandler(async (event) => {
+      const query = getQuery(event);
+      const tenantId = query.tenantId as string;
+      const cursorToken = query.cursor as string | undefined;
+      const limit = Math.min(parseInt(query.limit as string || '20', 10), 100);
+
+      if (!tenantId) {
+        throw createError({ statusCode: 400, message: 'Missing tenantId parameter' });
+      }
+
+      let cursorTime: string | null = null;
+      let cursorId: string | null = null;
+
+      if (cursorToken) {
+        try {
+          const [payloadB64, sig] = cursorToken.split('.');
+          const secret = useRuntimeConfig().cursorSecret || 'default-secret-key';
+          const expectedSig = crypto.createHmac('sha256', secret).update(payloadB64).digest('base64url');
+          if (sig !== expectedSig) {
+            throw createError({ statusCode: 400, message: 'Tampered cursor signature' });
+          }
+          const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+          cursorTime = payload.t;
+          cursorId = payload.i;
+        } catch (e: any) {
+          throw createError({ statusCode: 400, message: 'Malformed cursor token' });
+        }
+      }
+
+      const client = await useDatabase().connect();
+      try {
+        // Two-phase deferred join: seeks IDs on compact index first, then joins dimension tables
+        const sql = `
+          WITH target_ids AS (
+            SELECT id
+            FROM orders
+            WHERE tenant_id = $1
+              AND (
+                ($2::timestamptz IS NULL AND $3::uuid IS NULL)
+                OR (created_at, id) < ($2, $3)
+              )
+            ORDER BY created_at DESC NULLS LAST, id DESC
+            LIMIT $4
+          )
+          SELECT 
+            o.id, o.order_number, o.total_amount, o.created_at,
+            c.name AS customer_name, c.email AS customer_email
+          FROM target_ids tid
+          JOIN orders o ON o.id = tid.id
+          JOIN customers c ON c.id = o.customer_id
+          ORDER BY o.created_at DESC, o.id DESC;
+        `;
+
+        const result = await client.query(sql, [tenantId, cursorTime, cursorId, limit + 1]);
+        const hasMore = result.rows.length > limit;
+        const items = hasMore ? result.rows.slice(0, limit) : result.rows;
+
+        let nextCursor: string | null = null;
+        if (hasMore && items.length > 0) {
+          const last = items[items.length - 1];
+          const secret = useRuntimeConfig().cursorSecret || 'default-secret-key';
+          const payload = Buffer.from(
+            JSON.stringify({ t: last.created_at, i: last.id })
+          ).toString('base64url');
+          const sig = crypto.createHmac('sha256', secret).update(payload).digest('base64url');
+          nextCursor = `${payload}.${sig}`;
+        }
+
+        return { success: true, items, nextCursor, hasMore };
+      } catch (err: any) {
+        throw createError({ statusCode: 500, message: `Keyset feed query failed: ${err.message}` });
+      } finally {
+        client.release();
+      }
+    });
     ```

@@ -4462,5 +4462,69 @@ alwaysApply: false
           return fail(500, { message: `Failed to load hierarchy: ${err.message}` });
         }
       },
+
+      // Keyset cursor pagination action for infinite scroll / activity feed
+      // Eliminates OFFSET linear scan and guarantees zero page drift on concurrent inserts.
+      getPaginatedActivities: async ({ url, locals }) => {
+        const tenantId = locals.tenantId;
+        const cursorToken = url.searchParams.get('cursor');
+        const limit = 20;
+
+        let cursorDate: string | null = null;
+        let cursorId: string | null = null;
+
+        if (cursorToken) {
+          try {
+            const [payloadB64, sig] = cursorToken.split('.');
+            const expectedSig = crypto
+              .createHmac('sha256', process.env.CURSOR_SECRET || 'dev-secret')
+              .update(payloadB64)
+              .digest('base64url');
+            if (sig !== expectedSig) {
+              return fail(400, { message: 'Tampered cursor signature' });
+            }
+            const parsed = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+            cursorDate = parsed.d;
+            cursorId = parsed.i;
+          } catch {
+            return fail(400, { message: 'Invalid cursor token format' });
+          }
+        }
+
+        try {
+          const rows = await locals.db.manyOrNone(
+            `SELECT id, tenant_id, action, target_type, created_at
+             FROM activity_logs
+             WHERE tenant_id = $1
+               AND (
+                 ($2::timestamptz IS NULL AND $3::uuid IS NULL)
+                 OR (created_at, id) < ($2, $3)
+               )
+             ORDER BY created_at DESC NULLS LAST, id DESC
+             LIMIT $4;`,
+            [tenantId, cursorDate, cursorId, limit + 1]
+          );
+
+          const hasMore = rows.length > limit;
+          const items = hasMore ? rows.slice(0, limit) : rows;
+
+          let nextCursor: string | null = null;
+          if (hasMore && items.length > 0) {
+            const last = items[items.length - 1];
+            const payload = Buffer.from(
+              JSON.stringify({ d: last.created_at, i: last.id })
+            ).toString('base64url');
+            const sig = crypto
+              .createHmac('sha256', process.env.CURSOR_SECRET || 'dev-secret')
+              .update(payload)
+              .digest('base64url');
+            nextCursor = `${payload}.${sig}`;
+          }
+
+          return { success: true, items, nextCursor, hasMore };
+        } catch (err: any) {
+          return fail(500, { message: `Failed to fetch activities: ${err.message}` });
+        }
+      },
     };
     ```

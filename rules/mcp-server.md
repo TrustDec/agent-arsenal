@@ -4044,5 +4044,72 @@ alwaysApply: false
           };
         }
       );
+
+      // Diagnostic Tool: Inspect Keyset Pagination & Seek Method Safety
+      server.tool(
+        'inspect_keyset_pagination_safety',
+        'Audits SQL queries for high-offset scan cliffs, missing deterministic tie-breakers, tuple comparison mismatches, and early-join bloat',
+        {
+          sqlQuery: z.string().describe('Target SQL query text intended for paginated data retrieval'),
+        },
+        async ({ sqlQuery }) => {
+          const normalized = sqlQuery.replace(/\s+/g, ' ').trim();
+          const warnings: string[] = [];
+          const recommendations: string[] = [];
+
+          // 1. Detect OFFSET Catastrophe
+          const offsetMatch = normalized.match(/\bOFFSET\s+(\d+)\b/i);
+          if (offsetMatch && parseInt(offsetMatch[1], 10) > 0) {
+            const offsetVal = parseInt(offsetMatch[1], 10);
+            warnings.push(
+              `OFFSET_SCAN_CLIFF: Query uses OFFSET ${offsetVal}. The database must scan, visibility-check, ` +
+              `and discard ${offsetVal} rows before returning results, thrashing buffer caches.`
+            );
+            recommendations.push('Eliminate OFFSET. Use keyset cursor seek: WHERE (sort_col, id) < ($1, $2).');
+          }
+
+          // 2. Deterministic Tie-Breaker
+          const orderMatch = normalized.match(/\bORDER\s+BY\s+([^;]+?)(?:\bLIMIT\b|\bOFFSET\b|$)/i);
+          if (orderMatch) {
+            const orderCols = orderMatch[1].toLowerCase();
+            const hasTieBreaker = /\b(id|_id|uuid|pk)\b/.test(orderCols);
+            if (!hasTieBreaker) {
+              warnings.push(
+                'NON_DETERMINISTIC_SORT: ORDER BY clause lacks unique primary key tie-breaker. ' +
+                'Identical timestamps or status values will yield arbitrary physical heap ordering and page jitter.'
+              );
+              recommendations.push('Append unique primary key (e.g., id DESC) as the final ORDER BY column.');
+            }
+          } else {
+            warnings.push('MISSING_ORDER_BY: Query lacks explicit ORDER BY clause. Row order is completely non-deterministic.');
+            recommendations.push('Add deterministic ORDER BY with unique primary key tie-breaker.');
+          }
+
+          // 3. Early Join Bloat on Paginated Queries
+          const joinCount = (normalized.match(/\bJOIN\b/gi) || []).length;
+          const isPaginated = /\bLIMIT\b/i.test(normalized) || /\bOFFSET\b/i.test(normalized);
+          const isDeferred = /\bWITH\b.*\bLIMIT\b.*\bJOIN\b/i.test(normalized);
+          if (isPaginated && joinCount >= 2 && !isDeferred) {
+            warnings.push(
+              `EARLY_JOIN_AMPLIFICATION: Paginated query performs ${joinCount} joins before applying pagination bounds. ` +
+              'Materializes wide joined tuples in work_mem for discarded rows.'
+            );
+            recommendations.push('Refactor to Deferred Join (Late Lookup): Seek target IDs in a CTE with LIMIT, then join dimension tables.');
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                hasWarnings: warnings.length > 0,
+                warningsCount: warnings.length,
+                warnings,
+                recommendations,
+                status: warnings.length === 0 ? 'OPTIMAL' : 'REMEDIATION_REQUIRED',
+              }, null, 2),
+            }],
+          };
+        }
+      );
     }
     ```
