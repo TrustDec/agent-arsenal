@@ -5225,4 +5225,80 @@ When an MCP server exposes tools that execute database analytical scans, reports
         }
       );
     }
+
+    /**
+     * Diagnostic tool: PostgreSQL Prepared Transactions & In-Doubt 2PC Sentinel
+     */
+    export function registerTwoPhaseCommitDiagnosticsTool(server: McpServer, pool: Pool) {
+      server.tool(
+        'diagnose_two_phase_transactions',
+        'Audits pg_prepared_xacts for orphaned in-doubt prepared transactions pinning the cluster xmin horizon',
+        {
+          maxAgeSeconds: z.number().default(60).describe('Threshold in seconds to flag prepared transactions as in-doubt orphans'),
+        },
+        async ({ maxAgeSeconds }) => {
+          const client = await pool.connect();
+          try {
+            // Check server setting
+            const settingRes = await client.query<{ setting: string }>(
+              "SELECT setting FROM pg_settings WHERE name = 'max_prepared_transactions';"
+            );
+            const maxPrepared = parseInt(settingRes.rows[0]?.setting ?? '0', 10);
+
+            // Query active prepared transactions
+            const txRes = await client.query<{
+              transaction: string;
+              gid: string;
+              prepared: string;
+              owner: string;
+              database: string;
+              age_secs: number;
+            }>(`
+              SELECT
+                transaction,
+                gid,
+                prepared::text,
+                owner,
+                database,
+                EXTRACT(EPOCH FROM (clock_timestamp() - prepared))::int AS age_secs
+              FROM pg_prepared_xacts
+              ORDER BY prepared ASC;
+            `);
+
+            const inDoubt = txRes.rows.filter(r => r.age_secs >= maxAgeSeconds);
+            const violations: string[] = [];
+
+            if (maxPrepared === 0) {
+              violations.push('PREPARED_TX_DISABLED: max_prepared_transactions is 0. 2PC is unsupported.');
+            }
+
+            if (inDoubt.length > 0) {
+              const maxAge = Math.max(...inDoubt.map(r => r.age_secs));
+              violations.push(
+                `ORPHANED_PREPARED_TX_DETECTED: Found ${inDoubt.length} prepared transactions older than ${maxAgeSeconds}s (oldest: ${maxAge}s). Global vacuum horizon xmin is pinned!`
+              );
+            }
+
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  status: violations.length === 0 ? 'HEALTHY' : 'CRITICAL',
+                  maxPreparedTransactions: maxPrepared,
+                  totalActivePreparedTx: txRes.rows.length,
+                  inDoubtCount: inDoubt.length,
+                  inDoubtTransactions: inDoubt,
+                  violations,
+                  recommendation: inDoubt.length > 0 
+                    ? 'Verify distributed coordinator state and execute COMMIT PREPARED or ROLLBACK PREPARED immediately to release locks and unpin xmin.' 
+                    : 'Cluster vacuum horizon is unpinned.',
+                }, null, 2),
+              }],
+            };
+          } finally {
+            client.release();
+          }
+        }
+      );
+    }
     ```

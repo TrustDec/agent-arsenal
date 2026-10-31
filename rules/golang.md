@@ -6945,3 +6945,79 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   	return nil
   }
   ```
+
+- **Two-Phase Commit (2PC) & Orphaned Prepared Transaction (`pg_prepared_xacts`) Invariants**:
+  - ❌ **Anti-Pattern: Unfenced `PREPARE TRANSACTION`, Missing Coordinator WAL & PgBouncer Corruption**:
+    - Issuing `PREPARE TRANSACTION` over connection pools using transaction pooling mode (`pool_mode = transaction`), causing connection disassociation, transaction state leaks, or `0A000` errors.
+    - Executing 2PC across multiple databases without a durable coordinator Write-Ahead Log (WAL) recording the `COMMITTING` decision; if the coordinator process crashes after committing Shard 1, Shard 2 is orphaned, permanently breaking distributed ACID consistency.
+    - Failing to deploy an autonomous background watchdog checking `pg_prepared_xacts`; abandoned prepared transactions hold exclusive table locks and pin the global $x_{\min}$ vacuum horizon indefinitely, driving the database into transaction ID wraparound emergency shutdown.
+  - ✅ **Production Invariant**:
+    - Connect exclusively via direct PostgreSQL port 5432 or dedicated session-mode connection pools for any 2PC operations.
+    - Enforce structured Global Transaction Identifiers (GIDs): `app:service:coord_uuid:epoch_ms:tx_uuid:shard_id` strictly bounded $\le 200$ bytes.
+    - Ensure the coordinator persists `COMMITTING` to a local journal or disk file with `fsync` BEFORE issuing `COMMIT PREPARED` to any participant.
+    - Implement a background watchdog routine periodically querying `pg_prepared_xacts` to detect and safely reconcile in-doubt transactions older than 60 seconds:
+  ```go
+  package store
+
+  import (
+  	"context"
+  	"fmt"
+  	"time"
+
+  	"github.com/jackc/pgx/v5/pgxpool"
+  )
+
+  type PreparedTxJanitor struct {
+  	pool       *pgxpool.Pool
+  	maxAgeSecs int64
+  }
+
+  func NewPreparedTxJanitor(pool *pgxpool.Pool, maxAgeSecs int64) *PreparedTxJanitor {
+  	if maxAgeSecs <= 0 {
+  		maxAgeSecs = 60
+  	}
+  	return &PreparedTxJanitor{pool: pool, maxAgeSecs: maxAgeSecs}
+  }
+
+  func (j *PreparedTxJanitor) Start(ctx context.Context, checkInterval time.Duration) {
+  	ticker := time.NewTicker(checkInterval)
+  	go func() {
+  		defer ticker.Stop()
+  		for {
+  			select {
+  			case <-ctx.Done():
+  				return
+  			case <-ticker.C:
+  				_ = j.Reconcile(ctx)
+  			}
+  		}
+  	}()
+  }
+
+  func (j *PreparedTxJanitor) Reconcile(ctx context.Context) error {
+  	const query = `
+  		SELECT gid, EXTRACT(EPOCH FROM (clock_timestamp() - prepared))::bigint AS age_secs
+  		FROM pg_prepared_xacts
+  		WHERE prepared < clock_timestamp() - make_interval(secs => $1);
+  	`
+  	rows, err := j.pool.Query(ctx, query, j.maxAgeSecs)
+  	if err != nil {
+  		return fmt.Errorf("query pg_prepared_xacts failed: %w", err)
+  	}
+  	defer rows.Close()
+
+  	for rows.Next() {
+  		var gid string
+  		var ageSecs int64
+  		if err := rows.Scan(&gid, &ageSecs); err != nil {
+  			continue
+  		}
+  		if ageSecs > 300 {
+  			// Emergency threshold: rollback ancient orphaned tx to unpin xmin horizon
+  			rollbackSQL := fmt.Sprintf("ROLLBACK PREPARED '%s';", gid)
+  			_, _ = j.pool.Exec(ctx, rollbackSQL)
+  		}
+  	}
+  	return nil
+  }
+  ```

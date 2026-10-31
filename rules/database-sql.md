@@ -3680,6 +3680,22 @@ alwaysApply: false
     - Strictly audit functions used in parallel queries for `PARALLEL SAFE` annotations and isolate any unavoidable unsafe operations into distinct temporary tables or isolated CTEs.
     - Deploy `auto_explain` and `pg_stat_activity` sentinels to continuously detect `Workers Planned > Workers Launched` drift and alert when parallel worker starvation exceeds 5%.
 
+- **Database Two-Phase Commit (2PC), Orphaned Prepared Transactions & $x_{\min}$ Horizon Freezing Defense**:
+  - ❌ **Anti-Pattern: Abandoned Prepared Transactions, Default `max_prepared_transactions = 0` & Lockout Cascades**:
+    - Executing `PREPARE TRANSACTION` without verifying `max_prepared_transactions > 0`, causing fatal application runtime crashes (`SQLSTATE 0A000: feature_not_supported`).
+    - Issuing Two-Phase Commit commands over PgBouncer in `pool_mode = transaction`, causing connection reassignment desynchronization, prepared transaction leaks, or session state contamination across clients.
+    - Permitting network drops, client timeouts, or unhandled coordinator crashes to abandon prepared transactions in `pg_prepared_xacts`; because prepared transactions persist indefinitely across client disconnects and server restarts, they hold row and table locks indefinitely, serializing concurrent writes and blocking connection pools.
+    - Ignoring the catastrophic MVCC impact of orphaned prepared transactions: an active prepared transaction freezes the cluster transaction snapshot horizon ($x_{\min}$), rendering `autovacuum` completely unable to clean dead tuples across ALL tables, driving table and index bloat toward the $2^{31}$ transaction ID wraparound emergency stop-the-world shutdown.
+    - Relying on naive automated janitors that issue uncoordinated `ROLLBACK PREPARED` on transactions older than arbitrary low thresholds (e.g. 10s), creating distributed split-brain state divergence when the coordinator was merely delayed by a GC pause and committed sibling shards.
+  - ✅ **Production Invariant**:
+    - Default to **Distributed Saga + Transactional Outbox** for microservice operations; reserve 2PC strictly for scenarios with mandatory synchronous cross-shard ACID invariants.
+    - Configure `max_prepared_transactions = max_connections` and size `max_locks_per_transaction` to account for prepared transaction lock table entries.
+    - Route 2PC connections exclusively through direct PostgreSQL port 5432 or dedicated session-mode pools, strictly bypassing transaction-mode poolers.
+    - Enforce structured Global Transaction Identifiers (GIDs): `app:service:coord_uuid:epoch_ms:tx_uuid:shard_id` strictly bounded under 200 bytes with regex validation.
+    - Require the coordinator to write a durable `COMMITTING` record to local Write-Ahead Log (WAL) storage BEFORE emitting Phase 2 `COMMIT PREPARED` to any participant node.
+    - Deploy continuous background sentinels querying `pg_prepared_xacts`: emit warnings for prepared transactions older than 30s, critical alerts at 60s, and execute coordinated reconciliation to prevent cluster $x_{\min}$ horizon pinning and dead tuple accumulation.
+
+
 
 
 

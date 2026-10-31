@@ -5107,3 +5107,60 @@ When loading heavy aggregations or analytics dashboards in `+page.server.ts`:
     {/await}
   </div>
   ```
+
+## 19. Distributed Transaction (2PC) & `pg_prepared_xacts` Vacuum Sentinel
+
+In SvelteKit administrative consoles and system diagnostics:
+
+- **Svelte 5 Runes for Real-Time Prepared Transaction Watchdogs**:
+  - Automatically surface transactions older than 60 seconds with emergency reconciliation actions:
+
+  ```svelte
+  <!-- src/routes/admin/twophase/+page.svelte -->
+  <script lang="ts">
+    interface PreparedTx {
+      gid: string;
+      prepared: string;
+      age_secs: number;
+    }
+
+    let { data } = $props<{ data: { transactions: PreparedTx[] } }>();
+
+    let criticalCount = $derived(
+      data.transactions.filter(t => t.age_secs > 60).length
+    );
+  </script>
+
+  <div class="space-y-4 rounded-xl border border-zinc-200 dark:border-zinc-800 p-6 bg-white dark:bg-zinc-900 shadow-sm">
+    <div class="flex items-center justify-between">
+      <div>
+        <h2 class="text-base font-semibold text-zinc-900 dark:text-zinc-100">Active Two-Phase Commits</h2>
+        <p class="text-xs text-zinc-500">PostgreSQL pg_prepared_xacts vacuum horizon defense</p>
+      </div>
+      {#if criticalCount > 0}
+        <span class="rounded-full bg-red-100 px-3 py-1 font-mono text-xs font-semibold text-red-700 dark:bg-red-950/50 dark:text-red-400">
+          {criticalCount} PINNING VACUUM
+        </span>
+      {:else}
+        <span class="rounded-full bg-emerald-100 px-3 py-1 font-mono text-xs font-semibold text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400">
+          UNPINNED
+        </span>
+      {/if}
+    </div>
+
+    {#if data.transactions.length === 0}
+      <p class="text-sm text-zinc-400 py-4">No in-doubt prepared transactions detected.</p>
+    {:else}
+      <div class="divide-y divide-zinc-100 dark:divide-zinc-800 font-mono text-xs">
+        {#each data.transactions as tx (tx.gid)}
+          <div class="flex items-center justify-between py-2">
+            <span class="text-zinc-600 dark:text-zinc-300 truncate max-w-sm">{tx.gid}</span>
+            <span class={tx.age_secs > 60 ? 'text-red-600 font-bold' : 'text-amber-500'}>
+              {tx.age_secs}s
+            </span>
+          </div>
+        {/each}
+      </div>
+    {/if}
+  </div>
+  ```

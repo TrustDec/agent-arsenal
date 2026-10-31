@@ -4346,3 +4346,62 @@ When handling heavy dashboard data tables, aggregations, or export endpoints:
       }
     });
     ```
+
+## 19. Distributed Transaction (2PC) & `pg_prepared_xacts` Dashboard Sentinel
+
+When building administrative, DevOps, or system health portals in Nuxt 3:
+
+- **Reactive Watchdog for In-Doubt Transactions**:
+  - Never allow an orphaned prepared transaction to escape notice in system monitoring dashboards.
+  - Implement real-time polling or Server-Sent Events (SSE) checking `pg_prepared_xacts` and displaying age status:
+
+  ```vue
+  <!-- components/TwoPhaseMonitor.vue -->
+  <script setup lang="ts">
+  interface PreparedTx {
+    gid: string;
+    prepared: string;
+    owner: string;
+    database: string;
+    age_secs: number;
+  }
+
+  const { data: transactions, refresh } = await useFetch<PreparedTx[]>('/api/admin/prepared-tx', {
+    default: () => [],
+  });
+
+  const criticalCount = computed(() => 
+    transactions.value.filter(tx => tx.age_secs > 60).length
+  );
+  </script>
+
+  <template>
+    <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 p-5 bg-white dark:bg-zinc-900 shadow-sm">
+      <div class="flex items-center justify-between pb-4 border-b border-zinc-100 dark:border-zinc-800">
+        <div>
+          <h3 class="font-medium text-zinc-900 dark:text-zinc-100">In-Doubt Prepared Transactions (2PC)</h3>
+          <p class="text-xs text-zinc-500">Monitors pg_prepared_xacts to prevent cluster-wide xmin vacuum horizon pinning</p>
+        </div>
+        <span
+          :class="criticalCount > 0 ? 'bg-red-100 text-red-700 dark:bg-red-950/50 dark:text-red-400' : 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400'"
+          class="text-xs font-mono font-medium px-2.5 py-1 rounded-full"
+        >
+          {{ criticalCount > 0 ? `${criticalCount} CRITICAL` : 'HEALTHY' }}
+        </span>
+      </div>
+
+      <div v-if="transactions.length === 0" class="py-8 text-center text-sm text-zinc-400">
+        Zero active prepared transactions. Global vacuum horizon is unpinned.
+      </div>
+
+      <ul v-else class="divide-y divide-zinc-100 dark:divide-zinc-800 mt-3 font-mono text-xs">
+        <li v-for="tx in transactions" :key="tx.gid" class="py-2.5 flex items-center justify-between">
+          <span class="truncate max-w-md text-zinc-700 dark:text-zinc-300">{{ tx.gid }}</span>
+          <span :class="tx.age_secs > 60 ? 'text-red-600 font-bold' : 'text-amber-500'">
+            {{ tx.age_secs }}s
+          </span>
+        </li>
+      </ul>
+    </div>
+  </template>
+  ```
