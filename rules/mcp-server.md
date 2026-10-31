@@ -5814,6 +5814,118 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
   }
   ```
 
+- **PostgreSQL JIT Compilation Profiler & Latency Cliff Diagnostic Tool**:
+  - Expose an MCP tool `profile_database_jit_compilation` that executes `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` on an arbitrary SQL query, parses LLVM JIT compile timings (Generation, Inlining, Optimization, Emission), computes the Cary Millsap JIT Overhead Ratio $\rho_{\text{jit}} = T_{\text{compile}} / T_{\text{total}}$, evaluates the break-even threshold, and produces actionable planner GUC tuning advice to eliminate speculative index creation.
+
+  ```typescript
+  // src/tools/profile_jit_compilation.ts
+  import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+  import { z } from 'zod';
+  import { Pool } from 'pg';
+
+  export function registerJitCompilationProfilerTool(server: McpServer, pool: Pool): void {
+    server.tool(
+      'profile_database_jit_compilation',
+      'Profiles PostgreSQL query JIT compilation timings (Generation, Inlining, Optimization, Emission) and flags 100ms LLVM latency cliffs',
+      {
+        query: z.string().describe('The SQL query to profile with EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)'),
+        assumedSpeedup: z.number().optional().default(1.30).describe('Assumed execution speedup factor of JIT (default: 1.30 = 30%)'),
+      },
+      async ({ query, assumedSpeedup }) => {
+        // Prevent DDL / mutations from executing inside EXPLAIN ANALYZE
+        const trimmed = query.trim().toUpperCase();
+        if (
+          trimmed.startsWith('INSERT') ||
+          trimmed.startsWith('UPDATE') ||
+          trimmed.startsWith('DELETE') ||
+          trimmed.startsWith('DROP') ||
+          trimmed.startsWith('ALTER') ||
+          trimmed.startsWith('TRUNCATE')
+        ) {
+          throw new Error('Only read-only SELECT queries are permitted for EXPLAIN ANALYZE profiling.');
+        }
+
+        const client = await pool.connect();
+        try {
+          // Profile in read-only transaction that always rolls back
+          await client.query('BEGIN READ ONLY;');
+          const explainSql = `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${query}`;
+          const res = await client.query(explainSql);
+          await client.query('ROLLBACK;');
+
+          const rawJson = res.rows[0]['QUERY PLAN'];
+          const planData = Array.isArray(rawJson) ? rawJson[0] : rawJson;
+
+          const totalExecutionTimeMs: number = planData['Execution Time'];
+          const jitBlock = planData['JIT'];
+
+          if (!jitBlock || !jitBlock.Timing || jitBlock.Timing.Total === 0) {
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  isJitActive: false,
+                  totalExecutionTimeMs,
+                  message: 'JIT compilation was not triggered for this query. The query planner cost was below jit_above_cost.',
+                }, null, 2),
+              }],
+            };
+          }
+
+          const jitCompileTimeMs: number = jitBlock.Timing.Total;
+          const pureExecutionTimeMs = Math.max(0.001, totalExecutionTimeMs - jitCompileTimeMs);
+          const jitOverheadRatio = jitCompileTimeMs / totalExecutionTimeMs;
+          const estimatedInterpretedTimeMs = pureExecutionTimeMs * assumedSpeedup;
+          const breakEvenThresholdMs = (assumedSpeedup / (assumedSpeedup - 1.0)) * jitCompileTimeMs;
+          const isLatencyCliff = jitOverheadRatio > 0.15 && estimatedInterpretedTimeMs < totalExecutionTimeMs;
+
+          let strategy = 'RETAIN_JIT';
+          let recommendation = 'JIT speedup outweighs compilation overhead. Retain current configuration.';
+
+          if (jitOverheadRatio >= 0.70) {
+            strategy = 'SET_LOCAL_JIT_OFF';
+            recommendation = `CRITICAL JIT CLIFF: LLVM compilation consumed ${(jitOverheadRatio * 100).toFixed(1)}% of total query duration (${jitCompileTimeMs.toFixed(1)}ms compile vs ${pureExecutionTimeMs.toFixed(1)}ms exec). Interpreted execution would be ${(totalExecutionTimeMs / estimatedInterpretedTimeMs).toFixed(1)}x faster! Do NOT add indexes. Set "SET LOCAL jit = off;" for this query.`;
+          } else if (jitBlock.Timing.Optimization > jitCompileTimeMs * 0.50) {
+            strategy = 'DISABLE_INLINING_AND_OPTIMIZATION';
+            recommendation = `OPTIMIZATION PASS THRASH: LLVM -O3 optimization passes consumed ${jitBlock.Timing.Optimization.toFixed(1)}ms (${((jitBlock.Timing.Optimization / jitCompileTimeMs) * 100).toFixed(1)}% of compile time). Set "SET LOCAL jit_optimize_above_cost = -1; SET LOCAL jit_inline_above_cost = -1;" to eliminate optimization pass stalls.`;
+          } else if (isLatencyCliff) {
+            strategy = 'ELEVATE_JIT_ABOVE_COST';
+            recommendation = `MODERATE JIT REGRESSION: JIT overhead ratio ${(jitOverheadRatio * 100).toFixed(1)}% exceeds 15% threshold. Elevate jit_above_cost in postgresql.conf to prevent speculative JIT on this query.`;
+          }
+
+          const findings = {
+            isJitActive: true,
+            totalExecutionTimeMs,
+            jitCompileTimeMs,
+            pureExecutionTimeMs,
+            jitOverheadRatio: Number(jitOverheadRatio.toFixed(3)),
+            breakdown: {
+              generationMs: jitBlock.Timing.Generation,
+              inliningMs: jitBlock.Timing.Inlining,
+              optimizationMs: jitBlock.Timing.Optimization,
+              emissionMs: jitBlock.Timing.Emission,
+            },
+            estimatedInterpretedTimeMs: Number(estimatedInterpretedTimeMs.toFixed(2)),
+            breakEvenThresholdMs: Number(breakEvenThresholdMs.toFixed(2)),
+            isLatencyCliff,
+            strategy,
+            recommendation,
+          };
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify(findings, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
+  }
+  ```
+
 
 
 

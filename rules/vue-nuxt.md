@@ -4859,6 +4859,104 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   </template>
   ```
 
+- **PostgreSQL JIT Compilation & Latency Cliff Profiler Card (Vue 3 / Nuxt 3)**:
+  - Implement a real-time reactive component displaying JIT compilation timing breakdown (Generation, Inlining, Optimization, Emission) and flagging queries where LLVM compile overhead exceeds execution time.
+
+  ```vue
+  <!-- components/database/JitCompilationProfilerCard.vue -->
+  <script setup lang="ts">
+  import { computed } from 'vue';
+
+  export interface JitMetrics {
+    querySnippet: string;
+    totalExecutionTimeMs: number;
+    jitCompileTimeMs: number;
+    generationMs: number;
+    inliningMs: number;
+    optimizationMs: number;
+    emissionMs: number;
+    isJitActive: boolean;
+  }
+
+  const props = defineProps<{
+    metrics: JitMetrics;
+  }>();
+
+  const pureExecutionTimeMs = computed(() =>
+    Math.max(0.001, props.metrics.totalExecutionTimeMs - props.metrics.jitCompileTimeMs)
+  );
+
+  const jitOverheadRatio = computed(() =>
+    props.metrics.totalExecutionTimeMs > 0
+      ? props.metrics.jitCompileTimeMs / props.metrics.totalExecutionTimeMs
+      : 0
+  );
+
+  const isSevereCliff = computed(() => jitOverheadRatio.value >= 0.70);
+  const isModerateCliff = computed(() => jitOverheadRatio.value > 0.20 && !isSevereCliff.value);
+
+  const statusSeverity = computed(() => {
+    if (isSevereCliff.value) return 'bg-rose-50 text-rose-700 dark:bg-rose-950/50 dark:text-rose-400 border-rose-200 dark:border-rose-800';
+    if (isModerateCliff.value) return 'bg-amber-50 text-amber-700 dark:bg-amber-950/50 dark:text-amber-400 border-amber-200 dark:border-amber-800';
+    return 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800';
+  });
+
+  const statusLabel = computed(() => {
+    if (isSevereCliff.value) return 'CRITICAL JIT CLIFF';
+    if (isModerateCliff.value) return 'JIT OVERHEAD HIGH';
+    return 'JIT BENEFICIAL';
+  });
+  </script>
+
+  <template>
+    <div class="p-4 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-xs">
+      <div class="flex items-center justify-between pb-3 border-b border-zinc-100 dark:border-zinc-800/80">
+        <div class="truncate max-w-[70%]">
+          <h3 class="font-medium text-sm text-zinc-900 dark:text-zinc-100 truncate">JIT LLVM Compilation Profile</h3>
+          <p class="text-xs text-zinc-500 font-mono mt-0.5 truncate">{{ metrics.querySnippet }}</p>
+        </div>
+        <span class="text-xs px-2.5 py-0.5 rounded border font-mono font-medium" :class="statusSeverity">
+          {{ statusLabel }}
+        </span>
+      </div>
+
+      <div class="grid grid-cols-3 gap-3 my-3 text-xs">
+        <div class="p-2 rounded bg-zinc-50 dark:bg-zinc-800/50">
+          <div class="text-zinc-400 text-2xs mb-0.5">TOTAL TIME</div>
+          <div class="font-mono font-bold text-zinc-900 dark:text-zinc-100">
+            {{ metrics.totalExecutionTimeMs.toFixed(1) }}ms
+          </div>
+        </div>
+        <div class="p-2 rounded bg-zinc-50 dark:bg-zinc-800/50">
+          <div class="text-zinc-400 text-2xs mb-0.5">JIT COMPILE</div>
+          <div class="font-mono font-bold" :class="isSevereCliff ? 'text-rose-600 dark:text-rose-400' : 'text-zinc-900 dark:text-zinc-100'">
+            {{ metrics.jitCompileTimeMs.toFixed(1) }}ms ({{ (jitOverheadRatio * 100).toFixed(1) }}%)
+          </div>
+        </div>
+        <div class="p-2 rounded bg-zinc-50 dark:bg-zinc-800/50">
+          <div class="text-zinc-400 text-2xs mb-0.5">PURE EXEC</div>
+          <div class="font-mono font-bold text-emerald-600 dark:text-emerald-400">
+            {{ pureExecutionTimeMs.toFixed(1) }}ms
+          </div>
+        </div>
+      </div>
+
+      <!-- Compilation Phase Breakdown Bar -->
+      <div class="pt-2 border-t border-zinc-100 dark:border-zinc-800/80 text-2xs text-zinc-500">
+        <div class="flex justify-between font-mono mb-1">
+          <span>Gen: {{ metrics.generationMs.toFixed(1) }}ms</span>
+          <span>Inline: {{ metrics.inliningMs.toFixed(1) }}ms</span>
+          <span>Opt: {{ metrics.optimizationMs.toFixed(1) }}ms</span>
+          <span>Emit: {{ metrics.emissionMs.toFixed(1) }}ms</span>
+        </div>
+        <div v-if="isSevereCliff" class="mt-2 text-rose-600 dark:text-rose-400 font-mono text-xs">
+          ⚠️ Action: Compile time is {{ (metrics.jitCompileTimeMs / pureExecutionTimeMs).toFixed(1) }}x pure execution! Apply "SET LOCAL jit = off;".
+        </div>
+      </div>
+    </div>
+  </template>
+  ```
+
 
 
 

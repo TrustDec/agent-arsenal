@@ -3768,6 +3768,18 @@ alwaysApply: false
     - Apply **Cary Millsap's Method R Decomposition**: decompose Average Active Sessions (AAS) into CPU, IO, Lock, LWLock, and Client; only propose secondary indexes when queries are compute- or IO-read bound ($\text{AAS}_{\text{CPU}} + \text{AAS}_{\text{IO:DataFileRead}} > 60\%$).
     - Deploy **Lock Wait Tree Resolver**: continuously walk the `pg_blocking_pids()` DAG to isolate root blocker PIDs with bounded sub-second latency.
 
+- **Just-In-Time (JIT) Compilation, LLVM Expression Deforming & Cost Threshold Fencing (PostgreSQL 11–17+)**:
+  - ❌ **Anti-Pattern: The 100ms LLVM Latency Cliff & Optimization CPU Storms**:
+    - Allowing default `jit = on` with `jit_above_cost = 100000` on OLTP workloads, causing PostgreSQL to burn 50ms–200ms compiling LLVM IR for queries that execute in 2ms, triggering false-positive "slow query" alarms and speculative index churn.
+    - Permitting `jit_optimize_above_cost = 500000` to trigger LLVM `-O3` passes concurrently across multiple backend workers, pinning CPU cores at 100% in `llvm::Pass::run()`.
+    - Parallel query worker JIT multiplication where $W$ parallel workers each redundantly compile identical LLVM IR modules, expending $(W + 1) \times T_{\text{compile}}$ CPU time.
+    - Leaking internal LLVM module contexts into `TopMemoryContext` in long-lived connection poolers without periodic connection recycling or session discarding.
+  - ✅ **Production Invariant**:
+    - Enforce **OLTP JIT Deactivation**: configure `jit = off` globally for pure OLTP instances; for mixed instances, elevate `jit_above_cost = 500000`, `jit_inline_above_cost = 2500000`, and `jit_optimize_above_cost = 2500000`.
+    - Deploy **Surgical Transaction-Scoped JIT Opt-In**: analytical queries explicitly activate JIT via `SET LOCAL jit = on;` inside reporting transactions where execution duration exceeds the break-even threshold $T_{\text{exec}} \ge \frac{\sigma}{\sigma - 1} T_{\text{compile}}$.
+    - Enforce **Optimization Pass CPU Fencing**: set `jit_optimize_above_cost = -1` and `jit_inline_above_cost = -1` on high-throughput mixed workloads to retain sub-5ms expression JIT while eliminating LLVM optimization thrashing.
+    - Continuous **EXPLAIN JIT Telemetry**: extract `JIT.Timing.Total` from `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)`; automatically reject PRs proposing secondary indexes when query latency is dominated by JIT compilation ($\rho_{\text{jit}} > 15\%$).
+
 
 
 

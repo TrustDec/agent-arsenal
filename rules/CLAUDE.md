@@ -52,6 +52,8 @@ When given a coding or debugging task, always follow this sequence:
 - **Prompt Prefix Cache Awareness**: Keep static repository guidelines and rules unchanged at the prompt prefix to benefit from KV cache acceleration. Append dynamic context, execution results, and diffs strictly to the tail.
 - **Memory Bank & Compacting Protocol**: In complex multi-turn sessions, maintain a rolling compact state (`[Goal] -> [Verified Ground Truth] -> [Applied Diffs] -> [Next Action]`). When context approaches capacity, compress conversation turns into dense structured milestones to eliminate "Lost in the Middle" attention degradation.
 - **Bounded Diagnostic Truncation**: When running tests or linters, extract only the failing trace and line numbers. Never ingest 500 lines of passing green tests into prompt memory.
+- **MCP & Tool Calling Payload Virtualization**: When calling Model Context Protocol (MCP) servers or CLI tools that return multi-entity records, enforce bounded pagination (`limit <= 25`), select projections, and summarize data at the tool layer. Never pull megabytes of raw JSON responses into LLM context window memory.
+- **Bitwise Cache Invariance**: Ensure instructions, schemas, and memory banks remain bitwise immutable across turns to maintain hardware KV cache prefix hits (Anthropic prompt caching, OpenAI prefix cache, vLLM RadixAttention).
 
 ---
 
@@ -60,5 +62,6 @@ When given a coding or debugging task, always follow this sequence:
 - **Non-Interactive Execution**: Always pass non-interactive flags (`-y`, `--yes`, `CI=true`) to package managers, migrations, and CLI tools to avoid hanging on unanswerable interactive prompts.
 - **Bounded Command Outputs**: When inspecting logs or running test suites, use targeted filters, line limits, or `head`/`tail` to prevent dumping thousands of lines of terminal output into the context.
 - **Clean Subprocess Lifecycles**: Never leave orphan background processes or dangling test servers running; ensure test runs and tools terminate cleanly with deterministic exit codes.
+- **Sub-Agent Context Isolation**: Offload heavy exploratory sweeps, repository map generation, and massive benchmark runs to sandboxed sub-agents, returning strictly structured 5-line syntheses to the orchestrator.
 
 

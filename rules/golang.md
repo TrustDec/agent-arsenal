@@ -7798,6 +7798,142 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **PostgreSQL Just-In-Time (JIT) Compilation Guard & Telemetry Profiler**:
+  - Implement JIT execution policies across transactional boundaries using `jackc/pgx/v5` to eliminate the 100ms LLVM compilation cliff on short queries while allowing full LLVM optimization for heavy analytical workloads.
+  - Parse `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` to audit JIT compilation overhead ratio $\rho_{\text{jit}} = T_{\text{compile}} / T_{\text{total}}$ and prevent speculative indexing.
+
+  ```go
+  // internal/store/jit_guard.go
+  package store
+
+  import (
+  	"context"
+  	"encoding/json"
+  	"fmt"
+  	"log/slog"
+
+  	"github.com/jackc/pgx/v5"
+  	"github.com/jackc/pgx/v5/pgxpool"
+  )
+
+  type JitPolicy string
+
+  const (
+  	JitPolicyOLTP       JitPolicy = "OLTP"       // Strict jit = off (sub-100ms OLTP routes)
+  	JitPolicyFastBatch  JitPolicy = "FAST_BATCH" // jit = on, optimize = -1 (fast expression JIT)
+  	JitPolicyHeavyOLAP  JitPolicy = "HEAVY_OLAP" // Full JIT with LLVM optimization
+  )
+
+  type JitGuardEngine struct {
+  	pool   *pgxpool.Pool
+  	logger *slog.Logger
+  }
+
+  func NewJitGuardEngine(pool *pgxpool.Pool, logger *slog.Logger) *JitGuardEngine {
+  	return &JitGuardEngine{pool: pool, logger: logger}
+  }
+
+  // ExecWithJitPolicy executes a transaction callback with deterministic JIT GUC parameters.
+  func (e *JitGuardEngine) ExecWithJitPolicy(
+  	ctx context.Context,
+  	policy JitPolicy,
+  	fn func(tx pgx.Tx) error,
+  ) error {
+  	tx, err := e.pool.Begin(ctx)
+  	if err != nil {
+  		return fmt.Errorf("begin transaction failed: %w", err)
+  	}
+  	defer tx.Rollback(ctx)
+
+  	switch policy {
+  	case JitPolicyOLTP:
+  		if _, err := tx.Exec(ctx, "SET LOCAL jit = off;"); err != nil {
+  			return fmt.Errorf("disable jit for OLTP failed: %w", err)
+  		}
+  	case JitPolicyFastBatch:
+  		if _, err := tx.Exec(ctx, `
+  			SET LOCAL jit = on;
+  			SET LOCAL jit_above_cost = 50000;
+  			SET LOCAL jit_inline_above_cost = -1;
+  			SET LOCAL jit_optimize_above_cost = -1;
+  		`); err != nil {
+  			return fmt.Errorf("configure fast batch jit failed: %w", err)
+  		}
+  	case JitPolicyHeavyOLAP:
+  		if _, err := tx.Exec(ctx, `
+  			SET LOCAL jit = on;
+  			SET LOCAL jit_above_cost = 500000;
+  			SET LOCAL jit_inline_above_cost = 2500000;
+  			SET LOCAL jit_optimize_above_cost = 2500000;
+  		`); err != nil {
+  			return fmt.Errorf("configure heavy olap jit failed: %w", err)
+  		}
+  	}
+
+  	if err := fn(tx); err != nil {
+  		return err
+  	}
+
+  	return tx.Commit(ctx)
+  }
+
+  // ProfileQueryJit performs EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) to inspect JIT compilation timings.
+  func (e *JitGuardEngine) ProfileQueryJit(ctx context.Context, sqlQuery string, args ...any) error {
+  	explainSQL := fmt.Sprintf("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) %s", sqlQuery)
+
+  	var rawJSON []byte
+  	err := e.pool.QueryRow(ctx, explainSQL, args...).Scan(&rawJSON)
+  	if err != nil {
+  		return fmt.Errorf("explain json query failed: %w", err)
+  	}
+
+  	var plans []struct {
+  		ExecutionTime float64 `json:"Execution Time"`
+  		JIT           *struct {
+  			Functions int `json:"Functions"`
+  			Timing    struct {
+  				Generation   float64 `json:"Generation"`
+  				Inlining     float64 `json:"Inlining"`
+  				Optimization float64 `json:"Optimization"`
+  				Emission     float64 `json:"Emission"`
+  				Total        float64 `json:"Total"`
+  			} `json:"Timing"`
+  		} `json:"JIT"`
+  	}
+
+  	if err := json.Unmarshal(rawJSON, &plans); err != nil {
+  		return fmt.Errorf("parse explain plan json failed: %w", err)
+  	}
+
+  	if len(plans) == 0 {
+  		return fmt.Errorf("no explain plan returned")
+  	}
+
+  	plan := plans[0]
+  	if plan.JIT != nil && plan.JIT.Timing.Total > 0 {
+  		jitTotal := plan.JIT.Timing.Total
+  		totalExec := plan.ExecutionTime
+  		ratio := jitTotal / totalExec
+
+  		e.logger.Info("Audited JIT execution metrics",
+  			slog.Float64("total_time_ms", totalExec),
+  			slog.Float64("jit_total_ms", jitTotal),
+  			slog.Float64("jit_overhead_ratio", ratio),
+  			slog.Float64("optimization_ms", plan.JIT.Timing.Optimization),
+  		)
+
+  		if ratio > 0.15 {
+  			e.logger.Warn("JIT COMPILATION LATENCY CLIFF DETECTED: JIT compile time exceeds 15% of total runtime",
+  				slog.Float64("overhead_percent", ratio*100.0),
+  				slog.String("prescribed_action", "SET LOCAL jit = off or elevate jit_above_cost"),
+  			)
+  		}
+  	}
+
+  	return nil
+  }
+  ```
+
 
 
 
