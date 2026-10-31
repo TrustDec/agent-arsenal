@@ -4111,5 +4111,78 @@ alwaysApply: false
           };
         }
       );
+
+      // Diagnostic Tool: Inspect Window Function & Frame Specification Safety
+      server.tool(
+        'inspect_window_function_safety',
+        'Audits SQL queries for implicit RANGE frames on running aggregates, window functions in WHERE clauses, missing deterministic tie-breakers, and repeated identical window specifications',
+        {
+          sqlQuery: z.string().describe('Target SQL query text containing window functions or cumulative calculations'),
+        },
+        async ({ sqlQuery }) => {
+          const normalized = sqlQuery.replace(/\s+/g, ' ').trim();
+          const warnings: string[] = [];
+          const recommendations: string[] = [];
+
+          // 1. Detect Window Function inside WHERE clause
+          if (/\bWHERE\b.*?\b(ROW_NUMBER|RANK|DENSE_RANK|SUM|AVG|MIN|MAX|LEAD|LAG)\s*\([^)]*\)\s*OVER/i.test(normalized)) {
+            warnings.push(
+              'WINDOW_IN_WHERE_CLAUSE: Window functions are prohibited in WHERE/HAVING filters due to SQL relational execution order (SQLSTATE 42803).'
+            );
+            recommendations.push('Wrap query in a CTE or subquery, or use PostgreSQL DISTINCT ON for Top-1 per group.');
+          }
+
+          // 2. Detect Implicit RANGE frame on running aggregate
+          const overRegex = /\b(SUM|AVG|COUNT|MIN|MAX)\s*\(([^)]+)\)\s*OVER\s*\(([^)]+)\)/gi;
+          let match: RegExpExecArray | null;
+          while ((match = overRegex.exec(normalized)) !== null) {
+            const funcName = match[1].toUpperCase();
+            const overBody = match[3];
+            if (/\bORDER\s+BY\b/i.test(overBody) && !/\bROWS\b/i.test(overBody)) {
+              warnings.push(
+                `IMPLICIT_RANGE_FRAME: ${funcName} running aggregate omits explicit ROWS specification. ` +
+                'Defaults to RANGE, buffering peer groups in memory (tuplestore spill) and lumping identical timestamp values together.'
+              );
+              recommendations.push('Specify explicit ROWS frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW.');
+            }
+          }
+
+          // 3. Detect Missing Immutable Tie-Breaker
+          const orderMatch = normalized.match(/\bOVER\s*\(\s*(?:PARTITION\s+BY\s+[^)]+?)?\s*ORDER\s+BY\s+([^)]+?)\)/gi);
+          if (orderMatch) {
+            for (const om of orderMatch) {
+              const sortCols = om.toLowerCase().split(/\bROWS\b|\bRANGE\b/)[0];
+              if (!/\b(id|_id|uuid|pk)\b/.test(sortCols)) {
+                warnings.push(
+                  'MISSING_UNIQUE_TIE_BREAKER: Window ORDER BY clause lacks immutable unique key. Duplicate sort keys yield arbitrary heap ordering.'
+                );
+                recommendations.push('Append unique primary key (e.g. id ASC) to the window ORDER BY clause.');
+                break;
+              }
+            }
+          }
+
+          // 4. Correlated Subquery Running Total
+          if (/SELECT\s+.*?\(\s*SELECT\s+SUM\s*\(.*?\)\s+FROM\s+\w+\s+\w+\s+WHERE\s+.*?<=\s*.*?\)/i.test(normalized)) {
+            warnings.push(
+              'CORRELATED_SUBQUERY_RUNNING_TOTAL: Triangular self-join detected for cumulative sum. Operates in O(N^2) time, choking CPU cores.'
+            );
+            recommendations.push('Replace with single-pass window function: SUM(...) OVER (ORDER BY ... ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW).');
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                hasWarnings: warnings.length > 0,
+                warningsCount: warnings.length,
+                warnings,
+                recommendations,
+                status: warnings.length === 0 ? 'OPTIMAL' : 'REMEDIATION_REQUIRED',
+              }, null, 2),
+            }],
+          };
+        }
+      );
     }
     ```

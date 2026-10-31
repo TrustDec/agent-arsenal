@@ -3638,4 +3638,51 @@ alwaysApply: false
         client.release();
       }
     });
+
+    // server/api/analytics/store-metrics.get.ts
+    // Invariant: Window aggregation with explicit bounded sliding frames & named WINDOW consolidation
+    export const getStoreMetricsHandler = defineEventHandler(async (event) => {
+      const query = getQuery(event);
+      const tenantId = query.tenantId as string;
+      const storeId = query.storeId as string;
+
+      if (!tenantId || !storeId) {
+        throw createError({ statusCode: 400, message: 'Missing tenantId or storeId' });
+      }
+
+      const client = await useDatabase().connect();
+      try {
+        const sql = `
+          SELECT 
+            id, store_id, recorded_date, daily_revenue_cents,
+            SUM(daily_revenue_cents) OVER w_mtd AS mtd_revenue_cents,
+            AVG(daily_revenue_cents) OVER w_7d AS trailing_7d_avg_cents,
+            DENSE_RANK() OVER (
+              PARTITION BY store_id 
+              ORDER BY daily_revenue_cents DESC, id ASC
+            ) AS revenue_rank
+          FROM store_daily_metrics
+          WHERE tenant_id = $1 AND store_id = $2
+          WINDOW 
+            w_mtd AS (
+              PARTITION BY store_id 
+              ORDER BY recorded_date ASC, id ASC
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ),
+            w_7d AS (
+              PARTITION BY store_id 
+              ORDER BY recorded_date ASC, id ASC
+              ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+            )
+          ORDER BY recorded_date ASC, id ASC;
+        `;
+
+        const result = await client.query(sql, [tenantId, storeId]);
+        return { success: true, metrics: result.rows };
+      } catch (err: any) {
+        throw createError({ statusCode: 500, message: `Store metrics calculation failed: ${err.message}` });
+      } finally {
+        client.release();
+      }
+    });
     ```

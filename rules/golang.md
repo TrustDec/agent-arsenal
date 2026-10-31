@@ -5628,4 +5628,69 @@ func DecodeKeysetCursor(token string, secretKey []byte) (*KeysetPaginationCursor
 	}
 	return &cursor, nil
 }
+
+// WindowedLedgerRow represents a financial transaction enriched with streaming window aggregates.
+type WindowedLedgerRow struct {
+	ID             string    `json:"id"`
+	AccountID      string    `json:"account_id"`
+	AmountCents    int64     `json:"amount_cents"`
+	RunningBalance int64     `json:"running_balance"`
+	TxSeqNumber    int64     `json:"tx_seq_number"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+// FetchWindowedLedgerStreaming executes a memory-bounded streaming window query with O(1) state.
+// Eliminates implicit RANGE peer buffering and enforces deterministic tie-breakers.
+func FetchWindowedLedgerStreaming(
+	ctx context.Context,
+	db *pgxpool.Pool,
+	tenantID string,
+	accountID string,
+	since time.Time,
+) ([]WindowedLedgerRow, error) {
+	// Supporting index: (tenant_id, account_id, created_at ASC, id ASC) INCLUDE (amount_cents)
+	const query = `
+		SELECT 
+			id, account_id, amount_cents, created_at,
+			SUM(amount_cents) OVER w AS running_balance,
+			ROW_NUMBER() OVER w AS tx_seq_number
+		FROM bank_ledger
+		WHERE tenant_id = $1 
+		  AND account_id = $2
+		  AND created_at >= $3
+		WINDOW w AS (
+			PARTITION BY account_id
+			ORDER BY created_at ASC, id ASC
+			ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+		)
+		ORDER BY created_at ASC, id ASC;
+	`
+
+	rows, err := db.Query(ctx, query, tenantID, accountID, since)
+	if err != nil {
+		return nil, fmt.Errorf("failed executing windowed ledger query: %w", err)
+	}
+	defer rows.Close()
+
+	var entries []WindowedLedgerRow
+	for rows.Next() {
+		var r WindowedLedgerRow
+		if err := rows.Scan(
+			&r.ID,
+			&r.AccountID,
+			&r.AmountCents,
+			&r.CreatedAt,
+			&r.RunningBalance,
+			&r.TxSeqNumber,
+		); err != nil {
+			return nil, fmt.Errorf("failed scanning ledger row: %w", err)
+		}
+		entries = append(entries, r)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("row iteration error: %w", err)
+	}
+	return entries, nil
+}
 ```

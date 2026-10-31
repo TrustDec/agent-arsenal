@@ -3401,3 +3401,56 @@ alwaysApply: false
     JOIN addresses a ON a.id = o.shipping_address_id
     ORDER BY o.created_at DESC, o.id DESC;
     ```
+
+- **Window Functions, Frame Specifications (ROWS vs RANGE), Running Totals & Memory Defense**:
+  - ❌ **Anti-Pattern: Implicit RANGE Frames, Correlated Triangular Subqueries & Non-Deterministic Ranks**:
+    - Writing `SUM(amount) OVER (PARTITION BY acct ORDER BY created_at)` without frame: Defaults to `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`. Engine buffers peer groups with identical timestamps in `work_mem` (spilling to disk tuplestore), and sums all tie rows together, producing corrupted stepped jumps in running balances.
+    - Computing cumulative running totals via $O(N^2)$ correlated self-joins (`WHERE t2.created_at <= t1.created_at`), causing $10^{10}$ comparisons on 100k rows and hours of CPU starvation.
+    - Placing window functions inside `WHERE` clauses (`WHERE ROW_NUMBER() OVER (...) = 1`), crashing with `SQLSTATE 42803` because SQL evaluates `WHERE` before `WINDOW`.
+    - Using `ROW_NUMBER()` or `RANK()` without an immutable unique primary key tie-breaker, causing non-deterministic ordering and pagination drift across database runs.
+  - ✅ **Production Invariant**:
+    - Mandate explicit `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` on all running aggregates to stream in $O(1)$ memory.
+    - Append primary key `id` as the deterministic terminal tie-breaker: `ORDER BY created_at ASC, id ASC`.
+    - Align composite B-Tree indexes precisely with partition and order keys: `CREATE INDEX ON table (partition_col, order_col ASC, id ASC) INCLUDE (val)` to eliminate `Sort` executor nodes and external merge disk spills.
+    - Use PostgreSQL `DISTINCT ON (group_col)` for high-performance Top-1 retrieval without window sort overhead, or wrap Top-K in an index-aligned CTE.
+    - Consolidate repeated window declarations into a named `WINDOW w AS (...)` clause, and use bounded frames `ROWS BETWEEN (K-1) PRECEDING AND CURRENT ROW` for rolling moving averages to activate engine sliding-window optimizations.
+
+    ```sql
+    -- 1. Streaming Financial Running Balance with Explicit ROWS Frame and Named Window
+    -- Supporting index: CREATE INDEX idx_bank_stream ON bank_ledger (tenant_id, account_id, created_at ASC, id ASC) INCLUDE (amount_cents);
+    SELECT 
+        id, tenant_id, account_id, amount_cents, created_at,
+        SUM(amount_cents) OVER w AS running_balance,
+        ROW_NUMBER() OVER w AS transaction_seq
+    FROM bank_ledger
+    WHERE tenant_id = :tenant_id AND account_id = :account_id
+    WINDOW w AS (
+        PARTITION BY account_id
+        ORDER BY created_at ASC, id ASC
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    )
+    ORDER BY created_at ASC, id ASC;
+
+    -- 2. Rolling 7-Day Moving Metric with Bounded Frame Ring Buffer & Top-K Rank via CTE
+    WITH ranked_store_metrics AS (
+        SELECT 
+            store_id, recorded_date, daily_revenue_cents,
+            AVG(daily_revenue_cents) OVER w_7d AS trailing_7d_avg,
+            DENSE_RANK() OVER (
+                PARTITION BY store_id 
+                ORDER BY daily_revenue_cents DESC, id ASC
+            ) AS revenue_rank
+        FROM store_daily_metrics
+        WHERE tenant_id = :tenant_id
+        WINDOW w_7d AS (
+            PARTITION BY store_id 
+            ORDER BY recorded_date ASC, id ASC
+            ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+        )
+    )
+    SELECT store_id, recorded_date, daily_revenue_cents, trailing_7d_avg, revenue_rank
+    FROM ranked_store_metrics
+    WHERE revenue_rank <= 3
+    ORDER BY store_id, revenue_rank ASC;
+    ```
+

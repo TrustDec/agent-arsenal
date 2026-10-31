@@ -4526,5 +4526,38 @@ alwaysApply: false
           return fail(500, { message: `Failed to fetch activities: ${err.message}` });
         }
       },
+
+      // Streaming windowed ledger running balance action
+      // Enforces explicit ROWS BETWEEN frame and named WINDOW clause for O(1) memory
+      getAccountRunningBalance: async ({ url, locals }) => {
+        const tenantId = locals.tenantId;
+        const accountId = url.searchParams.get('accountId');
+        if (!accountId) {
+          return fail(400, { message: 'Missing accountId query parameter' });
+        }
+
+        try {
+          // Supporting index: idx_bank_stream ON bank_ledger (tenant_id, account_id, created_at ASC, id ASC) INCLUDE (amount_cents)
+          const entries = await locals.db.manyOrNone(
+            `SELECT 
+               id, account_id, amount_cents, created_at,
+               SUM(amount_cents) OVER w AS running_balance,
+               ROW_NUMBER() OVER w AS tx_seq
+             FROM bank_ledger
+             WHERE tenant_id = $1 AND account_id = $2
+             WINDOW w AS (
+               PARTITION BY account_id
+               ORDER BY created_at ASC, id ASC
+               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+             )
+             ORDER BY created_at ASC, id ASC;`,
+            [tenantId, accountId]
+          );
+
+          return { success: true, entries };
+        } catch (err: any) {
+          return fail(500, { message: `Failed to load windowed ledger: ${err.message}` });
+        }
+      },
     };
     ```
