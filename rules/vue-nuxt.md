@@ -4076,4 +4076,59 @@ alwaysApply: false
         hasCriticalRisk: databases.some((d: any) => d.riskLevel === 'CRITICAL' || d.riskLevel === 'EMERGENCY'),
       };
     });
+
+    // server/api/admin/database/toast-health.ts - Nuxt 3 server route for TOAST storage diagnostics
+    export default defineEventHandler(async (event) => {
+      const db = useDatabase();
+
+      const query = `
+        SELECT
+          n.nspname AS schema_name,
+          c.relname AS table_name,
+          a.attname AS column_name,
+          pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
+          a.attstorage::text AS storage_strategy,
+          COALESCE(a.attcompression::text, 'default') AS compression,
+          COALESCE(tc.relname, '') AS toast_rel_name,
+          COALESCE(pg_total_relation_size(c.reltoastrelid), 0) AS toast_size_bytes,
+          COALESCE(s.avg_width, 0) AS avg_payload_bytes
+        FROM pg_attribute a
+        JOIN pg_class c ON a.attrelid = c.oid
+        JOIN pg_namespace n ON c.relnamespace = n.oid
+        LEFT JOIN pg_class tc ON c.reltoastrelid = tc.oid
+        LEFT JOIN pg_stats s ON s.schemaname = n.nspname AND s.tablename = c.relname AND s.attname = a.attname
+        WHERE a.attnum > 0
+          AND NOT a.attisdropped
+          AND c.relkind IN ('r', 'p')
+          AND a.attstorage IN ('x', 'e', 'm')
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+        ORDER BY toast_size_bytes DESC;
+      `;
+      const result = await db.query(query);
+
+      const toastAudits = result.rows.map((r: any) => {
+        const isLegacyPglz = (r.data_type.includes('text') || r.data_type.includes('jsonb')) && r.compression === 'p';
+        const isLowDensity = r.avg_payload_bytes >= 600 && r.avg_payload_bytes <= 1900 && r.storage_strategy === 'e';
+
+        return {
+          schema: r.schema_name,
+          table: r.table_name,
+          column: r.column_name,
+          dataType: r.data_type,
+          strategy: r.storage_strategy === 'e' ? 'EXTENDED' : r.storage_strategy === 'x' ? 'EXTERNAL' : 'MAIN',
+          compression: r.compression === 'l' ? 'lz4' : r.compression === 'p' ? 'pglz' : 'default',
+          toastSizeBytes: Number(r.toast_size_bytes),
+          avgPayloadBytes: Number(r.avg_payload_bytes),
+          needsLz4Migration: isLegacyPglz,
+          needsToastTargetTuning: isLowDensity,
+        };
+      });
+
+      return {
+        timestamp: new Date().toISOString(),
+        columns: toastAudits,
+        totalToastedColumns: toastAudits.length,
+        legacyPglzCount: toastAudits.filter((c: any) => c.needsLz4Migration).length,
+      };
+    });
     ```

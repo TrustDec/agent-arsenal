@@ -6305,4 +6305,96 @@ func TerminateHorizonSaboteurs(ctx context.Context, pool *pgxpool.Pool, maxIdleT
 
 	return terminated, nil
 }
+
+// ToastColumnAudit encapsulates catalog metadata for PostgreSQL variable-length attributes.
+type ToastColumnAudit struct {
+	SchemaName      string  `json:"schema_name"`
+	TableName       string  `json:"table_name"`
+	ColumnName      string  `json:"column_name"`
+	DataType        string  `json:"data_type"`
+	StorageStrategy string  `json:"storage_strategy"` // 'e'=EXTENDED, 'x'=EXTERNAL, 'm'=MAIN, 'p'=PLAIN
+	Compression     string  `json:"compression"`      // 'l'=lz4, 'p'=pglz, ''=default
+	ToastRelName    string  `json:"toast_rel_name"`
+	ToastSizeBytes  int64   `json:"toast_size_bytes"`
+	AvgPayloadBytes int     `json:"avg_payload_bytes"`
+}
+
+// AuditToastArchitecture inspects PostgreSQL catalog for TOAST configuration and identifies
+// compression bottlenecks, legacy pglz columns, and missing STORAGE EXTERNAL on encrypted data.
+func AuditToastArchitecture(ctx context.Context, pool *pgxpool.Pool) ([]ToastColumnAudit, error) {
+	query := `
+		SELECT
+			n.nspname AS schema_name,
+			c.relname AS table_name,
+			a.attname AS column_name,
+			pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
+			a.attstorage::text AS storage_strategy,
+			COALESCE(a.attcompression::text, 'default') AS compression,
+			COALESCE(tc.relname, '') AS toast_rel_name,
+			COALESCE(pg_total_relation_size(c.reltoastrelid), 0) AS toast_size_bytes,
+			COALESCE(s.avg_width, 0) AS avg_payload_bytes
+		FROM pg_attribute a
+		JOIN pg_class c ON a.attrelid = c.oid
+		JOIN pg_namespace n ON c.relnamespace = n.oid
+		LEFT JOIN pg_class tc ON c.reltoastrelid = tc.oid
+		LEFT JOIN pg_stats s ON s.schemaname = n.nspname AND s.tablename = c.relname AND s.attname = a.attname
+		WHERE a.attnum > 0
+		  AND NOT a.attisdropped
+		  AND c.relkind IN ('r', 'p')
+		  AND a.attstorage IN ('x', 'e', 'm')
+		  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+		ORDER BY toast_size_bytes DESC;
+	`
+	rows, err := pool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("querying TOAST catalog failed: %w", err)
+	}
+	defer rows.Close()
+
+	var audits []ToastColumnAudit
+	for rows.Next() {
+		var a ToastColumnAudit
+		if err := rows.Scan(
+			&a.SchemaName,
+			&a.TableName,
+			&a.ColumnName,
+			&a.DataType,
+			&a.StorageStrategy,
+			&a.Compression,
+			&a.ToastRelName,
+			&a.ToastSizeBytes,
+			&a.AvgPayloadBytes,
+		); err != nil {
+			return nil, fmt.Errorf("scanning toast audit failed: %w", err)
+		}
+		audits = append(audits, a)
+	}
+	return audits, nil
+}
+
+// EnforceToastStoragePolicy migrates variable-length columns to LZ4 and bypasses compression on ciphertext.
+func EnforceToastStoragePolicy(ctx context.Context, pool *pgxpool.Pool, schema, table, column string, isCiphertextOrMedia bool) error {
+	var ddl string
+	if isCiphertextOrMedia {
+		// Bypass CPU-wasting compression loops on high-entropy data
+		ddl = fmt.Sprintf("ALTER TABLE %s.%s ALTER COLUMN %s SET STORAGE EXTERNAL;",
+			pgx.Identifier{schema}.Sanitize(),
+			pgx.Identifier{table}.Sanitize(),
+			pgx.Identifier{column}.Sanitize(),
+		)
+	} else {
+		// Migrate text/jsonb to high-performance LZ4 compression
+		ddl = fmt.Sprintf("ALTER TABLE %s.%s ALTER COLUMN %s SET COMPRESSION lz4;",
+			pgx.Identifier{schema}.Sanitize(),
+			pgx.Identifier{table}.Sanitize(),
+			pgx.Identifier{column}.Sanitize(),
+		)
+	}
+
+	_, err := pool.Exec(ctx, ddl)
+	if err != nil {
+		return fmt.Errorf("failed enforcing TOAST storage policy: %w", err)
+	}
+	return nil
+}
 ```

@@ -4693,5 +4693,70 @@ alwaysApply: false
           };
         }
       );
+
+      // Tool 21: TOAST Storage Architecture & Compression Diagnostics
+      server.tool(
+        'diagnose_toast_storage_policy',
+        'Analyzes PostgreSQL TOAST storage strategies, detects legacy pglz compression, Shannon entropy mismatches on encrypted ciphertext, and missing toast_tuple_target packing',
+        {
+          tableName: z.string().describe('Table name containing variable-length columns'),
+          columnName: z.string().describe('Column name to analyze'),
+          dataType: z.string().describe('Column data type (e.g., text, jsonb, bytea)'),
+          currentStorage: z.enum(['EXTENDED', 'EXTERNAL', 'MAIN', 'PLAIN']).default('EXTENDED').describe('Current attstorage setting'),
+          currentCompression: z.enum(['lz4', 'pglz', 'default']).default('pglz').describe('Current attcompression setting'),
+          sampleEntropyBits: z.number().min(0).max(8).optional().describe('Empirical Shannon entropy in bits/byte (if sampled)'),
+          avgPayloadBytes: z.number().optional().default(1500).describe('Average serialized payload size in bytes'),
+          toastTableBytes: z.number().optional().default(0).describe('Total size of auxiliary pg_toast table in bytes'),
+        },
+        async ({ tableName, columnName, dataType, currentStorage, currentCompression, sampleEntropyBits, avgPayloadBytes, toastTableBytes }) => {
+          const anomalies: string[] = [];
+          const remediationDdl: string[] = [];
+          let estimatedCpuSavings = 0;
+          let estimatedIoSavings = 0;
+
+          // Check 1: Ciphertext or pre-compressed assets under STORAGE EXTENDED
+          if (sampleEntropyBits !== undefined && sampleEntropyBits >= 7.85 && currentStorage === 'EXTENDED') {
+            anomalies.push(`HIGH_ENTROPY_COMPRESSION_BURN: Sample entropy is ${sampleEntropyBits} bits/byte (incompressible ciphertext/media), but storage is EXTENDED. Engine wastes up to 40% CPU attempting compression on writes.`);
+            remediationDdl.push(`ALTER TABLE "${tableName}" ALTER COLUMN "${columnName}" SET STORAGE EXTERNAL;`);
+            estimatedCpuSavings += 40;
+          }
+
+          // Check 2: Legacy pglz compression on PostgreSQL 14+ text/jsonb
+          if ((dataType.toLowerCase().includes('text') || dataType.toLowerCase().includes('jsonb')) && currentCompression === 'pglz') {
+            anomalies.push(`LEGACY_PGLZ_COMPRESSION: Column uses legacy 'pglz'. Decompression latency is 3x-5x slower than modern 'lz4'.`);
+            remediationDdl.push(`ALTER TABLE "${tableName}" ALTER COLUMN "${columnName}" SET COMPRESSION lz4;`);
+            estimatedCpuSavings += 50;
+          }
+
+          // Check 3: Moderate size varlena staying inline (500B-1900B) reducing heap packing
+          if (avgPayloadBytes >= 600 && avgPayloadBytes <= 1900 && currentStorage === 'EXTENDED') {
+            anomalies.push(`LOW_HEAP_PACKING_DENSITY: Avg size ${avgPayloadBytes}B stays inline under default TOAST_TUPLE_THRESHOLD (2048B), packing only 4-5 tuples per 8KB page.`);
+            remediationDdl.push(`ALTER TABLE "${tableName}" SET (toast_tuple_target = 128);`);
+            estimatedIoSavings += 70;
+          }
+
+          let state = 'OPTIMAL';
+          if (anomalies.some(a => a.startsWith('HIGH_ENTROPY'))) state = 'CPU_STARVATION_RISK';
+          else if (anomalies.some(a => a.startsWith('LEGACY'))) state = 'SUBOPTIMAL_COMPRESSION';
+          else if (anomalies.some(a => a.startsWith('LOW_HEAP'))) state = 'HEAP_BLOAT_INLINE';
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                tableName,
+                columnName,
+                state,
+                anomaliesCount: anomalies.length,
+                anomalies,
+                remediationDdl,
+                estimatedCpuSavingsPct: estimatedCpuSavings,
+                estimatedIoSavingsPct: estimatedIoSavings,
+                status: anomalies.length === 0 ? 'HEALTHY' : 'OPTIMIZATION_REQUIRED',
+              }, null, 2),
+            }],
+          };
+        }
+      );
     }
     ```

@@ -3592,6 +3592,22 @@ alwaysApply: false
     - Range-partition high-churn historical/audit tables and execute explicit one-time `VACUUM (FREEZE, ANALYZE)` on cold partitions, marking Visibility Map `all-frozen` bits and permanently eliminating them from future anti-wraparound scans.
     - Track Time-to-Wraparound (TTW): $T_{\text{ttw}} = \frac{2,137,483,648 - \text{age}(datfrozenxid)}{\lambda_{\text{xid}}}$; enforce automated canary alerts if $T_{\text{ttw}} < 72\text{ hours}$.
 
+- **Database TOAST Storage Strategies, LZ4 Compression & De-TOASTing Memory Defense**:
+  - ❌ **Anti-Pattern: De-TOASTing I/O Multiplication, PGLZ CPU Stalls & Ciphertext Compression**:
+    - Querying tables with wide varlena columns using unrestricted `SELECT *`, forcing the engine to fetch out-of-line 2KB chunks across thousands of auxiliary `pg_toast` pages and decompress megabytes in RAM even when callers only need scalar columns.
+    - Relying on legacy `pglz` compression on PostgreSQL 14+, burning 35%–55% of worker CPU cycles inside `pglz_decompress()` during heavy read workloads.
+    - Storing high-entropy pre-compressed (gzip, zstd, PNG) or encrypted (AES-256-GCM ciphertext) data under default `STORAGE EXTENDED`, causing PostgreSQL to waste 40% CPU fruitlessly attempting to compress incompressible bytes before storing out-of-line.
+    - Allowing wide columns (~1.5KB) to remain inline under default `TOAST_TUPLE_THRESHOLD` (2048B), packing only 3–5 tuples per 8KB heap page and bloating sequential scans by $15\times$.
+    - Modifying parts of toasted columns in naive update loops, duplicating entire multi-kilobyte TOAST chunk sets and flooding Write-Ahead Logs (WAL).
+    - Allowing auxiliary `pg_toast_<oid>` tables to accumulate millions of dead chunks without dedicated aggressive autovacuum scale factors (`autovacuum_vacuum_scale_factor = 0.05`).
+  - ✅ **Production Invariant**:
+    - Strictly eliminate `SELECT *` on relations with toasted columns; explicitly project only scalar metadata in query builders and ORMs.
+    - Enforce `default_toast_compression = 'lz4'` cluster-wide (PostgreSQL 14+) and configure `ALTER TABLE ... ALTER COLUMN ... SET COMPRESSION lz4` for large `TEXT` and `JSONB` columns.
+    - Enforce `ALTER TABLE ... ALTER COLUMN ... SET STORAGE EXTERNAL;` on all encrypted ciphertext, binary archives, and pre-compressed media blobs to bypass wasted CPU compression cycles.
+    - Tune `ALTER TABLE ... SET (toast_tuple_target = 128);` on scan-intensive tables to aggressively move wide text out-of-line, packing 60+ tuples per 8KB page and keeping working-set heap tuples resident in `shared_buffers`.
+    - Explicitly configure `autovacuum_vacuum_scale_factor = 0.05` on auxiliary `pg_toast` tables and execute zero-downtime `REINDEX TABLE CONCURRENTLY pg_toast.pg_toast_<oid>_index` during off-peak maintenance windows.
+
+
 
 
 

@@ -4869,5 +4869,34 @@ alwaysApply: false
           client.release();
         }
       },
+
+      // Ops form action to migrate legacy pglz columns to LZ4 and tune toast_tuple_target
+      optimizeToastStrategy: async ({ request, locals }) => {
+        const formData = await request.formData();
+        const table = String(formData.get('table') || '');
+        const column = String(formData.get('column') || '');
+        const isCiphertext = formData.get('isCiphertext') === 'true';
+
+        if (!table || !column) {
+          return fail(400, { message: 'Table and column names are required.' });
+        }
+
+        const client = await locals.dbPool.connect();
+        try {
+          if (isCiphertext) {
+            // Bypass CPU compression on encrypted blobs
+            await client.query(`ALTER TABLE "${table}" ALTER COLUMN "${column}" SET STORAGE EXTERNAL;`);
+          } else {
+            // Migrate text/jsonb to modern LZ4 compression
+            await client.query(`ALTER TABLE "${table}" ALTER COLUMN "${column}" SET COMPRESSION lz4;`);
+          }
+
+          return { success: true, table, column, optimized: true };
+        } catch (err: any) {
+          return fail(500, { message: `TOAST optimization failed: ${err.message}` });
+        } finally {
+          client.release();
+        }
+      },
     };
     ```
