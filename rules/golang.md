@@ -6857,3 +6857,91 @@ func (s *AutonomousListenNotifySupervisor) drainOutbox(ctx context.Context) erro
 }
 
 ```
+
+## 41. PostgreSQL Parallel Query Execution, Worker Starvation & Dynamic `work_mem` Fencing
+
+When orchestrating analytical reports, batch aggregations, or heavy read scans with `jackc/pgx/v5`:
+
+- **Silent Plan Downgrade & Starvation Detection**:
+  - In high-concurrency environments, PostgreSQL may plan for $W$ workers but launch 0 workers if the background worker pool is exhausted.
+  - Inspect `auto_explain` logs or query plans to detect `Workers Planned > Workers Launched` drift.
+- **Dynamic Session-Level `SET LOCAL` Fencing**:
+  - Always execute parallel analytical queries inside a dedicated read-only transaction using `SET LOCAL max_parallel_workers_per_gather` and `SET LOCAL work_mem`.
+  - Never modify global `work_mem` across connection pools, which triggers multi-worker memory multiplication ($K \cdot (W+1) \cdot \text{work\_mem}$) and Linux kernel OOM killer crashes.
+- **Production Go Safe Analytical Pipeline**:
+  ```go
+  package store
+
+  import (
+  	"context"
+  	"fmt"
+  	"time"
+
+  	"github.com/jackc/pgx/v5"
+  	"github.com/jackc/pgx/v5/pgxpool"
+  )
+
+  type SafeAnalyticalRunner struct {
+  	pool       *pgxpool.Pool
+  	maxWorkers int
+  	workMem    string
+  }
+
+  func NewSafeAnalyticalRunner(pool *pgxpool.Pool, maxWorkers int, workMem string) *SafeAnalyticalRunner {
+  	if maxWorkers <= 0 {
+  		maxWorkers = 4
+  	}
+  	if workMem == "" {
+  		workMem = "64MB"
+  	}
+  	return &SafeAnalyticalRunner{
+  		pool:       pool,
+  		maxWorkers: maxWorkers,
+  		workMem:    workMem,
+  	}
+  }
+
+  func (r *SafeAnalyticalRunner) RunReportingScan(ctx context.Context, query string, dest func(pgx.Rows) error, args ...any) error {
+  	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+  	defer cancel()
+
+  	conn, err := r.pool.Acquire(ctx)
+  	if err != nil {
+  		return fmt.Errorf("acquire conn failed: %w", err)
+  	}
+  	defer conn.Release()
+
+  	tx, err := conn.BeginTx(ctx, pgx.TxOptions{
+  		IsoLevel:   pgx.ReadCommitted,
+  		AccessMode: pgx.ReadOnly,
+  	})
+  	if err != nil {
+  		return fmt.Errorf("begin readonly tx failed: %w", err)
+  	}
+  	defer func() { _ = tx.Rollback(ctx) }()
+
+  	// Apply strict session isolation inside transaction
+  	initStatements := []string{
+  		fmt.Sprintf("SET LOCAL max_parallel_workers_per_gather = %d;", r.maxWorkers),
+  		fmt.Sprintf("SET LOCAL work_mem = '%s';", r.workMem),
+  		"SET LOCAL statement_timeout = '40s';",
+  	}
+  	for _, stmt := range initStatements {
+  		if _, err := tx.Exec(ctx, stmt); err != nil {
+  			return fmt.Errorf("failed to apply local parallel settings: %w", err)
+  		}
+  	}
+
+  	rows, err := tx.Query(ctx, query, args...)
+  	if err != nil {
+  		return fmt.Errorf("analytical query failed: %w", err)
+  	}
+  	defer rows.Close()
+
+  	if err := dest(rows); err != nil {
+  		return fmt.Errorf("processing rows failed: %w", err)
+  	}
+
+  	return nil
+  }
+  ```

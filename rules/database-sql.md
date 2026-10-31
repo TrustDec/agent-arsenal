@@ -3666,6 +3666,20 @@ alwaysApply: false
     - Implement continuous monitoring of `pg_notification_queue_usage()`; alert at > 25% utilization and auto-evict hung listener backends via `pg_terminate_backend()` before queue saturation triggers cluster write lockouts.
     - Coalesce multi-row batch mutations using statement-level triggers with transition tables (`REFERENCING NEW TABLE AS inserted`) or application-level commit hooks, delivering exactly one aggregated notification per transaction.
 
+- **Database Parallel Query Execution, Worker Starvation, DSM Exhaustion & Multiplied `work_mem` OOM Defense**:
+  - ❌ **Anti-Pattern: Silent Serial Plan Downgrade, Multiplied Memory OOMs & Gather Bottlenecks**:
+    - Allowing queries planned for multiple parallel workers to execute under worker pool saturation (`max_parallel_workers` / `max_worker_processes` exhausted), causing PostgreSQL to silently launch 0 workers and downgrade to a single-threaded leader sequential scan, turning sub-second queries into 40-second timeouts.
+    - Setting global `work_mem` high (e.g. 512MB) to avoid disk sort spills without accounting for worker multiplication, causing parallel queries with $W$ workers to consume $K \cdot (W + 1) \cdot \text{work\_mem}$, driving the Linux kernel to invoke OOM-killer `SIGKILL` on the postmaster.
+    - Running containerized PostgreSQL instances with default 64MB `/dev/shm` tmpfs, triggering `dsm_create: out of memory` or `could not resize shared memory segment: No space left on device` under concurrent parallel workloads.
+    - Streaming millions of raw unaggregated tuples across `Gather` nodes, pinning a single leader CPU core at 100% in IPC deserialization while parallel workers block waiting for shared message queue buffers.
+    - Calling unannotated PL/pgSQL functions or volatile expressions in scan predicates, which default to `VOLATILE` and `PARALLEL UNSAFE`, silently suppressing parallel execution across the entire query tree.
+  - ✅ **Production Invariant**:
+    - Strictly calibrate hardware limits: `max_parallel_workers_per_gather <= floor(cores / 2)` and `max_parallel_workers <= max_worker_processes`. Ensure `/dev/shm` tmpfs is mounted with at least $\max(1\text{GB}, 0.25 \times \text{RAM})$.
+    - Enforce **Dynamic Session `work_mem` Fencing**: analytical batch runners must apply `SET LOCAL work_mem` dynamically inside readonly transactions, scaled as $\min(\text{work\_mem}, \lfloor \text{budget} / (W + 1) \rfloor)$, preventing multi-worker memory multiplication spikes.
+    - Mandate **Partial Aggregation Pushdown**: ensure parallel workers perform `Partial Aggregate` locally so that only condensed summary rows (< 10,000 tuples) pass through `Gather` nodes to the leader for `Finalize Aggregate`.
+    - Strictly audit functions used in parallel queries for `PARALLEL SAFE` annotations and isolate any unavoidable unsafe operations into distinct temporary tables or isolated CTEs.
+    - Deploy `auto_explain` and `pg_stat_activity` sentinels to continuously detect `Workers Planned > Workers Launched` drift and alert when parallel worker starvation exceeds 5%.
+
 
 
 

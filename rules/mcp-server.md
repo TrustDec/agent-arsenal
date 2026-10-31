@@ -5149,3 +5149,80 @@ alwaysApply: false
       );
     }
     ```
+
+## 25. Database Parallel Query Safety, Worker Pool Sizing & Dynamic `work_mem` MCP Audit Tool
+
+When an MCP server exposes tools that execute database analytical scans, reports, or aggregations:
+
+- **Parallel Worker Starvation Defense**:
+  - Analytical tools must never trigger uncontrolled background worker exhaustion.
+  - Implement an MCP diagnostic tool allowing coding agents to evaluate query execution plans for `Workers Planned vs Workers Launched` drift and `work_mem` multiplication risk before running heavy scans:
+
+    ```typescript
+    import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+    import { z } from 'zod';
+
+    export function registerParallelQueryAuditTool(server: McpServer, dbPool: any) {
+      server.tool(
+        'audit_parallel_query_safety',
+        'Audits an analytical SQL query execution plan for worker starvation, DSM exhaustion, multiplied work_mem OOM risks, and Gather bottlenecks.',
+        {
+          sqlQuery: z.string().describe('The analytical SQL query to audit with EXPLAIN (ANALYZE, FORMAT JSON)'),
+          maxWorkersPerGather: z.number().default(4).describe('Configured max_parallel_workers_per_gather'),
+          workMemMb: z.number().default(64).describe('Configured work_mem in megabytes'),
+          systemRamMb: z.number().default(16384).describe('Total host RAM in megabytes'),
+        },
+        async ({ sqlQuery, maxWorkersPerGather, workMemMb, systemRamMb }) => {
+          const client = await dbPool.connect();
+          try {
+            const explainRes = await client.query(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${sqlQuery}`);
+            const plan = explainRes.rows[0]['QUERY PLAN'][0]['Plan'];
+
+            const violations: string[] = [];
+            let plannedWorkers = 0;
+            let launchedWorkers = 0;
+            let sortHashOps = 0;
+
+            const scanPlan = (node: any) => {
+              if (node['Node Type'] === 'Gather' || node['Node Type'] === 'Gather Merge') {
+                plannedWorkers = Math.max(plannedWorkers, node['Workers Planned'] ?? 0);
+                launchedWorkers = Math.max(launchedWorkers, node['Workers Launched'] ?? 0);
+              }
+              if (node['Node Type']?.includes('Sort') || node['Node Type']?.includes('Hash')) {
+                sortHashOps++;
+              }
+              for (const child of node.Plans ?? []) {
+                scanPlan(child);
+              }
+            };
+            scanPlan(plan);
+
+            if (plannedWorkers > 0 && launchedWorkers === 0) {
+              violations.push('WORKER_STARVATION: Planned parallel workers could not be launched. Saturated background pool.');
+            }
+
+            const peakMemoryMb = sortHashOps * (Math.max(1, launchedWorkers || plannedWorkers) + 1) * workMemMb;
+            if (peakMemoryMb > systemRamMb * 0.25) {
+              violations.push(`OOM_RISK: Peak query memory (${peakMemoryMb}MB) exceeds 25% of system RAM (${systemRamMb}MB).`);
+            }
+
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  status: violations.length === 0 ? 'SAFE' : 'RISK_DETECTED',
+                  plannedWorkers,
+                  launchedWorkers,
+                  sortHashOperations: sortHashOps,
+                  estimatedPeakMemoryMb: peakMemoryMb,
+                  violations,
+                }, null, 2),
+              }],
+            };
+          } finally {
+            client.release();
+          }
+        }
+      );
+    }
+    ```

@@ -4311,3 +4311,38 @@ alwaysApply: false
       return eventStream.send();
     });
     ```
+
+## 18. Nuxt 3 & Nitro Heavy Reporting & Parallel Query Streaming
+
+When handling heavy dashboard data tables, aggregations, or export endpoints:
+
+- **Chunked Streaming Response via Nitro**:
+  - Never buffer gigabyte analytical query results into V8 heap memory before responding.
+  - Stream results chunk-by-chunk using `sendStream` or `createEventStream`, applying `SET LOCAL work_mem` on the server transaction to prevent worker starvation and memory spikes:
+
+    ```ts
+    // server/api/reports/stream.get.ts
+    import { defineEventHandler } from 'h3';
+    import { getDbPool } from '~/server/utils/db';
+
+    export default defineEventHandler(async (event) => {
+      const pool = getDbPool();
+      const client = await pool.connect();
+
+      try {
+        await client.query('BEGIN READ ONLY');
+        await client.query('SET LOCAL max_parallel_workers_per_gather = 2');
+        await client.query('SET LOCAL work_mem = "32MB"');
+
+        const cursor = client.query(new (await import('pg-cursor')).default(
+          'SELECT metric_name, sum(value) as total FROM analytical_events GROUP BY metric_name'
+        ));
+
+        // Read chunks and stream to client without heap bloat
+        // ...
+      } finally {
+        await client.query('ROLLBACK');
+        client.release();
+      }
+    });
+    ```

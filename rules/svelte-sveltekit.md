@@ -5042,3 +5042,68 @@ alwaysApply: false
       },
     };
     ```
+
+## 18. SvelteKit & Svelte 5 Heavy Analytical Reporting & Stream Invariants
+
+When loading heavy aggregations or analytics dashboards in `+page.server.ts`:
+
+- **Streamed Promises & Runes Coordination**:
+  - In SvelteKit, return promises for slow analytical queries so the shell renders instantly with skeleton loaders while data streams over HTTP:
+    ```ts
+    // src/routes/analytics/+page.server.ts
+    import type { PageServerLoad } from './$types';
+    import { db } from '$lib/server/db';
+
+    export const load: PageServerLoad = async () => {
+      // Fast metadata resolves immediately
+      const summary = await db.getFastSummary();
+
+      // Heavy parallel query returns as an unresolved streaming promise
+      const heavyReportPromise = (async () => {
+        const client = await db.pool.connect();
+        try {
+          await client.query('BEGIN READ ONLY');
+          await client.query('SET LOCAL max_parallel_workers_per_gather = 2');
+          await client.query('SET LOCAL work_mem = "32MB"');
+          const res = await client.query('SELECT region, sum(revenue) as total FROM sales GROUP BY region');
+          await client.query('COMMIT');
+          return res.rows;
+        } finally {
+          client.release();
+        }
+      })();
+
+      return {
+        summary,
+        streamed: {
+          heavyReport: heavyReportPromise,
+        },
+      };
+    };
+    ```
+- **Svelte 5 Consumption via `await` block**:
+  ```svelte
+  <!-- src/routes/analytics/+page.svelte -->
+  <script lang="ts">
+    let { data } = $props();
+  </script>
+
+  <div class="space-y-6">
+    <h1 class="text-xl font-semibold tracking-tight">Revenue Analytics</h1>
+
+    {#await data.streamed.heavyReport}
+      <div class="h-48 animate-pulse rounded-lg bg-zinc-100 dark:bg-zinc-800" />
+    {:then rows}
+      <div class="divide-y divide-zinc-200 rounded-lg border border-zinc-200 dark:border-zinc-800">
+        {#each rows as row}
+          <div class="flex justify-between p-3 text-sm">
+            <span>{row.region}</span>
+            <span class="font-mono font-medium">${row.total.toLocaleString()}</span>
+          </div>
+        {/each}
+      </div>
+    {:catch error}
+      <p class="text-sm text-red-500">Failed to stream analytical report: {error.message}</p>
+    {/await}
+  </div>
+  ```
