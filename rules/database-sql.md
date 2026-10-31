@@ -3942,6 +3942,18 @@ alwaysApply: false
     - Enforce **Composite Index Consolidation**: replace disjoint multi-index bitmap boolean operations with composite indexes matching `(equality_cols..., range_or_sort_cols...)`.
     - Enforce **LIMIT Early-Termination Invariance**: preserve B-Tree index ordering for `ORDER BY ... LIMIT K` queries using plain `Index Scan` or `Index Only Scan` to stream results in $O(K)$ time.
 
+- **HashAggregate vs GroupAggregate, Disk Spilling Batches & Streaming Aggregation Invariants (PostgreSQL)**:
+  - ❌ **Anti-Pattern: Hash Disk Spills, Unindexed Sort Spills & LIMIT Traps**:
+    - Permitting `HashAggregate` to exceed `hashagg_max_mem` during grouping, triggering recursive multi-batch disk spills (`Batches > 1`, `Disk Usage > 0 kB`), creating NVMe write stalls and inflating query latency by 100x.
+    - Forcing `GroupAggregate` without backing B-Tree index coverage, causing PostgreSQL to insert a blocking `Sort` node that itself exceeds `work_mem` and spills to disk via external merge sorts (`Sort Method: external merge Disk`).
+    - Using `HashAggregate` on queries combining `GROUP BY` with `ORDER BY ... LIMIT K`, forcing the engine to scan and aggregate 100% of input rows into memory before emitting the first row, forfeiting $10,000\times$ streaming speedups.
+    - Unbounded stateful aggregators (`jsonb_agg`, `array_agg`) inside HashAggregate, exploding memory consumption beyond tuple sizing models and triggering Linux kernel OOM killer termination.
+  - ✅ **Production Invariant**:
+    - Enforce **Single-Batch HashAggregate Invariant**: assert `Batches == 1` and `Disk Usage == 0 kB` across all execution plans via automated CI gates.
+    - Enforce **Transaction-Scoped Memory Calibration**: dynamically size `SET LOCAL work_mem` and `SET LOCAL hash_mem_multiplier = 2.0` to guarantee $1.5\times$ headroom over estimated hash memory $M_{\text{hash}}(K)$.
+    - Enforce **Presorted B-Tree Index Coverage**: for high-cardinality groups ($K \ge 100,000$), create composite B-Tree indexes matching grouping keys to achieve $O(1)$ constant-memory streaming `GroupAggregate`.
+    - Enforce **LIMIT Early-Termination Pipelining**: pair presorted B-Tree indexes with `GroupAggregate` on `ORDER BY ... LIMIT K` queries to stream Top-$K$ groups in $O(K)$ time.
+
 
 
 

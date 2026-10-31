@@ -7003,6 +7003,95 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         };
       }
     );
+
+    // Tool: Audit Aggregation plan for HashAggregate disk spills & GroupAggregate sort spills
+    this.server.tool(
+      'audit_aggregation_plan',
+      'Parses EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) execution trees to verify zero-spill aggregation compliance (single-batch HashAggregate, disk usage == 0 kB, zero external merge sorts, and early-terminating LIMIT preservation)',
+      {
+        planJson: z.string().describe('Raw JSON output from EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)'),
+      },
+      async (args) => {
+        const parsed = JSON.parse(args.planJson);
+        const rootPlan = parsed[0]?.Plan;
+        if (!rootPlan) {
+          throw new Error('Invalid EXPLAIN JSON format: missing root Plan node');
+        }
+
+        let hasHashAgg = false;
+        let hasGroupAgg = false;
+        let spilledBatches = 0;
+        let diskUsageKb = 0;
+        let memoryUsageKb = 0;
+        let hasExternalMergeSort = false;
+        let hasEarlyTerminationTrap = false;
+
+        const traverse = (node: any, parent: any | null) => {
+          const nodeType = node['Node Type'] ?? '';
+          const strategy = node['Strategy'] ?? '';
+
+          if (nodeType === 'Aggregate' && strategy === 'Hashed') {
+            hasHashAgg = true;
+            const batches = node['Batches'] ?? 1;
+            const disk = node['Disk Usage'] ?? 0;
+            const mem = node['Memory Usage'] ?? 0;
+            if (batches > 1) spilledBatches += (batches - 1);
+            if (disk > 0) diskUsageKb += disk;
+            if (mem > memoryUsageKb) memoryUsageKb = mem;
+
+            if (parent && parent['Node Type'] === 'Limit') {
+              hasEarlyTerminationTrap = true;
+            }
+          }
+
+          if (nodeType === 'Aggregate' && (strategy === 'Sorted' || strategy === 'Plain')) {
+            hasGroupAgg = true;
+          }
+
+          if (nodeType === 'Sort') {
+            const spaceType = node['Sort Space Type'] ?? '';
+            const method = node['Sort Method'] ?? '';
+            if (spaceType === 'Disk' || method.includes('external merge')) {
+              hasExternalMergeSort = true;
+            }
+          }
+
+          if (Array.isArray(node.Plans)) {
+            for (const child of node.Plans) {
+              traverse(child, node);
+            }
+          }
+        };
+
+        traverse(rootPlan, null);
+
+        const isCompliant = spilledBatches === 0 && diskUsageKb === 0 && !hasExternalMergeSort;
+        const suggestedWorkMemMb = Math.max(Math.ceil((memoryUsageKb + diskUsageKb * 1.5) / 1024), 64);
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              hasHashAgg,
+              hasGroupAgg,
+              spilledBatches,
+              diskUsageKb,
+              memoryUsageKb,
+              hasExternalMergeSort,
+              hasEarlyTerminationTrap,
+              status: isCompliant ? 'compliant' : spilledBatches > 0 ? 'hashagg_disk_spill_detected' : 'sort_disk_spill_detected',
+              recommendation: spilledBatches > 0 || diskUsageKb > 0
+                ? `CRITICAL: HashAggregate spilled to disk (${spilledBatches} batches, ${diskUsageKb} kB). Increase transaction memory: SET LOCAL work_mem = '${suggestedWorkMemMb}MB'; SET LOCAL hash_mem_multiplier = 2.0;`
+                : hasExternalMergeSort
+                ? 'CRITICAL: Explicit Sort spilled to disk prior to GroupAggregate. Create a composite B-Tree index on grouping keys.'
+                : hasEarlyTerminationTrap
+                ? 'WARNING: HashAggregate used with LIMIT. Deploy B-Tree index to unlock index-backed streaming GroupAggregate.'
+                : '-- Aggregation plan is fully compliant (zero disk spills)',
+            }, null, 2),
+          }],
+        };
+      }
+    );
   }
   ```
 

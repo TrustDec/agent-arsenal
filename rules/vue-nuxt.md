@@ -5907,6 +5907,75 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   </template>
   ```
 
+- **PostgreSQL Aggregation Spill & Streaming Monitor (Vue 3 / Nuxt 3)**:
+  - ❌ **Anti-Pattern**: Failing to observe HashAggregate disk spilling batches in real-time APM telemetry, masking heavy NVMe write stalls behind generic database slow queries.
+  - ✅ **Production Invariant**: Implement Vue 3 Composition API reactive components displaying HashAggregate batches, memory vs disk usage, and GroupAggregate streaming compliance:
+  ```vue
+  <script setup lang="ts">
+  import { computed } from 'vue';
+
+  const props = withDefaults(defineProps<{
+    queryTitle?: string;
+    strategy?: 'Hashed' | 'Sorted' | 'Plain';
+    batches?: number;
+    diskUsageKb?: number;
+    memoryUsageKb?: number;
+    hasSortDiskSpill?: boolean;
+    isLimitTrap?: boolean;
+  }>(), {
+    queryTitle: 'Group Query',
+    strategy: 'Hashed',
+    batches: 1,
+    diskUsageKb: 0,
+    memoryUsageKb: 0,
+    hasSortDiskSpill: false,
+    isLimitTrap: false,
+  });
+
+  const isSpilling = computed(() => props.batches > 1 || props.diskUsageKb > 0 || props.hasSortDiskSpill);
+  const memoryDisplayMb = computed(() => (props.memoryUsageKb / 1024).toFixed(1));
+  const diskDisplayMb = computed(() => (props.diskUsageKb / 1024).toFixed(1));
+  </script>
+
+  <template>
+    <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 space-y-4">
+      <div class="flex items-center justify-between">
+        <div>
+          <h4 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{{ queryTitle }}</h4>
+          <span class="text-xs text-zinc-500">PostgreSQL Aggregation Monitor ({{ strategy }})</span>
+        </div>
+        <span
+          class="px-2.5 py-1 rounded-full text-xs font-medium"
+          :class="!isSpilling ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-400' : 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-400'"
+        >
+          {{ !isSpilling ? 'Zero Spill (Batches: 1)' : `Disk Spill (${diskDisplayMb} MB)` }}
+        </span>
+      </div>
+
+      <div class="grid grid-cols-3 gap-3 text-xs">
+        <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+          <span class="text-zinc-500">Batches / Mode:</span>
+          <span class="block font-mono font-medium" :class="!isSpilling ? 'text-zinc-900 dark:text-zinc-100' : 'text-rose-600'">
+            {{ batches }} {{ batches === 1 ? '(In-Memory)' : '(Multi-Batch)' }}
+          </span>
+        </div>
+        <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+          <span class="text-zinc-500">RAM / Disk:</span>
+          <span class="block font-mono font-medium" :class="diskUsageKb === 0 ? 'text-zinc-900 dark:text-zinc-100' : 'text-rose-600'">
+            {{ memoryDisplayMb }}MB / {{ diskDisplayMb }}MB
+          </span>
+        </div>
+        <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+          <span class="text-zinc-500">Streaming Status:</span>
+          <span class="block font-mono font-medium" :class="!isLimitTrap ? 'text-emerald-600' : 'text-amber-600'">
+            {{ !isLimitTrap ? (strategy === 'Sorted' ? 'Pipelined O(1)' : 'In-Memory') : 'Blocking Full Hash' }}
+          </span>
+        </div>
+      </div>
+    </div>
+  </template>
+  ```
+
 
 
 

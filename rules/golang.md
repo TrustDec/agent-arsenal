@@ -9327,6 +9327,115 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **PostgreSQL HashAggregate Disk Spill & GroupAggregate Streaming Invariants in Go**:
+  - ❌ **Anti-Pattern**: Allowing analytical grouping or metric rollup queries to spill HashAggregate tables to disk batches or force external merge sorts during GroupAggregate, causing latency spikes and connection pool starvation.
+  - ✅ **Production Invariant**: Use `jackc/pgx/v5` with transaction-scoped `SET LOCAL work_mem` calibration and plan auditing to assert zero spilled batches and zero disk usage:
+  ```go
+  // AggregationGovernor manages memory calibration and plan invariants for GROUP BY queries
+  type AggregationGovernor struct {
+  	Pool *pgxpool.Pool
+  }
+
+  // ExecuteWithCalibratedAggMemory executes an aggregation query with transaction-scoped memory boundaries
+  func (g *AggregationGovernor) ExecuteWithCalibratedAggMemory(
+  	ctx context.Context,
+  	workMemMB int,
+  	hashMemMultiplier float64,
+  	fn func(tx pgx.Tx) error,
+  ) error {
+  	tx, err := g.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+  	if err != nil {
+  		return fmt.Errorf("begin tx: %w", err)
+  	}
+  	defer tx.Rollback(ctx)
+
+  	setSQL := fmt.Sprintf("SET LOCAL work_mem = '%dMB'", workMemMB)
+  	if _, err := tx.Exec(ctx, setSQL); err != nil {
+  		return fmt.Errorf("set local work_mem: %w", err)
+  	}
+
+  	if hashMemMultiplier > 1.0 {
+  		multSQL := fmt.Sprintf("SET LOCAL hash_mem_multiplier = '%.1f'", hashMemMultiplier)
+  		if _, err := tx.Exec(ctx, multSQL); err != nil {
+  			return fmt.Errorf("set local hash_mem_multiplier: %w", err)
+  		}
+  	}
+
+  	if err := fn(tx); err != nil {
+  		return err
+  	}
+
+  	return tx.Commit(ctx)
+  }
+
+  // AuditAggregationPlan asserts that an EXPLAIN plan contains single-batch HashAggregates and zero disk spills
+  func (g *AggregationGovernor) AuditAggregationPlan(ctx context.Context, querySQL string, args ...any) error {
+  	explainSQL := fmt.Sprintf("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) %s", querySQL)
+
+  	ctxTimeout, cancel := context.WithTimeout(ctx, 10*time.Second)
+  	defer cancel()
+
+  	var rawJSON []byte
+  	if err := g.Pool.QueryRow(ctxTimeout, explainSQL, args...).Scan(&rawJSON); err != nil {
+  		return fmt.Errorf("explain query failed: %w", err)
+  	}
+
+  	var plans []struct {
+  		Plan map[string]any `json:"Plan"`
+  	}
+  	if err := json.Unmarshal(rawJSON, &plans); err != nil || len(plans) == 0 {
+  		return fmt.Errorf("parse explain json: %w", err)
+  	}
+
+  	var spilledBatches float64
+  	var diskUsageKb float64
+  	var externalMergeSort bool
+
+  	var inspect func(node map[string]any)
+  	inspect = func(node map[string]any) {
+  		nodeType, _ := node["Node Type"].(string)
+  		strategy, _ := node["Strategy"].(string)
+
+  		if nodeType == "Aggregate" && strategy == "Hashed" {
+  			if batches, ok := node["Batches"].(float64); ok && batches > 1 {
+  				spilledBatches += (batches - 1)
+  			}
+  			if disk, ok := node["Disk Usage"].(float64); ok && disk > 0 {
+  				diskUsageKb += disk
+  			}
+  		}
+
+  		if nodeType == "Sort" {
+  			if spaceType, _ := node["Sort Space Type"].(string); spaceType == "Disk" {
+  				externalMergeSort = true
+  			}
+  			if sortMethod, _ := node["Sort Method"].(string); sortMethod == "external merge Disk" {
+  				externalMergeSort = true
+  			}
+  		}
+
+  		if children, ok := node["Plans"].([]any); ok {
+  			for _, c := range children {
+  				if childMap, ok := c.(map[string]any); ok {
+  					inspect(childMap)
+  				}
+  			}
+  		}
+  	}
+
+  	inspect(plans[0].Plan)
+
+  	if spilledBatches > 0 || diskUsageKb > 0 {
+  		return fmt.Errorf("hash aggregate spill: %.0f spilled batches, %.0f kB disk used", spilledBatches, diskUsageKb)
+  	}
+  	if externalMergeSort {
+  		return fmt.Errorf("sort spill: explicit Sort node spilled to disk prior to GroupAggregate")
+  	}
+
+  	return nil
+  }
+  ```
+
 
 
 

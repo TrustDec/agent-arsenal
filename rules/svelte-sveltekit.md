@@ -6648,6 +6648,64 @@ In SvelteKit administrative consoles and system diagnostics:
   </div>
   ```
 
+- **PostgreSQL Aggregation Spill & Streaming Sentinel (Svelte 5 Runes)**:
+  - ❌ **Anti-Pattern**: Omitting observability for HashAggregate disk spills or Sort spills, hiding multi-gigabyte disk write stalls behind slow API response times.
+  - ✅ **Production Invariant**: Use Svelte 5 `$props()` and `$derived()` runes to monitor HashAggregate batches, disk spillover, and GroupAggregate streaming status:
+  ```svelte
+  <script lang="ts">
+    interface Props {
+      queryTitle: string;
+      strategy: 'Hashed' | 'Sorted' | 'Plain';
+      batches?: number;
+      diskUsageKb?: number;
+      memoryUsageKb?: number;
+      hasSortDiskSpill?: boolean;
+      isLimitTrap?: boolean;
+    }
+
+    let {
+      queryTitle,
+      strategy,
+      batches = 1,
+      diskUsageKb = 0,
+      memoryUsageKb = 0,
+      hasSortDiskSpill = false,
+      isLimitTrap = false,
+    }: Props = $props();
+
+    const isSpilling = $derived(batches > 1 || diskUsageKb > 0 || hasSortDiskSpill);
+    const memoryDisplayMb = $derived((memoryUsageKb / 1024).toFixed(1));
+    const diskDisplayMb = $derived((diskUsageKb / 1024).toFixed(1));
+  </script>
+
+  <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 space-y-4">
+    <div class="flex items-center justify-between">
+      <div>
+        <h4 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{queryTitle}</h4>
+        <span class="text-xs text-zinc-500">PostgreSQL Aggregation Sentinel ({strategy})</span>
+      </div>
+      <span class="px-2.5 py-1 rounded-full text-xs font-medium {!isSpilling ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-400' : 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-400'}">
+        {!isSpilling ? 'Zero Spill (Batches: 1)' : `Disk Spill (${diskDisplayMb} MB)`}
+      </span>
+    </div>
+
+    <div class="grid grid-cols-3 gap-3 text-xs">
+      <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+        <span class="text-zinc-500">Batches / Mode:</span>
+        <span class="block font-mono font-medium {!isSpilling ? 'text-zinc-900 dark:text-zinc-100' : 'text-rose-600'}">{batches} {batches === 1 ? '(In-Memory)' : '(Multi-Batch)'}</span>
+      </div>
+      <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+        <span class="text-zinc-500">RAM / Disk:</span>
+        <span class="block font-mono font-medium {diskUsageKb === 0 ? 'text-zinc-900 dark:text-zinc-100' : 'text-rose-600'}">{memoryDisplayMb}MB / {diskDisplayMb}MB</span>
+      </div>
+      <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+        <span class="text-zinc-500">Streaming Status:</span>
+        <span class="block font-mono font-medium {!isLimitTrap ? 'text-emerald-600' : 'text-amber-600'}">{!isLimitTrap ? (strategy === 'Sorted' ? 'Pipelined O(1)' : 'In-Memory') : 'Blocking Full Hash'}</span>
+      </div>
+    </div>
+  </div>
+  ```
+
 
 
 
