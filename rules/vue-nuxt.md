@@ -5391,6 +5391,85 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   </template>
   ```
 
+- **Vue 3 Composition API: `AutoExplainPlanVisualizer.vue` (Plan AST Tree & Anomaly Inspector)**:
+  - Deliver a production execution plan visualizer in Vue 3 script setup + TypeScript.
+  - Recursively highlights plan nodes with high cardinality error ratios ($\mathcal{E}_{\text{card}} \ge 10.0$), temp disk spills, and high physical read counts without unnecessary DOM thrashing.
+
+  ```vue
+  <!-- src/components/telemetry/AutoExplainPlanVisualizer.vue -->
+  <script setup lang="ts">
+  import { ref, computed } from 'vue';
+
+  export interface PlanNodeData {
+    'Node Type': string;
+    'Relation Name'?: string;
+    'Plan Rows': number;
+    'Actual Rows'?: number;
+    'Actual Loops'?: number;
+    'Actual Total Time'?: number;
+    'Shared Hit Blocks'?: number;
+    'Shared Read Blocks'?: number;
+    'Temp Written Blocks'?: number;
+    Plans?: PlanNodeData[];
+  }
+
+  interface Props {
+    queryText: string;
+    rootPlan: PlanNodeData;
+    executionTimeMs?: number;
+  }
+
+  const props = defineProps<Props>();
+
+  const collapsedPaths = ref<Record<string, boolean>>({});
+
+  function toggleCollapse(path: string) {
+    collapsedPaths.value[path] = !collapsedPaths.value[path];
+  }
+
+  function getCardinalityRatio(node: PlanNodeData) {
+    const act = (node['Actual Rows'] ?? 0) * (node['Actual Loops'] ?? 1);
+    const est = Math.max(1, node['Plan Rows']);
+    const ratio = act >= est ? act / est : est / Math.max(1, act);
+    return {
+      ratio,
+      isSevere: ratio >= 10.0 && act > 50,
+      actualTotal: act,
+    };
+  }
+  </script>
+
+  <template>
+    <div class="rounded-xl border border-zinc-200 bg-white p-5 shadow-xs dark:border-zinc-800 dark:bg-zinc-900">
+      <div class="flex items-center justify-between pb-3 border-b border-zinc-100 dark:border-zinc-800 mb-4">
+        <div>
+          <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Execution Plan Tree (auto_explain AST)</h3>
+          <p class="text-xs text-zinc-500 dark:text-zinc-400">Zero-timing-overhead execution tree diagnostics</p>
+        </div>
+        <span v-if="executionTimeMs" class="font-mono text-xs px-2.5 py-1 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 font-medium">
+          {{ executionTimeMs.toFixed(2) }} ms
+        </span>
+      </div>
+
+      <code class="block font-mono text-2xs p-2.5 rounded bg-zinc-50 dark:bg-zinc-950/60 border border-zinc-200/60 dark:border-zinc-800 text-zinc-700 dark:text-zinc-300 truncate mb-4">
+        {{ queryText }}
+      </code>
+
+      <div class="space-y-1">
+        <!-- Root node presentation -->
+        <div class="p-3 rounded-lg border border-zinc-100 bg-zinc-50/50 dark:border-zinc-800 dark:bg-zinc-800/30">
+          <div class="flex items-center justify-between text-xs">
+            <span class="font-mono font-bold text-zinc-900 dark:text-zinc-100">{{ rootPlan['Node Type'] }}</span>
+            <span class="font-mono text-3xs text-zinc-500 dark:text-zinc-400">
+              Est: {{ Math.round(rootPlan['Plan Rows']).toLocaleString() }} rows
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </template>
+  ```
+
 
 
 

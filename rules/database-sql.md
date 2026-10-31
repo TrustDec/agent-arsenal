@@ -3842,6 +3842,20 @@ alwaysApply: false
     - Deploy **Zero Temp Spill Defense**: assert $\Delta \text{temp\_blks\_written} = 0$ on all OLTP query paths; hoist sorting to indexes or tune per-node `work_mem`.
     - Enforce **Parameterized Bind Normalization**: eliminate variable-length dynamic IN lists via `= ANY($1::type[])` to maintain stable normalized query hashes and prevent ring buffer evictions.
 
+- **`auto_explain` Execution Plan Logging, Syscall Timing Overhead Containment & High-TPS Sampling Invariants (PostgreSQL 12–17+)**:
+  - ❌ **Anti-Pattern: 100% Timing Overhead Meltdown & PL/pgSQL Nested Log Bomb**:
+    - Enabling `auto_explain.log_analyze = on` with `auto_explain.log_timing = on` without sampling on high-TPS workloads; kernel clock timers (`gettimeofday` / `clock_gettime`) called millions of times per second inside nested loops spike CPU utilization by 15%–50% and inflate p99 latency.
+    - Activating `auto_explain.log_nested_statements = on` globally without duration thresholds; PL/pgSQL functions or triggers executing loops emit thousands of plans per second, saturating disk write bandwidth and causing cluster failovers.
+    - Operating with `auto_explain.log_buffers = off` or `auto_explain.log_wal = off`, blinding engineers to whether slow queries were bound by NVMe physical reads, temp disk spills, or WAL writeback stalls.
+    - Using plain text format `auto_explain.log_format = text`; multi-line indented strings split across distributed log forwarders (FluentBit, Vector, Datadog), corrupting AST parsers and blinding AI agents.
+    - Setting `auto_explain.log_min_duration = 0` in production, forcing backends to format plans for every query and locking syslog queues.
+  - ✅ **Production Invariant**:
+    - Enforce **Structured JSON Emission**: always configure `auto_explain.log_format = json` for lossless machine-verifiable AST ingestion and automated cardinality divergence analysis.
+    - Enforce **Timing Syscall Overhead Containment**: on high-throughput systems, set `auto_explain.log_timing = off` (which preserves exact row counts while eliminating 90% of timing overhead) or deploy statistical sampling `auto_explain.sample_rate <= 0.05`.
+    - Enforce **Mandatory Buffer & WAL Instrumentation**: always set `auto_explain.log_buffers = on` and `auto_explain.log_wal = on` to capture shared buffer hits, physical disk reads, and temp spillage.
+    - Enforce **Transaction-Scoped Canary Overrides**: evaluate slow query paths safely inside transactions via `SET LOCAL auto_explain.log_min_duration = '50ms'` rather than mutating cluster-wide settings.
+    - Enforce **Cardinality Divergence Sentinel**: flag any plan node where $\mathcal{E}_{\text{card}} = \max(R_{\text{act}}/R_{\text{est}}, R_{\text{est}}/R_{\text{act}}) \ge 10.0$ and duration $>20\text{ms}$ as a critical statistical regression requiring `ANALYZE` or `CREATE STATISTICS`.
+
 
 
 

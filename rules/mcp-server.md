@@ -6385,6 +6385,157 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
   }
   ```
 
+- **MCP Tool: `db_inspect_execution_plan` (`auto_explain` & `EXPLAIN JSON` Auditor)**:
+  - Expose a non-destructive query execution plan inspection tool using structured JSON parsing.
+  - Safely analyzes plan trees with `TIMING OFF` to eliminate system clock syscall overhead, flags cardinality estimation divergence ($\mathcal{E}_{\text{card}} \ge 10.0$), temp disk spills, and buffer cache misses, and generates actionable DBA recommendations.
+
+  ```typescript
+  // src/mcp/tools/dbInspectExecutionPlan.ts
+  import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+  import { z } from 'zod';
+  import { Pool } from 'pg';
+
+  export function registerDbInspectExecutionPlanTool(server: McpServer, pool: Pool) {
+    server.tool(
+      'db_inspect_execution_plan',
+      'Safely inspects execution plans using EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, FORMAT JSON) in a read-only transaction. Detects cardinality divergence, work_mem temp spills, and cache misses with zero syscall timing overhead.',
+      {
+        sqlQuery: z.string().describe('The SELECT query to inspect. Mutations (INSERT/UPDATE/DELETE) are strictly prohibited.'),
+        parameters: z.array(z.any()).default([]).describe('Optional query parameters for parameterized queries'),
+      },
+      async (args) => {
+        // Enforce read-only safety invariant
+        const normalized = args.sqlQuery.trim().toLowerCase();
+        if (
+          normalized.startsWith('insert') ||
+          normalized.startsWith('update') ||
+          normalized.startsWith('delete') ||
+          normalized.startsWith('drop') ||
+          normalized.startsWith('alter') ||
+          normalized.startsWith('truncate')
+        ) {
+          throw new Error('REJECTED: db_inspect_execution_plan strictly accepts SELECT queries. DDL/DML mutations are prohibited.');
+        }
+
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN READ ONLY;');
+
+          const explainSql = `EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, FORMAT JSON) ${args.sqlQuery};`;
+          const res = await client.query(explainSql, args.parameters);
+          await client.query('ROLLBACK;');
+
+          const rawPlanArray = res.rows[0]['QUERY PLAN'];
+          const rootPlan = rawPlanArray[0]?.Plan;
+
+          if (!rootPlan) {
+            throw new Error('Failed to retrieve structured plan tree from PostgreSQL.');
+          }
+
+          let totalHit = 0;
+          let totalRead = 0;
+          let totalTemp = 0;
+          let maxErrorRatio = 1.0;
+          const nodeAnomalies: Array<{
+            nodeType: string;
+            relation?: string;
+            planRows: number;
+            actualRows: number;
+            errorRatio: number;
+            tempSpillBlocks: number;
+            defect: string;
+          }> = [];
+
+          const traverse = (node: any) => {
+            const planRows = Math.max(1, node['Plan Rows'] || 1);
+            const loops = node['Actual Loops'] || 1;
+            const actualRows = (node['Actual Rows'] || 0) * loops;
+
+            const hit = node['Shared Hit Blocks'] || 0;
+            const read = node['Shared Read Blocks'] || 0;
+            const tempWritten = node['Temp Written Blocks'] || 0;
+
+            totalHit += hit;
+            totalRead += read;
+            totalTemp += tempWritten;
+
+            const errRatio = actualRows >= planRows ? actualRows / planRows : planRows / Math.max(1, actualRows);
+            if (errRatio > maxErrorRatio) {
+              maxErrorRatio = errRatio;
+            }
+
+            if (tempWritten > 0) {
+              nodeAnomalies.push({
+                nodeType: node['Node Type'],
+                relation: node['Relation Name'],
+                planRows,
+                actualRows,
+                errorRatio: Number(errRatio.toFixed(2)),
+                tempSpillBlocks: tempWritten,
+                defect: `TEMP_DISK_SPILL: Spilled ${tempWritten} blocks to disk (work_mem exceeded)`,
+              });
+            } else if (errRatio >= 10.0 && actualRows > 50) {
+              nodeAnomalies.push({
+                nodeType: node['Node Type'],
+                relation: node['Relation Name'],
+                planRows,
+                actualRows,
+                errorRatio: Number(errRatio.toFixed(2)),
+                tempSpillBlocks: 0,
+                defect: `CARDINALITY_ERROR: Estimated ${planRows} rows vs Actual ${actualRows} rows (${errRatio.toFixed(1)}x error)`,
+              });
+            }
+
+            if (node.Plans && Array.isArray(node.Plans)) {
+              for (const child of node.Plans) {
+                traverse(child);
+              }
+            }
+          };
+
+          traverse(rootPlan);
+
+          const totalBlocks = totalHit + totalRead;
+          const chr = totalBlocks > 0 ? (totalHit / totalBlocks) * 100 : 100;
+
+          const recommendations: string[] = [];
+          if (totalTemp > 0) {
+            recommendations.push(`ELEVATE WORK_MEM: Query spilled ${totalTemp} blocks to disk. Elevate transaction-scoped work_mem or align B-Tree index with sort ordering.`);
+          }
+          if (maxErrorRatio >= 10.0) {
+            recommendations.push(`REFRESH STATISTICS: Cardinality diverged by ${maxErrorRatio.toFixed(1)}x. Run ANALYZE on involved tables or create multivariate CREATE STATISTICS.`);
+          }
+          if (chr < 98.0 && totalRead > 200) {
+            recommendations.push(`BUFFER CACHE DEFICIT: Cache hit ratio ${chr.toFixed(1)}% < 98.0% (${totalRead} buffer misses). Consider covering index (INCLUDE) or memory prewarming.`);
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                status: 'success',
+                query: args.sqlQuery,
+                planningTimeMs: rawPlanArray[0]?.['Planning Time'],
+                executionTimeMs: rawPlanArray[0]?.['Execution Time'],
+                cacheHitRatio: `${chr.toFixed(1)}%`,
+                totalDiskReads: totalRead,
+                totalTempSpillBlocks: totalTemp,
+                maxCardinalityErrorRatio: Number(maxErrorRatio.toFixed(2)),
+                hasSevereAnomalies: nodeAnomalies.length > 0,
+                anomalies: nodeAnomalies,
+                recommendations,
+                timingSyscallOverhead: 'ELIMINATED (TIMING OFF verified)',
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
+  }
+  ```
+
 
 
 

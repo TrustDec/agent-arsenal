@@ -6082,6 +6082,137 @@ In SvelteKit administrative consoles and system diagnostics:
   </div>
   ```
 
+- **Svelte 5 Runes: `AutoExplainPlanViewer.svelte` (Hierarchical Execution Plan Inspector)**:
+  - Construct a production execution plan visualizer in Svelte 5 using `$state` and `$derived` runes.
+  - Recursively highlights plan nodes with high cardinality error ratios ($\mathcal{E}_{\text{card}} \ge 10.0$), temp disk spills, and high physical read counts without unnecessary DOM thrashing.
+
+  ```svelte
+  <!-- src/lib/components/AutoExplainPlanViewer.svelte -->
+  <script lang="ts">
+    interface PlanNodeData {
+      'Node Type': string;
+      'Relation Name'?: string;
+      'Plan Rows': number;
+      'Actual Rows'?: number;
+      'Actual Loops'?: number;
+      'Actual Total Time'?: number;
+      'Shared Hit Blocks'?: number;
+      'Shared Read Blocks'?: number;
+      'Temp Written Blocks'?: number;
+      Plans?: PlanNodeData[];
+    }
+
+    interface Props {
+      queryText: string;
+      rootPlan: PlanNodeData;
+      executionTimeMs?: number;
+      onClose?: () => void;
+    }
+
+    let { queryText, rootPlan, executionTimeMs, onClose }: Props = $props();
+
+    // Svelte 5 state for expanded nodes
+    let expandedNodes = $state<Record<string, boolean>>({ root: true });
+
+    function toggleNode(key: string) {
+      expandedNodes[key] = !expandedNodes[key];
+    }
+
+    // Helper to evaluate cardinality discrepancy
+    function getCardinalityRatio(node: PlanNodeData): { ratio: number; isSevere: boolean } {
+      const act = (node['Actual Rows'] ?? 0) * (node['Actual Loops'] ?? 1);
+      const est = Math.max(1, node['Plan Rows']);
+      const ratio = act >= est ? act / est : est / Math.max(1, act);
+      return { ratio, isSevere: ratio >= 10.0 && act > 50 };
+    }
+  </script>
+
+  <div class="rounded-xl border border-zinc-200 bg-white p-5 shadow-xs dark:border-zinc-800 dark:bg-zinc-900">
+    <div class="flex items-center justify-between pb-3 border-b border-zinc-100 dark:border-zinc-800 mb-4">
+      <div>
+        <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">PostgreSQL Execution Plan Inspector</h3>
+        <p class="text-xs text-zinc-500 dark:text-zinc-400">Structured auto_explain AST tree (TIMING OFF verified)</p>
+      </div>
+      {#if executionTimeMs}
+        <span class="font-mono text-xs px-2.5 py-1 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 font-medium">
+          {executionTimeMs.toFixed(2)} ms
+        </span>
+      {/if}
+    </div>
+
+    <code class="block font-mono text-2xs p-2.5 rounded bg-zinc-50 dark:bg-zinc-950/60 border border-zinc-200/60 dark:border-zinc-800 text-zinc-700 dark:text-zinc-300 truncate mb-4">
+      {queryText}
+    </code>
+
+    <!-- Recursive Tree Component snippet -->
+    {#snippet renderNode(node: PlanNodeData, path: string, depth: number)}
+      {@const { ratio, isSevere } = getCardinalityRatio(node)}
+      {@const actRows = (node['Actual Rows'] ?? 0) * (node['Actual Loops'] ?? 1)}
+      {@const tempBlocks = node['Temp Written Blocks'] ?? 0}
+      {@const diskReads = node['Shared Read Blocks'] ?? 0}
+      {@const isExpanded = expandedNodes[path] ?? true}
+
+      <div class="py-1.5" style="padding-left: {depth * 16}px;">
+        <div class="flex items-center justify-between p-2 rounded-lg border text-xs {isSevere || tempBlocks > 0 ? 'border-rose-200 bg-rose-50/40 dark:border-rose-900/40 dark:bg-rose-950/20' : 'border-zinc-100 bg-zinc-50/50 dark:border-zinc-800/60 dark:bg-zinc-800/30'}">
+          <div class="flex items-center gap-2 min-w-0">
+            {#if node.Plans && node.Plans.length > 0}
+              <button
+                type="button"
+                onclick={() => toggleNode(path)}
+                class="w-4 h-4 text-3xs font-mono rounded bg-zinc-200 dark:bg-zinc-700 text-zinc-700 dark:text-zinc-300"
+              >
+                {isExpanded ? '−' : '+'}
+              </button>
+            {:else}
+              <span class="w-4"></span>
+            {/if}
+            <span class="font-mono font-semibold text-zinc-900 dark:text-zinc-100">{node['Node Type']}</span>
+            {#if node['Relation Name']}
+              <span class="font-mono text-3xs text-zinc-500 dark:text-zinc-400">on {node['Relation Name']}</span>
+            {/if}
+            {#if isSevere}
+              <span class="px-1.5 py-0.2 rounded text-3xs font-bold bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300">
+                Skew {ratio.toFixed(1)}x
+              </span>
+            {/if}
+            {#if tempBlocks > 0}
+              <span class="px-1.5 py-0.2 rounded text-3xs font-bold bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-300">
+                Temp Disk Spill ({tempBlocks} blks)
+              </span>
+            {/if}
+          </div>
+
+          <div class="flex items-center gap-3 text-right shrink-0 font-mono text-3xs">
+            <div>
+              <span class="text-zinc-400">EST: </span>
+              <span class="text-zinc-600 dark:text-zinc-400">{Math.round(node['Plan Rows']).toLocaleString()}</span>
+            </div>
+            <div>
+              <span class="text-zinc-400">ACT: </span>
+              <span class="text-zinc-900 dark:text-zinc-100 font-semibold">{Math.round(actRows).toLocaleString()}</span>
+            </div>
+            {#if diskReads > 0}
+              <div class="text-indigo-600 dark:text-indigo-400">
+                {diskReads} reads
+              </div>
+            {/if}
+          </div>
+        </div>
+
+        {#if isExpanded && node.Plans}
+          {#each node.Plans as child, idx}
+            {@render renderNode(child, `${path}_${idx}`, depth + 1)}
+          {/each}
+        {/if}
+      </div>
+    {/snippet}
+
+    <div class="space-y-1">
+      {@render renderNode(rootPlan, 'root', 0)}
+    </div>
+  </div>
+  ```
+
 
 
 

@@ -8651,6 +8651,207 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **PostgreSQL `auto_explain` JSON Execution Plan Parser & Cardinality Divergence Sentinel**:
+  - Implement production execution plan inspection using `jackc/pgx/v5` with transaction-scoped `auto_explain` and `EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, FORMAT JSON)`.
+  - Automatically parses node hierarchies, detects cardinality estimation divergence ($\mathcal{E}_{\text{card}} \ge 10.0$), flags work_mem temp disk spillage, and isolates cache hit deficits without system clock syscall overhead.
+
+  ```go
+  // internal/telemetry/auto_explain_auditor.go
+  package telemetry
+
+  import (
+  	"context"
+  	"encoding/json"
+  	"fmt"
+  	"log/slog"
+  	"math"
+  	"time"
+
+  	"github.com/jackc/pgx/v5"
+  	"github.com/jackc/pgx/v5/pgxpool"
+  )
+
+  type PlanNodeAudit struct {
+  	NodeType             string  `json:"node_type"`
+  	RelationName         string  `json:"relation_name,omitempty"`
+  	PlanRows             float64 `json:"plan_rows"`
+  	ActualRows           float64 `json:"actual_rows"`
+  	ActualLoops          float64 `json:"actual_loops"`
+  	TotalActualRows      float64 `json:"total_actual_rows"`
+  	CardinalityErrorRatio float64 `json:"cardinality_error_ratio"`
+  	SharedHitBlocks      int64   `json:"shared_hit_blocks"`
+  	SharedReadBlocks     int64   `json:"shared_read_blocks"`
+  	TempWrittenBlocks    int64   `json:"temp_written_blocks"`
+  	ExecutionTimeMs      float64 `json:"execution_time_ms"`
+  	Defect               string  `json:"defect,omitempty"`
+  }
+
+  type ExecutionPlanAuditReport struct {
+  	QueryText           string          `json:"query_text"`
+  	TotalDurationMs     float64         `json:"total_duration_ms"`
+  	CacheHitRatio       float64         `json:"cache_hit_ratio"`
+  	TotalDiskReads      int64           `json:"total_disk_reads"`
+  	TotalTempSpill      int64           `json:"total_temp_spill"`
+  	MaxCardinalityError float64         `json:"max_cardinality_error"`
+  	HasSevereAnomalies  bool            `json:"has_severe_anomalies"`
+  	NodeAudits          []PlanNodeAudit `json:"node_audits"`
+  	Recommendations     []string        `json:"recommendations"`
+  }
+
+  type AutoExplainPlanAuditor struct {
+  	pool   *pgxpool.Pool
+  	logger *slog.Logger
+  }
+
+  func NewAutoExplainPlanAuditor(pool *pgxpool.Pool, logger *slog.Logger) *AutoExplainPlanAuditor {
+  	return &AutoExplainPlanAuditor{pool: pool, logger: logger}
+  }
+
+  // AuditQueryPlan runs an isolated EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, FORMAT JSON)
+  // in a read-only transaction, ensuring zero clock-timing syscall overhead and no global side effects.
+  func (a *AutoExplainPlanAuditor) AuditQueryPlan(
+  	ctx context.Context,
+  	sqlQuery string,
+  	params ...any,
+  ) (*ExecutionPlanAuditReport, error) {
+  	conn, err := a.pool.Acquire(ctx)
+  	if err != nil {
+  		return nil, fmt.Errorf("failed to acquire connection from pool: %w", err)
+  	}
+  	defer conn.Release()
+
+  	tx, err := conn.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+  	if err != nil {
+  		return nil, fmt.Errorf("failed to begin audit transaction: %w", err)
+  	}
+  	defer tx.Rollback(ctx)
+
+  	explainSQL := fmt.Sprintf("EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, FORMAT JSON) %s", sqlQuery)
+
+  	var rawJSON []byte
+  	start := time.Now()
+  	if err := tx.QueryRow(ctx, explainSQL, params...).Scan(&rawJSON); err != nil {
+  		return nil, fmt.Errorf("failed to execute explain query: %w", err)
+  	}
+  	totalDuration := time.Since(start)
+
+  	var rootSlice []map[string]interface{}
+  	if err := json.Unmarshal(rawJSON, &rootSlice); err != nil || len(rootSlice) == 0 {
+  		return nil, fmt.Errorf("failed to unmarshal explain json: %w", err)
+  	}
+
+  	rootPlan, ok := rootSlice[0]["Plan"].(map[string]interface{})
+  	if !ok {
+  		return nil, fmt.Errorf("malformed plan tree root in explain json")
+  	}
+
+  	var nodeAudits []PlanNodeAudit
+  	var totalHit, totalRead, totalTemp int64
+  	var maxErrorRatio float64 = 1.0
+
+  	var traverse func(node map[string]interface{})
+  	traverse = func(node map[string]interface{}) {
+  		nodeType, _ := node["Node Type"].(string)
+  		relName, _ := node["Relation Name"].(string)
+  		planRows, _ := node["Plan Rows"].(float64)
+  		actRows, _ := node["Actual Rows"].(float64)
+  		actLoops, _ := node["Actual Loops"].(float64)
+  		if actLoops <= 0 {
+  			actLoops = 1.0
+  		}
+  		totalActualRows := actRows * actLoops
+
+  		var hit, read, tempWritten int64
+  		if v, ok := node["Shared Hit Blocks"].(float64); ok {
+  			hit = int64(v)
+  		}
+  		if v, ok := node["Shared Read Blocks"].(float64); ok {
+  			read = int64(v)
+  		}
+  		if v, ok := node["Temp Written Blocks"].(float64); ok {
+  			tempWritten = int64(v)
+  		}
+
+  		totalHit += hit
+  		totalRead += read
+  		totalTemp += tempWritten
+
+  		// Compute cardinality error ratio
+  		estSafe := math.Max(1.0, planRows)
+  		actSafe := math.Max(1.0, totalActualRows)
+  		errorRatio := actSafe / estSafe
+  		if estSafe > actSafe {
+  			errorRatio = estSafe / actSafe
+  		}
+  		if errorRatio > maxErrorRatio {
+  			maxErrorRatio = errorRatio
+  		}
+
+  		var defect string
+  		if tempWritten > 0 {
+  			defect = fmt.Sprintf("TEMP_DISK_SPILL: %d blocks spilled to disk during execution", tempWritten)
+  		} else if errorRatio >= 10.0 && totalActualRows > 50 {
+  			defect = fmt.Sprintf("CARDINALITY_MISMATCH: Estimated %.0f rows vs Actual %.0f rows (%.1fx error)", planRows, totalActualRows, errorRatio)
+  		} else if read > 1000 {
+  			defect = fmt.Sprintf("HEAVY_DISK_READ: %d blocks read from disk", read)
+  		}
+
+  		nodeAudits = append(nodeAudits, PlanNodeAudit{
+  			NodeType:              nodeType,
+  			RelationName:          relName,
+  			PlanRows:              planRows,
+  			ActualRows:            actRows,
+  			ActualLoops:           actLoops,
+  			TotalActualRows:       totalActualRows,
+  			CardinalityErrorRatio: math.Round(errorRatio*100) / 100,
+  			SharedHitBlocks:       hit,
+  			SharedReadBlocks:      read,
+  			TempWrittenBlocks:     tempWritten,
+  			Defect:                defect,
+  		})
+
+  		if childPlans, ok := node["Plans"].([]interface{}); ok {
+  			for _, child := range childPlans {
+  				if childMap, ok := child.(map[string]interface{}); ok {
+  					traverse(childMap)
+  				}
+  			}
+  		}
+  	}
+
+  	traverse(rootPlan)
+
+  	totalBlocks := totalHit + totalRead
+  	chr := 100.0
+  	if totalBlocks > 0 {
+  		chr = (float64(totalHit) / float64(totalBlocks)) * 100.0
+  	}
+
+  	var recs []string
+  	if totalTemp > 0 {
+  		recs = append(recs, fmt.Sprintf("WORK_MEM SPILL: Query spilled %d blocks to disk. Elevate transaction-scoped work_mem or align B-Tree index with sort ordering.", totalTemp))
+  	}
+  	if maxErrorRatio >= 10.0 {
+  		recs = append(recs, fmt.Sprintf("CARDINALITY SKEW: Maximum estimation divergence is %.1fx. Run ANALYZE on target tables or create multivariate CREATE STATISTICS.", maxErrorRatio))
+  	}
+  	if chr < 98.0 && totalRead > 200 {
+  		recs = append(recs, fmt.Sprintf("CACHE MISS: Cache hit ratio %.1f%% < 98.0%% (%d buffer misses). Consider covering index (INCLUDE) or memory prewarming.", chr, totalRead))
+  	}
+
+  	return &ExecutionPlanAuditReport{
+  		QueryText:           sqlQuery,
+  		TotalDurationMs:     float64(totalDuration.Microseconds()) / 1000.0,
+  		CacheHitRatio:       math.Round(chr*10) / 10,
+  		TotalDiskReads:      totalRead,
+  		TotalTempSpill:      totalTemp,
+  		MaxCardinalityError: math.Round(maxErrorRatio*10) / 10,
+  		HasSevereAnomalies:  len(recs) > 0,
+  		NodeAudits:          nodeAudits,
+  		Recommendations:     recs,
+  	}, nil
+  }
+  ```
+
 
 
 
