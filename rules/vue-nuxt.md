@@ -5534,6 +5534,69 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   </template>
   ```
 
+- **Vue 3.5 Reactive Props Destructuring for Query Anti-Join & Semi-Join Telemetry**:
+  - ✅ **Production Invariant**: Leverage Vue 3.5's reactive props destructure and `computed` to evaluate query anti-join / semi-join compliance and 3VL risk:
+  ```vue
+  <script setup lang="ts">
+  import { computed } from 'vue';
+
+  interface PlanNodeSummary {
+    nodeType: string;
+    hasSubPlan: boolean;
+  }
+
+  // Vue 3.5 native reactive props destructuring with defaults
+  const { queryText = '', planNodes = [] } = defineProps<{
+    queryText?: string;
+    planNodes?: PlanNodeSummary[];
+  }>();
+
+  const hasNotInHazard = computed(() => /\bNOT\s+IN\s*\(\s*SELECT\b/i.test(queryText));
+  const hasJoinDistinct = computed(() => /\bSELECT\s+DISTINCT\b[\s\S]+?\bJOIN\b/i.test(queryText));
+  const hasSubPlanLoop = computed(() => planNodes.some((n) => n.hasSubPlan || n.nodeType.includes('SubPlan')));
+
+  const optimizationScore = computed(() => {
+    let score = 100;
+    if (hasNotInHazard.value) score -= 50;
+    if (hasSubPlanLoop.value) score -= 30;
+    if (hasJoinDistinct.value) score -= 20;
+    return Math.max(0, score);
+  });
+  </script>
+
+  <template>
+    <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 space-y-3">
+      <div class="flex items-center justify-between">
+        <div>
+          <h4 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Anti-Join / Semi-Join Optimizer Sentinel</h4>
+          <span class="text-xs text-zinc-500">Plan Unnesting & 3VL Defense</span>
+        </div>
+        <span
+          class="font-mono text-xs px-2.5 py-1 rounded-full font-semibold"
+          :class="optimizationScore >= 90 ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400' : 'bg-rose-50 text-rose-700 dark:bg-rose-950 dark:text-rose-400'"
+        >
+          Score: {{ optimizationScore }}/100
+        </span>
+      </div>
+
+      <div v-if="hasNotInHazard || hasSubPlanLoop || hasJoinDistinct" class="p-3 rounded-lg bg-rose-50 dark:bg-rose-950/40 text-xs text-rose-700 dark:text-rose-300 space-y-1">
+        <p v-if="hasNotInHazard" class="font-medium">
+          CRITICAL: NOT IN (SELECT ...) detected. NULL inner values will drop all results. Rewrite to NOT EXISTS.
+        </p>
+        <p v-if="hasSubPlanLoop">
+          HIGH: Plan contains unnested SubPlan loop! Quadratic execution risk.
+        </p>
+        <p v-if="hasJoinDistinct">
+          WARN: SELECT DISTINCT with JOIN detected. Use WHERE EXISTS for early termination.
+        </p>
+      </div>
+      <div v-else class="p-3 rounded-lg bg-emerald-50 dark:bg-emerald-950/40 text-xs text-emerald-700 dark:text-emerald-300">
+        ✓ Query verified: 2VL compliant with Hash Anti/Semi-Join execution plan.
+      </div>
+    </div>
+  </template>
+  ```
+
 
 
 

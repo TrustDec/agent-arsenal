@@ -8952,6 +8952,84 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **Anti-Join & Semi-Join Query Construction, 3VL NULL Trap Eradication & Plan Unnesting in Go**:
+  - ❌ **Anti-Pattern**: Using raw SQL strings with `NOT IN (SELECT ...)` over nullable foreign keys, or using `SELECT DISTINCT` with inner joins for existence checks, inducing 3-valued logic 0-row bugs and memory-thrashing Cartesian joins.
+  - ✅ **Production Invariant**: Implement type-safe repository queries using `jackc/pgx/v5` with explicit `NOT EXISTS` (Anti-Join) and `WHERE EXISTS` (Semi-Join) clauses. Enforce static query linting in test suites to prevent `NOT IN (SELECT` subqueries from reaching production:
+  ```go
+  // QueryAstGuard inspects SQL strings in test suites to eliminate 3VL NULL traps
+  type QueryAstGuard struct{}
+
+  type QueryIssue struct {
+  	Code        string
+  	Severity    string
+  	Description string
+  }
+
+  // LintSql inspects query strings for anti-join/semi-join anti-patterns
+  func (g *QueryAstGuard) LintSql(query string) []QueryIssue {
+  	var issues []QueryIssue
+  	upper := strings.ToUpper(query)
+
+  	// Trap 1: NOT IN (SELECT ...) 3VL hazard
+  	if strings.Contains(upper, "NOT IN") && strings.Contains(upper, "SELECT") {
+  		notInIdx := strings.Index(upper, "NOT IN")
+  		selectIdx := strings.Index(upper[notInIdx:], "SELECT")
+  		if selectIdx != -1 && selectIdx < 50 {
+  			issues = append(issues, QueryIssue{
+  				Code:        "3VL_NOT_IN_SUBQUERY",
+  				Severity:    "CRITICAL",
+  				Description: "Found 'NOT IN (SELECT ...)'. A single NULL in subquery yields empty results and prevents Hash Anti Join unnesting. Rewrite to NOT EXISTS.",
+  			})
+  		}
+  	}
+
+  	// Trap 2: SELECT DISTINCT with JOIN (Semi-join bloat)
+  	if strings.Contains(upper, "SELECT DISTINCT") && strings.Contains(upper, "JOIN") && !strings.Contains(upper, "EXISTS") {
+  		issues = append(issues, QueryIssue{
+  			Code:        "JOIN_DISTINCT_SEMIJOIN",
+  			Severity:    "HIGH",
+  			Description: "Found 'SELECT DISTINCT' combined with 'JOIN'. If asserting child row existence, use 'WHERE EXISTS' to enable Hash Semi Join short-circuiting.",
+  		})
+  	}
+
+  	return issues
+  }
+
+  // Repository example demonstrating compliant Anti-Join and Semi-Join patterns
+  type UserSyncRepository struct {
+  	pool *pgxpool.Pool
+  }
+
+  func (r *UserSyncRepository) ListUnsyncedUsers(ctx context.Context) ([]int64, error) {
+  	// Enforces Hash Anti Join unnesting: O(N + M) complexity, immune to NULLs
+  	const sql = `
+  		SELECT u.id
+  		FROM users u
+  		WHERE NOT EXISTS (
+  			SELECT 1
+  			FROM user_sync_logs l
+  			WHERE l.user_id = u.id
+  			  AND l.status = 'synced'
+  		);
+  	`
+  	rows, err := r.pool.Query(ctx, sql)
+  	if err != nil {
+  		return nil, fmt.Errorf("query unsynced users: %w", err)
+  	}
+  	defer rows.Close()
+
+  	var ids []int64
+  	for rows.Next() {
+  		var id int64
+  		if err := rows.Scan(&id); err != nil {
+  			return nil, err
+  		}
+  		ids = append(ids, id)
+  	}
+  	return ids, rows.Err()
+  }
+  ```
+
 
 
 

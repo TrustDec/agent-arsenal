@@ -6290,6 +6290,80 @@ In SvelteKit administrative consoles and system diagnostics:
   </div>
   ```
 
+- **Svelte 5 Runes for Real-Time Query Plan Anti-Join & Semi-Join Optimization Audit**:
+  - ✅ **Production Invariant**: Use Svelte 5 `$state` and `$derived` to inspect query execution plans and ASTs for `SubPlan` loops, `NOT IN` traps, and missing short-circuiting:
+  ```svelte
+  <script lang="ts">
+    interface QueryPlanNode {
+      nodeType: string;
+      relationName?: string;
+      actualRows?: number;
+      planRows?: number;
+      subplanName?: string;
+    }
+
+    interface Props {
+      queryText: string;
+      planNodes: QueryPlanNode[];
+    }
+
+    const { queryText, planNodes }: Props = $props();
+
+    // Svelte 5 $derived analysis of query plan structure
+    const hasNotInHazard = $derived(/\bNOT\s+IN\s*\(\s*SELECT\b/i.test(queryText));
+    const hasJoinDistinct = $derived(/\bSELECT\s+DISTINCT\b[\s\S]+?\bJOIN\b/i.test(queryText));
+    const hasSubPlanLoop = $derived(planNodes.some((n) => n.nodeType.includes('SubPlan')));
+    const hasAntiJoin = $derived(planNodes.some((n) => n.nodeType.includes('Anti Join')));
+    const hasSemiJoin = $derived(planNodes.some((n) => n.nodeType.includes('Semi Join')));
+
+    const optimizationScore = $derived(
+      Math.max(
+        0,
+        100 -
+          (hasNotInHazard ? 50 : 0) -
+          (hasSubPlanLoop ? 30 : 0) -
+          (hasJoinDistinct ? 20 : 0)
+      )
+    );
+  </script>
+
+  <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 p-5 shadow-sm space-y-4">
+    <div class="flex items-center justify-between border-b border-zinc-100 dark:border-zinc-850 pb-3">
+      <div>
+        <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Anti-Join & Semi-Join Audit</h3>
+        <p class="text-xs text-zinc-500 font-mono">Plan Unnesting & 3VL Invariance</p>
+      </div>
+      <span class="text-xs font-mono font-medium px-2 py-0.5 rounded-full {optimizationScore >= 90 ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800' : 'bg-rose-50 text-rose-700 dark:bg-rose-950/40 dark:text-rose-400 border border-rose-200 dark:border-rose-800'}">
+        Health: {optimizationScore}/100
+      </span>
+    </div>
+
+    {#if hasNotInHazard || hasSubPlanLoop || hasJoinDistinct}
+      <div class="p-3 rounded-lg bg-rose-50 dark:bg-rose-950/30 border border-rose-200 dark:border-rose-900 text-xs space-y-1">
+        {#if hasNotInHazard}
+          <div class="text-rose-700 dark:text-rose-300 font-medium">
+            CRITICAL: NOT IN (SELECT ...) detected! Vulnerable to NULL-value empty results. Rewrite to NOT EXISTS.
+          </div>
+        {/if}
+        {#if hasSubPlanLoop}
+          <div class="text-rose-600 dark:text-rose-400">
+            HIGH: Execution plan contains unnested SubPlan loop! O(N × M) quadratic execution hazard.
+          </div>
+        {/if}
+        {#if hasJoinDistinct}
+          <div class="text-amber-700 dark:text-amber-300">
+            WARN: SELECT DISTINCT with JOIN detected. If checking existence, rewrite to WHERE EXISTS (Hash Semi Join).
+          </div>
+        {/if}
+      </div>
+    {:else}
+      <div class="p-3 rounded-lg bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-900 text-xs text-emerald-700 dark:text-emerald-300">
+        ✓ Query verified: Immune to 3VL NULL traps with unnested {hasAntiJoin ? 'Hash Anti Join' : hasSemiJoin ? 'Hash Semi Join' : 'optimized join'} execution plan.
+      </div>
+    {/if}
+  </div>
+  ```
+
 
 
 

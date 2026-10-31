@@ -3868,6 +3868,18 @@ alwaysApply: false
     - Enforce **Differential Window Flux Profiling**: never evaluate raw cumulative counters; evaluate delta rates $\Delta \mathbf{\Phi}_{\text{io}} = (\mathbf{M}(t_2) - \mathbf{M}(t_1)) / \Delta t$ over 60-second observation windows.
     - Enforce **Bulkread Containment Sentinel**: track $\mathcal{R}_{\text{bulk\_pressure}} = \Delta R_{\text{bulkread}} / (\Delta R_{\text{normal}} + \Delta R_{\text{bulkread}})$; flag any workload with ratio $> 0.40$ as suffering from unindexed sequential scans.
 
+- **Anti-Joins, Semi-Joins, 3-Valued Logic NULL Traps & Subquery Unnesting Invariants (PostgreSQL, MySQL, SQLite)**:
+  - ❌ **Anti-Pattern: The `NOT IN` NULL Trap & `JOIN DISTINCT` Semi-Join Multiplier**:
+    - Writing `WHERE id NOT IN (SELECT foreign_id FROM other_table)` where `foreign_id` can be `NULL`. If even a single row contains `NULL`, SQL three-valued logic forces `NOT IN` to evaluate to `UNKNOWN`, causing the outer query to silently return zero rows and corrupting critical business logic.
+    - Forcing query optimizers into quadratic $O(N \times M)$ nested-loop `SubPlan` execution paths because 3VL prevents unnesting `NOT IN` on nullable columns into a `Hash Anti Join`.
+    - Writing `SELECT DISTINCT p.* FROM parent p JOIN child c ON p.id = c.parent_id` solely to verify parent existence, duplicating parent rows thousands of times in intermediate buffers before performing an expensive deduplication sort or hash aggregation.
+    - Placing filter predicates on outer-joined tables in the `WHERE` clause instead of the `ON` clause, silently converting `LEFT JOIN` into an `INNER JOIN`.
+  - ✅ **Production Invariant**:
+    - Enforce **Mandatory `WHERE NOT EXISTS` (Two-Valued Boolean Invariance)**: replace all `NOT IN (SELECT ...)` subqueries with `WHERE NOT EXISTS (SELECT 1 FROM ...)`, guaranteeing mathematical immunity to `NULL` corruption and enabling optimizer transformation into $O(N + M)$ `Hash Anti Join` or `Merge Anti Join`.
+    - Enforce **Mandatory `WHERE EXISTS` for Semi-Joins**: replace all `SELECT DISTINCT ... JOIN ...` existence checks with `WHERE EXISTS (SELECT 1 FROM ...)`, activating `Hash Semi Join` execution which terminates search immediately upon identifying the first matching child tuple (short-circuiting).
+    - Enforce **CI SubPlan Elimination Assertions**: run `EXPLAIN (FORMAT JSON)` in test pipelines to assert zero `SubPlan` nodes on set difference and existence query paths.
+    - Enforce **Supporting B-Tree Index on Child Join Columns**: ensure all subquery join keys (`child.parent_id`) possess a supporting B-Tree index to allow index probe scans during anti/semi-join execution.
+
 
 
 

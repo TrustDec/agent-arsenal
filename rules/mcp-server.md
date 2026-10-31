@@ -6624,6 +6624,64 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         }
       }
     );
+
+    // MCP Tool: Anti-Join & Semi-Join Query Optimization & 3VL Null Trap Inspector
+    server.tool(
+      'diagnose_anti_semi_joins',
+      'Analyzes a SQL query string for Three-Valued Logic NOT IN traps, unnested SubPlan risks, and JOIN DISTINCT semi-join memory bloat.',
+      {
+        sqlQuery: z.string().describe('The SQL query string to inspect and optimize'),
+      },
+      async (args) => {
+        const violations: any[] = [];
+        const normalized = args.sqlQuery.trim();
+
+        // Check for NOT IN subqueries
+        if (/\bNOT\s+IN\s*\(\s*SELECT\b/i.test(normalized)) {
+          violations.push({
+            code: 'NOT_IN_SUBQUERY_3VL_HAZARD',
+            severity: 'CRITICAL',
+            message: 'Detected NOT IN (SELECT ...). If any inner tuple is NULL, SQL 3-valued logic causes the query to return 0 rows. Optimizers cannot unnest to Hash Anti Join.',
+            fix: 'Rewrite as WHERE NOT EXISTS (SELECT 1 FROM ... WHERE child.fk = parent.pk)',
+          });
+        }
+
+        // Check for SELECT DISTINCT ... JOIN existence checks
+        if (/\bSELECT\s+DISTINCT\b[\s\S]+?\bJOIN\b/i.test(normalized) && !/\bWHERE\s+EXISTS\b/i.test(normalized)) {
+          violations.push({
+            code: 'JOIN_DISTINCT_SEMIJOIN_BLOAT',
+            severity: 'HIGH',
+            message: 'Detected SELECT DISTINCT with JOIN. Duplicates parent rows per child match before running expensive deduplication. Use WHERE EXISTS (Hash Semi Join).',
+            fix: 'Rewrite as WHERE EXISTS (SELECT 1 FROM child WHERE child.fk = parent.pk AND <filters>)',
+          });
+        }
+
+        // Check for correlated scalar subquery in SELECT
+        if (/\bSELECT\b[\s\S]*?\(\s*SELECT\s+(?:COUNT|SUM|AVG|MAX|MIN|[a-zA-Z0-9_]+)\b[\s\S]*?\bFROM\b[\s\S]*?\)\s*(?:AS\s+[a-zA-Z0-9_]+)?[\s\S]*?\bFROM\b/i.test(normalized)) {
+          violations.push({
+            code: 'SCALAR_SUBQUERY_PROJECTION',
+            severity: 'MEDIUM',
+            message: 'Correlated scalar subquery in SELECT projection forces N individual SubPlan passes. Flatten using LEFT JOIN LATERAL or vectorized GROUP BY.',
+            fix: 'Replace projection subquery with LEFT JOIN LATERAL or LEFT JOIN ... GROUP BY',
+          });
+        }
+
+        const healthScore = Math.max(0, 100 - violations.reduce((acc, v) => acc + (v.severity === 'CRITICAL' ? 50 : v.severity === 'HIGH' ? 30 : 15), 0));
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              status: 'success',
+              isCompliant: violations.length === 0,
+              healthScore,
+              violationsCount: violations.length,
+              violations,
+            }, null, 2),
+          }],
+        };
+      }
+    );
   }
   ```
 
