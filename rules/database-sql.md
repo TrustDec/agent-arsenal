@@ -3739,6 +3739,22 @@ alwaysApply: false
     - Deploy **Zero-Downtime Concurrent Reindexing**: execute `SET lock_timeout = '2s'; REINDEX INDEX CONCURRENTLY idx_name;` to rebuild legacy or bloated indexes without blocking production transactions.
     - Automate **amcheck Verification**: execute `SELECT bt_index_parent_check(c.oid, true)` in CI/CD migrations and scheduled maintenance to detect OS collation drift or corrupted posting lists before data corruption impacts queries.
 
+- **Page Checksums, Torn Page Protection, amcheck Integrity Auditing & zero_damaged_pages Pitfalls (PostgreSQL 12–17+)**:
+  - ❌ **Anti-Pattern: zero_damaged_pages Data Erasure, Silent Bit-Rot & Torn Write Disasters**:
+    - Setting `zero_damaged_pages = on` in production to bypass `ERROR: invalid page in block X of relation ...: checksum verification failed`, causing PostgreSQL to overwrite corrupted 8KB blocks with all zeroes in buffer memory and silently vaporizing 50–250 live rows forever without audit trails.
+    - Operating production clusters with `data_checksums = off` (the historical default), allowing silent NVMe bitflips, SAN controller corruption, or memory degradation to go undetected and propagate silently to standby replicas and base backups.
+    - Disabling `full_page_writes = off` to reduce WAL write volume, leaving physical 8KB pages vulnerable to torn writes (partial 4KB sector writes during OS crashes) that prevent postmaster crash recovery.
+    - Running naive `REINDEX` against tables with corrupted heap line pointers (`ItemPointerData`), permanently baking invalid tuple offsets into secondary B-Trees.
+    - Performing unvalidated in-place page surgery (`heap_force_kill`) without salvaging surviving tuples via `pageinspect.heap_page_items()`, leaving orphaned foreign key cascades across the relational graph.
+  - ✅ **Production Invariant**:
+    - Enforce **Cluster-Wide Checksum Invariant**: ensure `SHOW data_checksums;` returns `on` (enabled via `initdb -k` or offline `pg_checksums --enable`).
+    - Enforce **Torn Page Protection**: guarantee `SHOW full_page_writes;` returns `on` across all environments; never disable FPW on production write nodes.
+    - Absolute Prohibition of **zero_damaged_pages**: strictly enforce `zero_damaged_pages = off` in configuration files; alert on any attempt to execute `SET zero_damaged_pages = on`.
+    - Deploy **Proactive amcheck Health Sentinels**: schedule off-peak `SELECT bt_index_parent_check(c.oid, true)` for B-Tree indexes and `SELECT * FROM verify_heapam('table'::regclass)` for heap tables with bounded `statement_timeout = '30s'` and `lock_timeout = '2s'`.
+    - Enforce **Surgical Tuple Salvaging**: when block corruption strikes, inspect the raw page via `SELECT * FROM heap_page_items(get_raw_page('table', block_num))` to extract surviving tuples before attempting standby page transplantation or PITR repair.
+    - Zero-Downtime Index Remediation: rebuild verified corrupted indexes using `SET lock_timeout = '2000ms'; REINDEX INDEX CONCURRENTLY idx_name;`.
+
+
 
 
 

@@ -5612,4 +5612,104 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
   }
   ```
 
+- **PostgreSQL Page Checksums & Block Integrity Audit Tool**:
+  - Expose an MCP tool `audit_database_page_checksums` that verifies cluster durability settings (`data_checksums`, `full_page_writes`, `zero_damaged_pages`) and executes non-blocking `amcheck` integrity inspections on specified relations.
+
+  ```typescript
+  // src/tools/audit_page_checksums.ts
+  import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+  import { z } from 'zod';
+  import { Pool } from 'pg';
+
+  export function registerPageChecksumAuditTool(server: McpServer, pool: Pool): void {
+    server.tool(
+      'audit_database_page_checksums',
+      'Audits PostgreSQL cluster durability flags (data_checksums, full_page_writes, zero_damaged_pages) and checks physical block integrity',
+      {
+        targetRelation: z.string().optional().describe('Optional table or index to check with amcheck'),
+        isIndex: z.boolean().optional().default(false).describe('Whether target relation is a B-Tree index'),
+      },
+      async ({ targetRelation, isIndex }) => {
+        const client = await pool.connect();
+        try {
+          const durabilityRes = await client.query(`
+            SELECT
+              current_setting('data_checksums') AS data_checksums,
+              current_setting('full_page_writes') AS full_page_writes,
+              current_setting('zero_damaged_pages') AS zero_damaged_pages;
+          `);
+          const row = durabilityRes.rows[0];
+
+          const isDataChecksums = row.data_checksums === 'on';
+          const isFpw = row.full_page_writes === 'on';
+          const isZeroDamaged = row.zero_damaged_pages === 'on';
+
+          let targetStatus = 'NOT_REQUESTED';
+          let targetErrors: string[] = [];
+
+          if (targetRelation) {
+            await client.query("SET LOCAL statement_timeout = '20s'; SET LOCAL lock_timeout = '2s';");
+            try {
+              if (isIndex) {
+                await client.query('SELECT bt_index_parent_check($1::regclass, true);', [targetRelation]);
+                targetStatus = 'HEALTHY';
+              } else {
+                const heapCheck = await client.query(
+                  'SELECT blkno, offnum, msg FROM verify_heapam($1::regclass, on_error_stop := false) LIMIT 20;',
+                  [targetRelation]
+                );
+                if (heapCheck.rows.length === 0) {
+                  targetStatus = 'HEALTHY';
+                } else {
+                  targetStatus = 'CORRUPTED';
+                  targetErrors = heapCheck.rows.map(r => `Block ${r.blkno}, Offset ${r.offnum}: ${r.msg}`);
+                }
+              }
+            } catch (err: any) {
+              targetStatus = 'CORRUPTED';
+              targetErrors.push(err.message);
+            }
+          }
+
+          const findings = {
+            clusterDurability: {
+              dataChecksums: isDataChecksums,
+              fullPageWrites: isFpw,
+              zeroDamagedPages: isZeroDamaged,
+              isSafe: isFpw && !isZeroDamaged,
+            },
+            targetAudit: targetRelation ? {
+              relation: targetRelation,
+              type: isIndex ? 'index' : 'heap_table',
+              status: targetStatus,
+              errors: targetErrors,
+            } : null,
+            warnings: [] as string[],
+          };
+
+          if (isZeroDamaged) {
+            findings.warnings.push('CRITICAL: zero_damaged_pages is ON! Risk of silent permanent data loss.');
+          }
+          if (!isFpw) {
+            findings.warnings.push('CRITICAL: full_page_writes is OFF! Torn page protection is completely broken.');
+          }
+          if (!isDataChecksums) {
+            findings.warnings.push('WARNING: data_checksums is OFF. Hardware bitflips will not be caught.');
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify(findings, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
+  }
+  ```
+
+
 

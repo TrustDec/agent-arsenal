@@ -5452,5 +5452,76 @@ In SvelteKit administrative consoles and system diagnostics:
   </div>
   ```
 
+- **PostgreSQL Page Checksums & Durability Integrity Card (Svelte 5 Runes)**:
+  - Implement a real-time reactive card auditing cluster durability invariants (`data_checksums`, `full_page_writes`, `zero_damaged_pages`) with visual indicators using Svelte 5 `$derived`.
+
+  ```svelte
+  <!-- src/lib/components/PageChecksumIntegrityCard.svelte -->
+  <script lang="ts">
+    export interface DurabilityAudit {
+      dataChecksums: boolean;
+      fullPageWrites: boolean;
+      zeroDamagedPages: boolean;
+      corruptionsDetected: number;
+    }
+
+    interface Props {
+      audit: DurabilityAudit;
+    }
+
+    let { audit }: Props = $props();
+
+    let isSafe = $derived(
+      audit.fullPageWrites && !audit.zeroDamagedPages && audit.corruptionsDetected === 0
+    );
+
+    let riskLabel = $derived.by(() => {
+      if (audit.zeroDamagedPages) return 'CRITICAL: zero_damaged_pages is ON';
+      if (!audit.fullPageWrites) return 'DURABILITY BREACH: full_page_writes is OFF';
+      if (audit.corruptionsDetected > 0) return `CORRUPTIONS DETECTED: ${audit.corruptionsDetected} blocks`;
+      if (!audit.dataChecksums) return 'WARNING: data_checksums is OFF';
+      return 'DURABILITY VERIFIED';
+    });
+  </script>
+
+  <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-4">
+    <div class="flex items-center justify-between mb-3">
+      <div class="flex items-center gap-2">
+        <span
+          class="h-2.5 w-2.5 rounded-full {isSafe ? 'bg-emerald-500 ring-4 ring-emerald-500/20' : 'bg-rose-500 ring-4 ring-rose-500/20 animate-pulse'}"
+        ></span>
+        <h3 class="font-medium text-sm text-zinc-900 dark:text-zinc-100">Page Checksums & Block Integrity</h3>
+      </div>
+      <span
+        class="text-xs px-2 py-0.5 rounded font-mono font-medium {isSafe ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400' : 'bg-rose-50 text-rose-700 dark:bg-rose-950/50 dark:text-rose-400'}"
+      >
+        {riskLabel}
+      </span>
+    </div>
+
+    <div class="grid grid-cols-3 gap-3 text-xs mt-3">
+      <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+        <div class="text-zinc-400 text-2xs mb-1">data_checksums</div>
+        <div class="font-mono font-semibold {audit.dataChecksums ? 'text-emerald-600' : 'text-amber-500'}">
+          {audit.dataChecksums ? 'ENABLED (on)' : 'DISABLED (off)'}
+        </div>
+      </div>
+      <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+        <div class="text-zinc-400 text-2xs mb-1">full_page_writes</div>
+        <div class="font-mono font-semibold {audit.fullPageWrites ? 'text-emerald-600' : 'text-rose-600'}">
+          {audit.fullPageWrites ? 'PROTECTED (on)' : 'VULNERABLE (off)'}
+        </div>
+      </div>
+      <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+        <div class="text-zinc-400 text-2xs mb-1">zero_damaged_pages</div>
+        <div class="font-mono font-semibold {!audit.zeroDamagedPages ? 'text-emerald-600' : 'text-rose-600 animate-pulse'}">
+          {audit.zeroDamagedPages ? 'ACTIVE (DANGER!)' : 'SAFE (off)'}
+        </div>
+      </div>
+    </div>
+  </div>
+  ```
+
+
 
 

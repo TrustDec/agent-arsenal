@@ -7425,5 +7425,135 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **PostgreSQL Page Integrity, Checksum Verification & amcheck Health Watchdog**:
+  - Implement automated page checksum audits, torn write protection verification, and non-blocking `amcheck` diagnostics using `jackc/pgx/v5`.
+  - Strictly enforce `zero_damaged_pages = off` and alert immediately if `data_checksums` or `full_page_writes` are disabled.
+
+  ```go
+  // internal/store/page_integrity_watchdog.go
+  package store
+
+  import (
+  	"context"
+  	"fmt"
+  	"log/slog"
+  	"time"
+
+  	"github.com/jackc/pgx/v5/pgxpool"
+  )
+
+  type ClusterPageDurability struct {
+  	DataChecksumsEnabled bool      `json:"data_checksums_enabled"`
+  	FullPageWrites       bool      `json:"full_page_writes"`
+  	ZeroDamagedPages     bool      `json:"zero_damaged_pages"`
+  	AuditedAt            time.Time `json:"audited_at"`
+  	Status               string    `json:"status"`
+  }
+
+  type IntegrityViolation struct {
+  	RelationName string `json:"relation_name"`
+  	BlockNo      int64  `json:"block_no"`
+  	OffsetNo     int    `json:"offset_no"`
+  	ErrorMessage string `json:"error_message"`
+  }
+
+  type PageIntegrityWatchdog struct {
+  	pool   *pgxpool.Pool
+  	logger *slog.Logger
+  }
+
+  func NewPageIntegrityWatchdog(pool *pgxpool.Pool, logger *slog.Logger) *PageIntegrityWatchdog {
+  	return &PageIntegrityWatchdog{pool: pool, logger: logger}
+  }
+
+  // AuditClusterDurability verifies Tier 0 & Tier 1 invariants.
+  func (w *PageIntegrityWatchdog) AuditClusterDurability(ctx context.Context) (*ClusterPageDurability, error) {
+  	conn, err := w.pool.Acquire(ctx)
+  	if err != nil {
+  		return nil, fmt.Errorf("acquire db conn failed: %w", err)
+  	}
+  	defer conn.Release()
+
+  	var dataChecksums, fpw, zeroDamaged string
+  	if err := conn.QueryRow(ctx, "SHOW data_checksums;").Scan(&dataChecksums); err != nil {
+  		return nil, fmt.Errorf("check data_checksums: %w", err)
+  	}
+  	if err := conn.QueryRow(ctx, "SHOW full_page_writes;").Scan(&fpw); err != nil {
+  		return nil, fmt.Errorf("check full_page_writes: %w", err)
+  	}
+  	if err := conn.QueryRow(ctx, "SHOW zero_damaged_pages;").Scan(&zeroDamaged); err != nil {
+  		return nil, fmt.Errorf("check zero_damaged_pages: %w", err)
+  	}
+
+  	dur := &ClusterPageDurability{
+  		DataChecksumsEnabled: dataChecksums == "on",
+  		FullPageWrites:       fpw == "on",
+  		ZeroDamagedPages:     zeroDamaged == "on",
+  		AuditedAt:            time.Now().UTC(),
+  		Status:               "HEALTHY",
+  	}
+
+  	if dur.ZeroDamagedPages {
+  		dur.Status = "CRITICAL_RISK"
+  		w.logger.Error("FATAL: zero_damaged_pages is ON! Corrupted pages will be zeroed out. Revert immediately.")
+  	} else if !dur.FullPageWrites {
+  		dur.Status = "DURABILITY_BREACH"
+  		w.logger.Error("FATAL: full_page_writes is OFF! Torn page protection disabled.")
+  	} else if !dur.DataChecksumsEnabled {
+  		dur.Status = "WARNING"
+  		w.logger.Warn("WARNING: data_checksums is OFF! Cluster cannot detect silent bit-rot.")
+  	}
+
+  	return dur, nil
+  }
+
+  // VerifyRelationIntegrity checks a table or index using amcheck.
+  func (w *PageIntegrityWatchdog) VerifyRelationIntegrity(ctx context.Context, relationName string, isIndex bool) ([]IntegrityViolation, error) {
+  	conn, err := w.pool.Acquire(ctx)
+  	if err != nil {
+  		return nil, err
+  	}
+  	defer conn.Release()
+
+  	// Timeout guard prevents long locks
+  	if _, err := conn.Exec(ctx, "SET LOCAL statement_timeout = '30s'; SET LOCAL lock_timeout = '2s';"); err != nil {
+  		return nil, err
+  	}
+
+  	var violations []IntegrityViolation
+  	if isIndex {
+  		_, err := conn.Exec(ctx, "SELECT bt_index_parent_check($1::regclass, true);", relationName)
+  		if err != nil {
+  			violations = append(violations, IntegrityViolation{
+  				RelationName: relationName,
+  				ErrorMessage: err.Error(),
+  			})
+  		}
+  	} else {
+  		rows, err := conn.Query(ctx, `
+  			SELECT blkno, offnum, msg
+  			FROM verify_heapam($1::regclass, on_error_stop := false)
+  			LIMIT 25;
+  		`, relationName)
+  		if err != nil {
+  			return nil, fmt.Errorf("verify_heapam failed: %w", err)
+  		}
+  		defer rows.Close()
+
+  		for rows.Next() {
+  			var v IntegrityViolation
+  			v.RelationName = relationName
+  			if err := rows.Scan(&v.BlockNo, &v.OffsetNo, &v.ErrorMessage); err != nil {
+  				return nil, err
+  			}
+  			violations = append(violations, v)
+  		}
+  	}
+
+  	return violations, nil
+  }
+  ```
+
+
 
 
