@@ -9193,6 +9193,60 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **PostgreSQL Nested Loop Join Parameterized Index Probes & Cartesian Defense in Go**:
+  - ❌ **Anti-Pattern**: Executing nested loops against unindexed inner tables, triggering $O(M \times N)$ sequential scans, or ignoring cardinality underestimation traps where 1 estimated row explodes into 100,000 random I/O seeks.
+  - ✅ **Production Invariant**: Use `jackc/pgx/v5` with transaction-scoped timeouts and plan auditing to assert zero inner sequential scans (`Actual Loops > 1`) and zero `Materialize` temp disk spills:
+  ```go
+  // NestedLoopGovernor safeguards against Cartesian degradation and unindexed loops
+  type NestedLoopGovernor struct {
+  	Pool *pgxpool.Pool
+  }
+
+  // AuditNestedLoopPlan verifies that an EXPLAIN plan contains zero inner sequential scans
+  func (g *NestedLoopGovernor) AuditNestedLoopPlan(ctx context.Context, querySQL string, args ...any) error {
+  	explainSQL := fmt.Sprintf("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) %s", querySQL)
+
+  	ctxTimeout, cancel := context.WithTimeout(ctx, 5*time.Second)
+  	defer cancel()
+
+  	var rawJSON []byte
+  	if err := g.Pool.QueryRow(ctxTimeout, explainSQL, args...).Scan(&rawJSON); err != nil {
+  		return fmt.Errorf("explain query failed: %w", err)
+  	}
+
+  	var plans []struct {
+  		Plan map[string]any `json:"Plan"`
+  	}
+  	if err := json.Unmarshal(rawJSON, &plans); err != nil || len(plans) == 0 {
+  		return fmt.Errorf("parse explain json: %w", err)
+  	}
+
+  	var hasInnerSeqScan bool
+  	var inspect func(node map[string]any, isInner bool)
+  	inspect = func(node map[string]any, isInner bool) {
+  		nodeType, _ := node["Node Type"].(string)
+  		actualLoops, _ := node["Actual Loops"].(float64)
+  		if isInner && nodeType == "Seq Scan" && actualLoops > 1 {
+  			hasInnerSeqScan = true
+  		}
+  		if children, ok := node["Plans"].([]any); ok {
+  			for i, c := range children {
+  				if childMap, ok := c.(map[string]any); ok {
+  					inspect(childMap, nodeType == "Nested Loop" && i == 1)
+  				}
+  			}
+  		}
+  	}
+
+  	inspect(plans[0].Plan, false)
+  	if hasInnerSeqScan {
+  		return fmt.Errorf("nested loop violation: unindexed Seq Scan detected on inner relation")
+  	}
+
+  	return nil
+  }
+  ```
+
 
 
 

@@ -6531,6 +6531,68 @@ In SvelteKit administrative consoles and system diagnostics:
   </div>
   ```
 
+- **Svelte 5 Runes Invariant: Reactive Nested Loop Join Cartesian & Index Probe Sentinel**:
+  - Deploy Svelte 5 runes (`$state`, `$derived`, `$props`) to monitor PostgreSQL Nested Loop execution, warning against unindexed inner sequential scans and cardinality estimation divergence:
+  ```svelte
+  <script lang="ts">
+    interface Props {
+      queryName: string;
+      hasNestedLoop: boolean;
+      innerSeqScan: boolean;
+      actualLoops: number;
+      estimatedRows: number;
+      actualRows: number;
+      tempWrittenBlocks: number;
+    }
+
+    let {
+      queryName,
+      hasNestedLoop,
+      innerSeqScan,
+      actualLoops,
+      estimatedRows,
+      actualRows,
+      tempWrittenBlocks,
+    }: Props = $props();
+
+    const divergenceRatio = $derived(
+      actualRows > estimatedRows
+        ? (actualRows / Math.max(estimatedRows, 1)).toFixed(1)
+        : (estimatedRows / Math.max(actualRows, 1)).toFixed(1)
+    );
+    const hasDivergence = $derived(parseFloat(divergenceRatio) > 5.0);
+    const isCartesianRisk = $derived(innerSeqScan && actualLoops > 1);
+  </script>
+
+  <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 space-y-4">
+    <div class="flex items-center justify-between">
+      <div>
+        <h4 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{queryName}</h4>
+        <span class="text-xs text-zinc-500">PostgreSQL Nested Loop Join Sentinel</span>
+      </div>
+      <span class="px-2.5 py-1 rounded-full text-xs font-medium {!isCartesianRisk ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-400' : 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-400'}">
+        {!isCartesianRisk ? 'Parameterized Index Probe' : 'Cartesian Inner Seq Scan'}
+      </span>
+    </div>
+
+    <div class="grid grid-cols-3 gap-3 text-xs">
+      <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+        <span class="text-zinc-500">Inner Scan Mode:</span>
+        <span class="block font-mono font-medium text-zinc-900 dark:text-zinc-100">{!innerSeqScan ? 'Index Scan' : 'Seq Scan'}</span>
+      </div>
+      <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+        <span class="text-zinc-500">Actual Loops:</span>
+        <span class="block font-mono font-medium text-zinc-900 dark:text-zinc-100">{actualLoops.toLocaleString()}</span>
+      </div>
+      <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+        <span class="text-zinc-500">Cardinality Divergence:</span>
+        <span class="block font-mono font-medium {!hasDivergence ? 'text-zinc-900 dark:text-zinc-100' : 'text-amber-600'}">{divergenceRatio}x</span>
+      </div>
+    </div>
+  </div>
+  ```
+
+
 
 
 

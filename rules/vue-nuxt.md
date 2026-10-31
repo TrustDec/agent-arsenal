@@ -5780,6 +5780,73 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   </template>
   ```
 
+- **Vue 3.5+ Reactivity Invariant: Nested Loop Join Cartesian & Index Probe Sentinel**:
+  - Deploy `<script setup lang="ts">` with reactive prop destructuring to monitor PostgreSQL Nested Loop execution, warning against unindexed inner sequential scans and cardinality estimation divergence:
+  ```vue
+  <script setup lang="ts">
+  import { computed } from 'vue';
+
+  const {
+    queryTitle = 'Transactional Point Join',
+    hasNestedLoop = true,
+    innerSeqScan = false,
+    actualLoops = 1,
+    estimatedRows = 1,
+    actualRows = 1,
+    tempWrittenBlocks = 0,
+  } = defineProps<{
+    queryTitle?: string;
+    hasNestedLoop?: boolean;
+    innerSeqScan?: boolean;
+    actualLoops?: number;
+    estimatedRows?: number;
+    actualRows?: number;
+    tempWrittenBlocks?: number;
+  }>();
+
+  const divergenceRatio = computed(() => {
+    const est = Math.max(estimatedRows, 1);
+    const act = Math.max(actualRows, 1);
+    return act > est ? (act / est).toFixed(1) : (est / act).toFixed(1);
+  });
+  const hasDivergence = computed(() => parseFloat(divergenceRatio.value) > 5.0);
+  const isCartesianRisk = computed(() => innerSeqScan && actualLoops > 1);
+  </script>
+
+  <template>
+    <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 space-y-4">
+      <div class="flex items-center justify-between">
+        <div>
+          <h4 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{{ queryTitle }}</h4>
+          <span class="text-xs text-zinc-500">PostgreSQL Nested Loop Join Monitor</span>
+        </div>
+        <span
+          class="px-2.5 py-1 rounded-full text-xs font-medium"
+          :class="!isCartesianRisk ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-400' : 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-400'"
+        >
+          {{ !isCartesianRisk ? 'Parameterized Index Probe' : 'Cartesian Inner Seq Scan' }}
+        </span>
+      </div>
+
+      <div class="grid grid-cols-3 gap-3 text-xs">
+        <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+          <span class="text-zinc-500">Inner Scan Mode:</span>
+          <span class="block font-mono font-medium text-zinc-900 dark:text-zinc-100">{{ !innerSeqScan ? 'Index Scan' : 'Seq Scan' }}</span>
+        </div>
+        <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+          <span class="text-zinc-500">Actual Loops:</span>
+          <span class="block font-mono font-medium text-zinc-900 dark:text-zinc-100">{{ actualLoops.toLocaleString() }}</span>
+        </div>
+        <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+          <span class="text-zinc-500">Cardinality Divergence:</span>
+          <span class="block font-mono font-medium" :class="!hasDivergence ? 'text-zinc-900 dark:text-zinc-100' : 'text-amber-600'">{{ divergenceRatio }}x</span>
+        </div>
+      </div>
+    </div>
+  </template>
+  ```
+
+
 
 
 

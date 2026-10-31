@@ -3919,6 +3919,19 @@ alwaysApply: false
     - Enforce **Transaction-Scoped Sort Memory Calibration**: if explicit sorting is unavoidable, size `SET LOCAL work_mem` dynamically to guarantee in-memory quicksort (`Sort Method: quicksort`) and assert `Temp Written Blocks == 0`.
     - Enforce **Streaming Full Outer Join Invariance**: leverage index-backed Merge Joins for zero-disk-spill, bounded-memory streaming on full outer joins and ordered pagination pipelines (`ORDER BY ... LIMIT K`).
 
+- **Nested Loop Joins, Parameterized Index Probes & Cardinality Underestimation Defense (PostgreSQL)**:
+  - ❌ **Anti-Pattern: Unindexed Inner Sequential Scans, Cardinality Underestimation & Materialize Disk Spills**:
+    - Permitting unindexed inner relations in a Nested Loop join, forcing the executor to perform a full sequential scan of the child table for every single outer row ($O(M \times N)$ Cartesian degradation) and locking CPU cores at 100%.
+    - Suffering from cardinality underestimation cliffs ($E \ll A$, e.g. 1 row estimated vs 100,000 actual) caused by correlated filters or stale stats, triggering 100,000 random I/O index seeks and wiping out `shared_buffers`.
+    - Allowing `Materialize` nodes caching inner datasets to exceed `work_mem` and spill temporary blocks to disk (`temp_blks_written > 0`), causing disk thrashing across repeated loop iterations.
+    - Using unindexed or misordered composite indexes on correlated `LATERAL` top-K subqueries, forcing full partition table scans on every loop step.
+  - ✅ **Production Invariant**:
+    - Enforce **Parameterized Index Scan Invariant**: guarantee that inner relation join keys are backed by selective B-Tree indexes (`Index Scan` or `Index Only Scan`) and assert zero inner `Seq Scan` nodes with `Actual Loops > 1`.
+    - Enforce **Cardinality Error Ratio Bounding**: maintain fresh statistics (`ANALYZE`) and declare extended statistics (`CREATE STATISTICS (dependencies)`) to ensure estimation error ratio satisfies $0.1 \le \frac{E}{A} \le 10.0$.
+    - Enforce **Physical Correlation & Bitmap Heap Guard**: verify inner column correlation $\ge 0.8$ or leverage `Bitmap Index Scan` with dynamic block sorting to eliminate random NVMe seeks.
+    - Enforce **LATERAL Top-K Composite Index Alignment**: pair `CROSS JOIN LATERAL ... ORDER BY col DESC LIMIT K` with composite B-Tree indexes matching `(foreign_key, sort_col DESC)` to achieve sub-millisecond point seeks.
+
+
 
 
 

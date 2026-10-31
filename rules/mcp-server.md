@@ -6858,6 +6858,78 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         };
       }
     );
+
+    // Tool: Audit Nested Loop Join execution plan for inner seq scans and spills
+    this.server.tool(
+      'audit_nested_loop_plan',
+      'Parses EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) execution trees to verify zero-Cartesian Nested Loop compliance (parameterized index scans, zero inner sequential scans, zero materialize spills)',
+      {
+        planJson: z.string().describe('Raw JSON output from EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)'),
+        maxAllowedLoopsForSeqScan: z.number().default(1).describe('Maximum loops allowed for inner sequential scans'),
+      },
+      async (args) => {
+        const parsed = JSON.parse(args.planJson);
+        const rootPlan = parsed[0]?.Plan;
+        if (!rootPlan) {
+          throw new Error('Invalid EXPLAIN JSON format: missing root Plan node');
+        }
+
+        let hasNestedLoop = false;
+        let innerSeqScanDetected = false;
+        const offendingRelations: string[] = [];
+        let tempWrittenBlocks = 0;
+        let maxDivergence = 1.0;
+
+        const traverse = (node: any, isInner: boolean) => {
+          const nodeType = node['Node Type'] ?? '';
+          if (nodeType === 'Nested Loop') {
+            hasNestedLoop = true;
+          }
+          const actualLoops = node['Actual Loops'] ?? 1;
+          if (isInner && nodeType === 'Seq Scan' && actualLoops > args.maxAllowedLoopsForSeqScan) {
+            innerSeqScanDetected = true;
+            const rel = node['Relation Name'] || node['Alias'] || 'unknown';
+            if (!offendingRelations.includes(rel)) offendingRelations.push(rel);
+          }
+          tempWrittenBlocks += node['Temp Written Blocks'] ?? 0;
+
+          const planRows = Math.max(node['Plan Rows'] ?? 1, 1);
+          const actRows = Math.max(node['Actual Rows'] ?? 1, 1);
+          const div = actRows > planRows ? actRows / planRows : planRows / actRows;
+          if (div > maxDivergence) maxDivergence = div;
+
+          if (Array.isArray(node.Plans)) {
+            for (let i = 0; i < node.Plans.length; i++) {
+              const child = node.Plans[i];
+              traverse(child, nodeType === 'Nested Loop' && i === 1);
+            }
+          }
+        };
+
+        traverse(rootPlan, false);
+
+        const isCompliant = hasNestedLoop && !innerSeqScanDetected && tempWrittenBlocks === 0;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              hasNestedLoop,
+              innerSeqScanDetected,
+              offendingRelations,
+              tempWrittenBlocks,
+              maxCardinalityDivergence: parseFloat(maxDivergence.toFixed(2)),
+              status: isCompliant ? 'compliant' : innerSeqScanDetected ? 'inner_seq_scan_detected' : 'spill_detected',
+              recommendation: innerSeqScanDetected
+                ? `CRITICAL: Add B-Tree index on foreign keys for relations: ${offendingRelations.join(', ')}`
+                : isCompliant
+                ? '-- Nested loop index probing is compliant'
+                : '-- Audit work_mem or materialize buffer parameters',
+            }, null, 2),
+          }],
+        };
+      }
+    );
   }
   ```
 
