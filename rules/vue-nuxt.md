@@ -4131,4 +4131,43 @@ alwaysApply: false
         legacyPglzCount: toastAudits.filter((c: any) => c.needsLz4Migration).length,
       };
     });
+
+    // server/api/admin/database/catalog-health.ts - Nuxt 3 server route for System Catalog bloat diagnostics
+    export default defineEventHandler(async (event) => {
+      const db = useDatabase();
+
+      const query = `
+        SELECT
+          c.relname AS table_name,
+          COALESCE(s.n_live_tup, 0) AS live_tuples,
+          COALESCE(s.n_dead_tup, 0) AS dead_tuples,
+          CASE
+            WHEN (COALESCE(s.n_live_tup, 0) + COALESCE(s.n_dead_tup, 0)) = 0 THEN 0.0
+            ELSE ROUND(COALESCE(s.n_dead_tup, 0)::numeric / (s.n_live_tup + s.n_dead_tup), 4)
+          END AS dead_tuple_ratio,
+          pg_total_relation_size(c.oid) AS total_size_bytes
+        FROM pg_class c
+        JOIN pg_namespace n ON c.relnamespace = n.oid
+        LEFT JOIN pg_stat_sys_tables s ON s.schemaname = n.nspname AND s.relname = c.relname
+        WHERE n.nspname = 'pg_catalog'
+          AND c.relname IN ('pg_class', 'pg_attribute', 'pg_type', 'pg_depend')
+        ORDER BY total_size_bytes DESC;
+      `;
+      const result = await db.query(query);
+
+      const catalogs = result.rows.map((r: any) => ({
+        tableName: r.table_name,
+        liveTuples: Number(r.live_tuples),
+        deadTuples: Number(r.dead_tuples),
+        deadRatioPct: Number(r.dead_tuple_ratio) * 100,
+        totalSizeMb: Number((Number(r.total_size_bytes) / (1024 * 1024)).toFixed(2)),
+        bloatAlert: Number(r.dead_tuple_ratio) > 0.20 || Number(r.dead_tuples) > 5000,
+      }));
+
+      return {
+        timestamp: new Date().toISOString(),
+        catalogs,
+        hasCatalogBloatRisk: catalogs.some((c: any) => c.bloatAlert),
+      };
+    });
     ```

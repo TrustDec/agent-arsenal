@@ -6397,4 +6397,82 @@ func EnforceToastStoragePolicy(ctx context.Context, pool *pgxpool.Pool, schema, 
 	}
 	return nil
 }
+
+// SystemCatalogBloatAudit encapsulates catalog health and dead tuple accumulation metrics.
+type SystemCatalogBloatAudit struct {
+	TableName       string  `json:"table_name"`
+	LiveTuples      int64   `json:"live_tuples"`
+	DeadTuples      int64   `json:"dead_tuples"`
+	DeadTupleRatio  float64 `json:"dead_tuple_ratio"`
+	TableSizeBytes  int64   `json:"table_size_bytes"`
+	IndexSizeBytes  int64   `json:"index_size_bytes"`
+	TotalSizeBytes  int64   `json:"total_size_bytes"`
+	RequiresVacuum  bool    `json:"requires_vacuum"`
+}
+
+// AuditSystemCatalogHealth inspects core PostgreSQL system catalogs to detect dead tuple bloat,
+// B-Tree fragmentation, and catalog autovacuum starvation.
+func AuditSystemCatalogHealth(ctx context.Context, pool *pgxpool.Pool) ([]SystemCatalogBloatAudit, error) {
+	query := `
+		SELECT
+			c.relname AS table_name,
+			COALESCE(s.n_live_tup, 0) AS live_tuples,
+			COALESCE(s.n_dead_tup, 0) AS dead_tuples,
+			CASE
+				WHEN (COALESCE(s.n_live_tup, 0) + COALESCE(s.n_dead_tup, 0)) = 0 THEN 0.0
+				ELSE ROUND(COALESCE(s.n_dead_tup, 0)::numeric / (s.n_live_tup + s.n_dead_tup), 4)
+			END AS dead_tuple_ratio,
+			pg_relation_size(c.oid) AS table_size_bytes,
+			pg_indexes_size(c.oid) AS index_size_bytes,
+			pg_total_relation_size(c.oid) AS total_size_bytes
+		FROM pg_class c
+		JOIN pg_namespace n ON c.relnamespace = n.oid
+		LEFT JOIN pg_stat_sys_tables s ON s.schemaname = n.nspname AND s.relname = c.relname
+		WHERE n.nspname = 'pg_catalog'
+		  AND c.relname IN ('pg_class', 'pg_attribute', 'pg_type', 'pg_depend', 'pg_description')
+		ORDER BY total_size_bytes DESC;
+	`
+	rows, err := pool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("querying system catalog bloat failed: %w", err)
+	}
+	defer rows.Close()
+
+	var audits []SystemCatalogBloatAudit
+	for rows.Next() {
+		var a SystemCatalogBloatAudit
+		if err := rows.Scan(
+			&a.TableName,
+			&a.LiveTuples,
+			&a.DeadTuples,
+			&a.DeadTupleRatio,
+			&a.TableSizeBytes,
+			&a.IndexSizeBytes,
+			&a.TotalSizeBytes,
+		); err != nil {
+			return nil, fmt.Errorf("scanning catalog bloat audit failed: %w", err)
+		}
+		a.RequiresVacuum = a.DeadTupleRatio > 0.20 || (a.DeadTuples > 5000)
+		audits = append(audits, a)
+	}
+	return audits, nil
+}
+
+// CalibrateCatalogAutovacuum tunes system catalog relations with aggressive autovacuum thresholds
+// to prevent pg_attribute and pg_class bloat from degrading query plan compilation times.
+func CalibrateCatalogAutovacuum(ctx context.Context, pool *pgxpool.Pool) error {
+	ddls := []string{
+		"ALTER TABLE pg_catalog.pg_class SET (autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_threshold = 50);",
+		"ALTER TABLE pg_catalog.pg_attribute SET (autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_threshold = 100);",
+		"ALTER TABLE pg_catalog.pg_type SET (autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_threshold = 50);",
+		"ALTER TABLE pg_catalog.pg_depend SET (autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_threshold = 100);",
+	}
+
+	for _, ddl := range ddls {
+		if _, err := pool.Exec(ctx, ddl); err != nil {
+			return fmt.Errorf("failed executing catalog autovacuum calibration '%s': %w", ddl, err)
+		}
+	}
+	return nil
+}
 ```

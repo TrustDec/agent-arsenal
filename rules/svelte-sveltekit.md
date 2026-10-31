@@ -4898,5 +4898,25 @@ alwaysApply: false
           client.release();
         }
       },
+
+      // Ops form action to calibrate system catalog autovacuum and audit catalog dead tuples
+      calibrateCatalogAutovacuum: async ({ locals }) => {
+        const client = await locals.dbPool.connect();
+        try {
+          const ddls = [
+            `ALTER TABLE pg_catalog.pg_class SET (autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_threshold = 50);`,
+            `ALTER TABLE pg_catalog.pg_attribute SET (autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_threshold = 100);`,
+            `ALTER TABLE pg_catalog.pg_type SET (autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_threshold = 50);`,
+          ];
+          for (const ddl of ddls) {
+            await client.query(ddl);
+          }
+          return { success: true, calibrated: true };
+        } catch (err: any) {
+          return fail(500, { message: `Catalog autovacuum calibration failed: ${err.message}` });
+        } finally {
+          client.release();
+        }
+      },
     };
     ```

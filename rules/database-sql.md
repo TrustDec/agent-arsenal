@@ -3607,6 +3607,21 @@ alwaysApply: false
     - Tune `ALTER TABLE ... SET (toast_tuple_target = 128);` on scan-intensive tables to aggressively move wide text out-of-line, packing 60+ tuples per 8KB page and keeping working-set heap tuples resident in `shared_buffers`.
     - Explicitly configure `autovacuum_vacuum_scale_factor = 0.05` on auxiliary `pg_toast` tables and execute zero-downtime `REINDEX TABLE CONCURRENTLY pg_toast.pg_toast_<oid>_index` during off-peak maintenance windows.
 
+- **Database System Catalog Bloat, Relcache Invalidation Storms & Temporary Table Churn Defense**:
+  - ❌ **Anti-Pattern: CREATE TEMP TABLE in Hot Paths, Shared Inval Ring Overruns & Catalog Starvation**:
+    - Issuing `CREATE TEMP TABLE` or `CREATE TEMPORARY TABLE` inside batch ETL scripts, API endpoints, or worker loops, inserting 20+ rows into `pg_class`, `pg_attribute`, and `pg_type` per invocation and abandoning millions of dead catalog tuples upon session exit.
+    - Allowing unvacuumed `pg_attribute` to swell to gigabytes; because catalog pages cannot be truncated without `ACCESS EXCLUSIVE` locks, query plan compilation slows down 100x across all connections.
+    - Triggering shared invalidation ring buffer (`shared_inval`) overflows via rapid DDL or temp table churn, broadcasting nuclear cache resets that dump the entire `relcache` across hundreds of backends simultaneously and causing 100% CPU lock storms.
+    - Utilizing temporary tables under transaction-pooled PgBouncer, leaving orphaned temporary objects across reused backend connections and triggering `relation already exists` failures or cross-tenant data leaks.
+    - Leaving `pg_catalog` tables under default global autovacuum settings (`autovacuum_vacuum_scale_factor = 0.20`), requiring thousands of dead rows before autovacuum wakes up to clean volatile catalog tables.
+  - ✅ **Production Invariant**:
+    - Strictly enforce a zero-temp-table invariant in OLTP and API hot paths; replace all temporary staging tables with parameterized arrays (`UNNEST($1::type[])`), `jsonb_to_recordset()`, memory CTEs, or value constructors.
+    - For bulk ETL workloads exceeding array wire limits (>100,000 rows), use permanent `UNLOGGED` staging tables partitioned by `session_id`/`batch_id` with `DELETE` or `TRUNCATE`, completely eliminating DDL catalog churn.
+    - Calibrate dedicated aggressive catalog autovacuum parameters: `ALTER TABLE pg_catalog.pg_class SET (autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_threshold = 50);` and `ALTER TABLE pg_catalog.pg_attribute SET (autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_threshold = 100);`.
+    - Enforce PgBouncer `server_reset_query = DISCARD ALL` in pool configurations to cleanly evict temporary state, prepared statements, and private relcache memory allocations on connection check-in.
+    - Execute scheduled zero-downtime `REINDEX TABLE CONCURRENTLY pg_catalog.pg_class;` and `REINDEX TABLE CONCURRENTLY pg_catalog.pg_attribute;` during off-peak maintenance windows to eliminate catalog B-Tree fragmentation.
+
+
 
 
 

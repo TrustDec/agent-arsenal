@@ -4758,5 +4758,71 @@ alwaysApply: false
           };
         }
       );
+
+      // Tool 22: System Catalog Bloat & Relcache Invalidation Risk Diagnostics
+      server.tool(
+        'diagnose_catalog_bloat_and_invalidation',
+        'Analyzes PostgreSQL system catalog dead tuple bloat, detects temporary table churn, shared_inval ring buffer risk, and recommends aggressive catalog autovacuum tuning',
+        {
+          catalogTableName: z.enum(['pg_class', 'pg_attribute', 'pg_type', 'pg_depend', 'pg_description']).describe('System catalog table name to evaluate'),
+          liveTuples: z.number().describe('Number of live tuples in the catalog table'),
+          deadTuples: z.number().describe('Number of dead tuples accumulated in the catalog table'),
+          tableSizeBytes: z.number().describe('Total disk size of the catalog table in bytes'),
+          dailyTempTableCreations: z.number().optional().default(0).describe('Estimated temporary table creations per day in application workloads'),
+          pgBouncerMode: z.enum(['transaction', 'session', 'statement', 'none']).default('transaction').describe('PgBouncer connection pooling mode'),
+        },
+        async ({ catalogTableName, liveTuples, deadTuples, tableSizeBytes, dailyTempTableCreations, pgBouncerMode }) => {
+          const totalTuples = liveTuples + deadTuples;
+          const deadRatio = totalTuples > 0 ? deadTuples / totalTuples : 0;
+          const anomalies: string[] = [];
+          const remediationDdl: string[] = [];
+
+          // Check 1: Severe dead tuple bloat in system catalog
+          if (deadRatio > 0.20 || deadTuples > 10000) {
+            anomalies.push(`CATALOG_DEAD_TUPLE_BLOAT: ${catalogTableName} has ${deadTuples} dead tuples (${(deadRatio * 100).toFixed(1)}% dead ratio). Causes query plan compilation latency degradation.`);
+            remediationDdl.push(`VACUUM ANALYZE pg_catalog.${catalogTableName};`);
+            remediationDdl.push(`REINDEX TABLE CONCURRENTLY pg_catalog.${catalogTableName};`);
+          }
+
+          // Check 2: Active temporary table churn in OLTP / worker paths
+          if (dailyTempTableCreations > 500) {
+            anomalies.push(`TEMP_TABLE_CHURN_DETECTED: Workload performs ~${dailyTempTableCreations} CREATE TEMP TABLE operations daily. Generates millions of dead catalog rows and risks shared_inval overflow.`);
+            remediationDdl.push(`-- Refactor application queries to replace temporary tables with parameterized UNNEST($1::type[]) or permanent UNLOGGED staging.`);
+          }
+
+          // Check 3: PgBouncer transaction mode temp collision risk
+          if (pgBouncerMode === 'transaction' && dailyTempTableCreations > 0) {
+            anomalies.push(`PGBOUNCER_TRANSACTION_MODE_TEMP_LEAK: Temporary objects created in transaction mode leak across reused server connections. Ensure server_reset_query = DISCARD ALL.`);
+          }
+
+          // Check 4: Missing aggressive catalog autovacuum thresholds
+          remediationDdl.push(`ALTER TABLE pg_catalog.${catalogTableName} SET (autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_threshold = 50);`);
+
+          let state = 'OPTIMAL';
+          if (anomalies.some(a => a.startsWith('TEMP_TABLE_CHURN') || a.startsWith('PGBOUNCER'))) {
+            state = 'HIGH_INVAL_STORM_RISK';
+          } else if (deadRatio > 0.30 || tableSizeBytes > 100 * 1024 * 1024) {
+            state = 'CATALOG_BLOAT_CRITICAL';
+          } else if (anomalies.length > 0) {
+            state = 'MAINTENANCE_REQUIRED';
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                catalogTableName,
+                state,
+                deadTupleRatioPct: Number((deadRatio * 100).toFixed(2)),
+                tableSizeMb: Number((tableSizeBytes / (1024 * 1024)).toFixed(2)),
+                anomaliesCount: anomalies.length,
+                anomalies,
+                remediationDdl,
+                status: anomalies.length === 0 ? 'HEALTHY' : 'OPTIMIZATION_REQUIRED',
+              }, null, 2),
+            }],
+          };
+        }
+      );
     }
     ```
