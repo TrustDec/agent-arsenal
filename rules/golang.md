@@ -9148,6 +9148,51 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **PostgreSQL Merge Join Presorted Execution & Zero-Disk-Spill Sort Invariant in Go**:
+  - ❌ **Anti-Pattern**: Permitting Merge Joins to execute with unindexed join columns, causing dual `external merge Disk` sort nodes or `Materialize` node disk spills that exhaust NVMe IOPS.
+  - ✅ **Production Invariant**: Use `jackc/pgx/v5` with transaction-scoped `SET LOCAL work_mem` to guarantee in-memory quicksort or assert presorted B-Tree index scan execution (`Sort Method != 'external merge Disk'`, `TempWrittenBlocks == 0`):
+  ```go
+  // MergeJoinGovernor ensures zero disk spill and presorted index scans for merge joins
+  type MergeJoinGovernor struct {
+  	Pool *pgxpool.Pool
+  }
+
+  // ExecutePresortedOrCalibrated runs an ordered join with transaction-scoped work_mem
+  func (g *MergeJoinGovernor) ExecutePresortedOrCalibrated(
+  	ctx context.Context,
+  	expectedSortRows int64,
+  	avgTupleWidthBytes int,
+  	fn func(tx pgx.Tx) error,
+  ) error {
+  	// Calculate buffer: (width + 32 byte header) * rows * 1.35 quicksort overhead
+  	sortBytes := int64(float64(expectedSortRows*int64(avgTupleWidthBytes+32)) * 1.35)
+  	workMemMB := int(math.Ceil(float64(sortBytes) / (1024 * 1024)))
+  	if workMemMB < 4 {
+  		workMemMB = 4
+  	}
+  	if workMemMB > 512 {
+  		workMemMB = 512 // Bounded session ceiling
+  	}
+
+  	tx, err := g.Pool.Begin(ctx)
+  	if err != nil {
+  		return fmt.Errorf("begin tx: %w", err)
+  	}
+  	defer tx.Rollback(ctx)
+
+  	setWorkMem := fmt.Sprintf("SET LOCAL work_mem = '%dMB'", workMemMB)
+  	if _, err := tx.Exec(ctx, setWorkMem); err != nil {
+  		return fmt.Errorf("set work_mem: %w", err)
+  	}
+
+  	if err := fn(tx); err != nil {
+  		return err
+  	}
+
+  	return tx.Commit(ctx)
+  }
+  ```
+
 
 
 

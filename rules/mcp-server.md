@@ -6789,6 +6789,75 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         };
       }
     );
+
+    // Tool: Audit Merge Join execution plan for disk sorts and materialize spills
+    this.server.tool(
+      'audit_merge_join_plan',
+      'Parses EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) execution trees to verify zero-disk-spill Merge Join compliance (presorted index scans, zero external merge disk sorts, zero materialize spills)',
+      {
+        planJson: z.string().describe('Raw JSON output from EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)'),
+        maxSessionMemoryMB: z.number().default(512).describe('Maximum permissible work_mem in megabytes'),
+      },
+      async (args) => {
+        const parsed = JSON.parse(args.planJson);
+        const rootPlan = parsed[0]?.Plan;
+        if (!rootPlan) {
+          throw new Error('Invalid EXPLAIN JSON format: missing root Plan node');
+        }
+
+        let hasMergeJoin = false;
+        let explicitSortCount = 0;
+        let hasDiskSort = false;
+        let tempWrittenBlocks = 0;
+        let maxSortSpaceKB = 0;
+
+        const traverse = (node: any) => {
+          if (node['Node Type'] === 'Merge Join') {
+            hasMergeJoin = true;
+          }
+          if (node['Node Type'] === 'Sort') {
+            explicitSortCount++;
+            const method = node['Sort Method'] ?? '';
+            const spaceType = node['Sort Space Type'] ?? '';
+            const spaceUsed = node['Sort Space Used'] ?? 0;
+            if (spaceUsed > maxSortSpaceKB) maxSortSpaceKB = spaceUsed;
+            if (method.includes('external merge') || spaceType.toLowerCase() === 'disk') {
+              hasDiskSort = true;
+            }
+          }
+          tempWrittenBlocks += node['Temp Written Blocks'] ?? 0;
+          if (Array.isArray(node.Plans)) {
+            for (const child of node.Plans) traverse(child);
+          }
+        };
+
+        traverse(rootPlan);
+
+        const presortedScans = hasMergeJoin && explicitSortCount === 0;
+        const isCompliant = hasMergeJoin && !hasDiskSort && tempWrittenBlocks === 0;
+        const recommendedWorkMemMB = isCompliant
+          ? 4
+          : Math.min(args.maxSessionMemoryMB, Math.max(4, Math.ceil((maxSortSpaceKB * 1.35) / 1024)));
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              hasMergeJoin,
+              presortedScans,
+              explicitSortCount,
+              hasDiskSort,
+              tempWrittenBlocks,
+              maxSortSpaceKB,
+              status: isCompliant ? 'compliant' : hasDiskSort ? 'disk_sort_detected' : 'temp_spill_detected',
+              recommendedGUC: isCompliant
+                ? '-- Merge Join memory and presorting are optimal'
+                : `SET LOCAL work_mem = '${recommendedWorkMemMB}MB';`,
+            }, null, 2),
+          }],
+        };
+      }
+    );
   }
   ```
 

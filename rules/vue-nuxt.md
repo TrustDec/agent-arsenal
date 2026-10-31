@@ -5718,6 +5718,68 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   </template>
   ```
 
+- **Vue 3.5+ Reactivity Invariant: Merge Join Sort Spill & Presorted Scan Sentinel**:
+  - Deploy `<script setup lang="ts">` with reactive prop destructuring to monitor PostgreSQL Merge Join nodes, differentiating presorted B-Tree index scans from external merge disk spills:
+  ```vue
+  <script setup lang="ts">
+  import { computed } from 'vue';
+
+  const {
+    queryTitle = 'Ordered Merge Join',
+    hasMergeJoin = true,
+    presortedScans = true,
+    sortMethod = '',
+    tempWrittenBlocks = 0,
+    maxSortSpaceKB = 0,
+    allocatedWorkMemMB = 64,
+  } = defineProps<{
+    queryTitle?: string;
+    hasMergeJoin?: boolean;
+    presortedScans?: boolean;
+    sortMethod?: string;
+    tempWrittenBlocks?: number;
+    maxSortSpaceKB?: number;
+    allocatedWorkMemMB?: number;
+  }>();
+
+  const isDiskSpill = computed(() => sortMethod.includes('external merge') || tempWrittenBlocks > 0);
+  const sortSpaceMB = computed(() => (maxSortSpaceKB / 1024).toFixed(1));
+  const spilledMB = computed(() => ((tempWrittenBlocks * 8) / 1024).toFixed(1));
+  </script>
+
+  <template>
+    <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 space-y-4">
+      <div class="flex items-center justify-between">
+        <div>
+          <h4 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{{ queryTitle }}</h4>
+          <span class="text-xs text-zinc-500">PostgreSQL Merge Join Presort & Spill Monitor</span>
+        </div>
+        <span
+          class="px-2.5 py-1 rounded-full text-xs font-medium"
+          :class="presortedScans ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-400' : isDiskSpill ? 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-400' : 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-400'"
+        >
+          {{ presortedScans ? 'Presorted Index Scan' : isDiskSpill ? 'Disk Sort Spill' : 'In-Memory Sort' }}
+        </span>
+      </div>
+
+      <div class="grid grid-cols-3 gap-3 text-xs">
+        <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+          <span class="text-zinc-500">Sort Method:</span>
+          <span class="block font-mono font-medium text-zinc-900 dark:text-zinc-100">{{ presortedScans ? 'None (Presorted)' : sortMethod || 'quicksort' }}</span>
+        </div>
+        <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+          <span class="text-zinc-500">Sort Space Used:</span>
+          <span class="block font-mono font-medium text-zinc-900 dark:text-zinc-100">{{ sortSpaceMB }} MB / {{ allocatedWorkMemMB }} MB</span>
+        </div>
+        <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+          <span class="text-zinc-500">Temp Disk Spill:</span>
+          <span class="block font-mono font-medium" :class="!isDiskSpill ? 'text-emerald-600' : 'text-rose-600'">{{ spilledMB }} MB</span>
+        </div>
+      </div>
+    </div>
+  </template>
+  ```
+
 
 
 

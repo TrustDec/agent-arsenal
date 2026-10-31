@@ -3907,6 +3907,18 @@ alwaysApply: false
     - Enforce **Strict Inner Table Cardinality Prerequisite**: guarantee that the inner build relation is the smaller dataset by running `ANALYZE` after bulk ingestions or migrations.
     - Enforce **Parallel Shared Hash Join DSM Calibration**: allocate adequate Dynamic Shared Memory (`max_dsm_memory`) and tune `max_parallel_workers_per_gather` to ensure workers cooperate on a single shared hash table without barrier desynchronization.
 
+- **Merge Joins, Presorted B-Tree Scans & Materialize Spill Elimination (PostgreSQL)**:
+  - ❌ **Anti-Pattern: External Merge Sort Disk Spills, Mismatched Collations & Materialize Spooling**:
+    - Permitting unindexed join columns to force dual `Sort` nodes before a Merge Join, causing multi-pass disk merges (`Sort Method: external merge Disk`) when relations exceed `work_mem` and saturating NVMe write bandwidth.
+    - Joining on non-unique inner keys with massive duplicate runs, forcing the planner to inject a `Materialize` node that spills to disk (`temp_blks_written > 0`) during mark-and-restore scans, collapsing $O(M + N)$ streaming into quadratic $O(M \times N)$ nested loops.
+    - Creating B-Tree indexes with mismatched collations (`COLLATE "C"` vs default) or differing `ASC/DESC` and `NULLS FIRST/LAST` options, which silently disables presorted index scans and triggers redundant in-memory or on-disk sorts.
+    - Using Hash Joins for large full outer joins, risking multi-batch disk thrashing when an index-backed Merge Join would stream the entire full outer join in $O(1)$ memory.
+  - ✅ **Production Invariant**:
+    - Enforce **Presorted B-Tree Index Scan Invariant**: index join keys in matching sort order and deterministic collation to achieve zero-sort `Index Scan` / `Index Only Scan` paths.
+    - Enforce **Inner Uniqueness Prerequisite**: assert `PRIMARY KEY` or `UNIQUE` on the inner relation to eliminate `Materialize` node rewinds and prevent duplicate run Cartesian degradation.
+    - Enforce **Transaction-Scoped Sort Memory Calibration**: if explicit sorting is unavoidable, size `SET LOCAL work_mem` dynamically to guarantee in-memory quicksort (`Sort Method: quicksort`) and assert `Temp Written Blocks == 0`.
+    - Enforce **Streaming Full Outer Join Invariance**: leverage index-backed Merge Joins for zero-disk-spill, bounded-memory streaming on full outer joins and ordered pagination pipelines (`ORDER BY ... LIMIT K`).
+
 
 
 
