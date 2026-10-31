@@ -4171,3 +4171,38 @@ alwaysApply: false
       };
     });
     ```
+
+- **Nuxt 3 Server API Database Pipelining & SSR Round-Trip Latency (RTT) Minimization**:
+  - ❌ **Anti-Pattern: Sequential Awaited DB Queries in Nitro Event Handlers**:
+    - Writing `for (const id of ids) { await db.query(...) }` inside `server/api/` Nitro endpoints, burning $N \times \text{RTT}$ in network idle time and exhausting serverless worker timeout budgets.
+    - Serializing complex relational state into verbose JSON strings on the server and re-parsing on the client, instead of leveraging native binary / typed representations.
+  - ✅ **Production Invariant**:
+    - Enforce wire pipelining with `Promise.all()` or driver-level batching (`postgres.js` / `drizzle-orm` batch API) within Nuxt 3 event handlers to execute all sub-queries in a single network turnaround.
+    - Explicitly set `{ noDelay: true }` on database client socket configurations inside Nuxt server plugins (`server/plugins/database.ts`).
+    ```typescript
+    // server/api/v1/batch-metrics.post.ts
+    // Nitro route enforcing pipelined batch execution and zero N+1 wire turnarounds
+    import { defineEventHandler, readBody } from 'h3';
+    import { getDatabaseClient } from '~/server/utils/db';
+
+    export default defineEventHandler(async (event) => {
+      const body = await readBody(event);
+      const items = body.items as Array<{ id: string; category: string }>;
+      if (!items || items.length === 0) return { inserted: 0 };
+
+      const sql = getDatabaseClient();
+
+      // Pipelined execution: postgres.js dispatches all queries concurrently in a single TCP socket stream
+      const results = await sql.begin(async (tx) => {
+        const promises = items.map((item) =>
+          tx`
+            INSERT INTO telemetry_events (id, category, recorded_at)
+            VALUES (${item.id}, ${item.category}, NOW())
+          `
+        );
+        return Promise.all(promises);
+      });
+
+      return { inserted: results.length };
+    });
+    ```

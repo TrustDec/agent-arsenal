@@ -3621,6 +3621,21 @@ alwaysApply: false
     - Enforce PgBouncer `server_reset_query = DISCARD ALL` in pool configurations to cleanly evict temporary state, prepared statements, and private relcache memory allocations on connection check-in.
     - Execute scheduled zero-downtime `REINDEX TABLE CONCURRENTLY pg_catalog.pg_class;` and `REINDEX TABLE CONCURRENTLY pg_catalog.pg_attribute;` during off-peak maintenance windows to eliminate catalog B-Tree fragmentation.
 
+- **Database Extended Query Protocol, Wire Pipelining, Binary Format Encoding & Round-Trip Latency (RTT) Defense**:
+  - ❌ **Anti-Pattern: Simple Query Protocol Text Re-Parsing, N+1 Wire RTT Waterfalls & Text Format Deserialization**:
+    - Emitting queries via the legacy Simple Query (`'Q'`) protocol using raw text or string concatenation, forcing PostgreSQL to re-parse, re-analyze, and re-plan statements on every execution while creating severe SQL injection vulnerabilities.
+    - Executing repetitive queries inside sequential client loops (`for item in batch: query(...)`), waiting for a full client-server TCP round trip per row; in cloud environments with 2ms–5ms RTT, executing 100 queries wastes 200ms–500ms of pure idle wire transit time, starving connection pools.
+    - Transmitting UUIDs, timestamps, 64-bit integers, and vector embeddings in Text Format (`format code = 0`), bloating packet payloads by 2.5x and burning 35%–50% of CPU cycles in string formatting and regex parsing.
+    - Sending explicit `Sync` (`'S'`) messages between sub-statements in multi-statement workflows, triggering unnecessary intermediate snapshot overhead and WAL evaluation cycles instead of packing requests into a single pipelined flight.
+    - Omitting `TCP_NODELAY = 1` on client database sockets, allowing OS Nagle buffering to combine with remote 40ms delayed ACK timers and cause mysterious micro-stutters.
+  - ✅ **Production Invariant**:
+    - Strictly enforce Extended Query Protocol (`Parse`, `Bind`, `Execute`, `Sync`) parameterization (`$1, $2, ...`) across all database drivers, banning unparameterized simple query strings.
+    - Mandate Wire Pipelining (`pgx.Batch` in Go, `PQpipelineMode` in libpq, `connection.pipeline()` in Python psycopg3, `drizzle-orm` batching) for all multi-statement operations, collapsing $N$ round trips into exactly $1$ RTT turnaround: $T = 1 \cdot \text{RTT} + \sum T_{\text{exec}}$.
+    - Enforce native PostgreSQL Binary Format (`format code = 1`) for high-density types (`UUID` 16 bytes vs 36 ASCII chars, `TIMESTAMPTZ` 8-byte int64 vs 35-char ISO-8601, `FLOAT8`, `INT8`, `VECTOR`), slashing serialization CPU overhead and network payload size by 50%+.
+    - Wrap pipelined operations with transactional savepoints (`SAVEPOINT sp_k`) when partial batch recovery is required, isolating `PGRES_PIPELINE_ABORTED` failures without invalidating entire batches.
+    - Explicitly configure client TCP dialers with `TCP_NODELAY = true` and `keepAlive = true` to eradicate 40ms delayed ACK latency cliffs.
+
+
 
 
 

@@ -6475,4 +6475,81 @@ func CalibrateCatalogAutovacuum(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 	return nil
 }
+
+// WirePipelineBatchManager orchestrates high-throughput batch operations over PostgreSQL Extended Query Protocol.
+// It bundles statements into pgx.Batch, enforcing single-turnaround RTT and native binary format encoding.
+type WirePipelineBatchManager[T any] struct {
+	pool         *pgxpool.Pool
+	batchSize    int
+	query        string
+	argExtractor func(item T) []any
+}
+
+// NewWirePipelineBatchManager creates a production-grade pipelined batch manager.
+func NewWirePipelineBatchManager[T any](
+	pool *pgxpool.Pool,
+	batchSize int,
+	query string,
+	argExtractor func(item T) []any,
+) *WirePipelineBatchManager[T] {
+	if batchSize <= 0 || batchSize > 1000 {
+		batchSize = 250 // Optimal balance between socket buffer packing and error blast radius
+	}
+	return &WirePipelineBatchManager[T]{
+		pool:         pool,
+		batchSize:    batchSize,
+		query:        query,
+		argExtractor: argExtractor,
+	}
+}
+
+// ExecutePipelined processes all items across batched network round trips, collapsing O(N) RTT to O(ceil(N/batchSize)).
+func (m *WirePipelineBatchManager[T]) ExecutePipelined(ctx context.Context, items []T) error {
+	if len(items) == 0 {
+		return nil
+	}
+
+	conn, err := m.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquiring connection for pipeline execution failed: %w", err)
+	}
+	defer conn.Release()
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("beginning pipeline transaction failed: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	for chunkStart := 0; chunkStart < len(items); chunkStart += m.batchSize {
+		chunkEnd := chunkStart + m.batchSize
+		if chunkEnd > len(items) {
+			chunkEnd = len(items)
+		}
+		chunk := items[chunkStart:chunkEnd]
+
+		batch := &pgx.Batch{}
+		for _, item := range chunk {
+			batch.Queue(m.query, m.argExtractor(item)...)
+		}
+
+		br := tx.SendBatch(ctx, batch)
+		for i := 0; i < len(chunk); i++ {
+			if _, err := br.Exec(); err != nil {
+				_ = br.Close()
+				return fmt.Errorf("pipelined execution failed at item %d (chunk %d): %w", chunkStart+i, chunkStart, err)
+			}
+		}
+
+		if err := br.Close(); err != nil {
+			return fmt.Errorf("closing batch results for chunk starting at %d failed: %w", chunkStart, err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("committing pipelined transaction failed: %w", err)
+	}
+	return nil
+}
+
 ```

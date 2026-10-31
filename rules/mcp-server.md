@@ -4824,5 +4824,120 @@ alwaysApply: false
           };
         }
       );
+
+      // Extended Query Protocol, Wire Pipelining & Binary Format Sentinel Tool
+      server.registerTool(
+        'audit_database_wire_protocol_pipelining',
+        {
+          title: 'Audit Database Extended Protocol, Wire Pipelining & Binary Encoding',
+          description: 'Evaluates database query execution patterns to detect Simple Query Protocol string concatenation, N+1 sequential loop round trips, text-format serialization overhead, and missing TCP_NODELAY socket flags.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              sqlQueries: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Array of SQL query statements executed within the workload or transaction.',
+              },
+              loopIterations: {
+                type: 'number',
+                description: 'Observed or estimated number of iterations in the execution loop.',
+              },
+              isPipelined: {
+                type: 'boolean',
+                description: 'Whether client executes statements via libpq pipeline mode (pgx.Batch, connection.pipeline()).',
+              },
+              usesBinaryFormat: {
+                type: 'boolean',
+                description: 'Whether driver transmits and receives data in PostgreSQL binary format (format=1).',
+              },
+              socketNoDelay: {
+                type: 'boolean',
+                description: 'Whether TCP_NODELAY is enabled on client connection sockets.',
+              },
+              estimatedRttMs: {
+                type: 'number',
+                description: 'Estimated round-trip time between application and database host in milliseconds.',
+              },
+            },
+            required: ['sqlQueries', 'loopIterations', 'isPipelined', 'usesBinaryFormat', 'socketNoDelay'],
+          },
+        },
+        async (args) => {
+          const {
+            sqlQueries,
+            loopIterations,
+            isPipelined,
+            usesBinaryFormat,
+            socketNoDelay,
+            estimatedRttMs = 2.5,
+          } = args as {
+            sqlQueries: string[];
+            loopIterations: number;
+            isPipelined: boolean;
+            usesBinaryFormat: boolean;
+            socketNoDelay: boolean;
+            estimatedRttMs?: number;
+          };
+
+          const violations: string[] = [];
+          const recommendations: string[] = [];
+
+          // Check 1: Simple query concatenation
+          const concatRegex = /(['"`])\s*\+\s*[\w.]+\s*\+\s*(['"`])|\${[\w.]+}/;
+          for (const query of sqlQueries) {
+            if (concatRegex.test(query)) {
+              violations.push(`SIMPLE_QUERY_STRING_CONCAT: Query uses string interpolation instead of parameterized Extended Query Protocol ($1, $2).`);
+              recommendations.push('Refactor queries to parameterized templates to enable plan caching and prevent SQL injection.');
+              break;
+            }
+          }
+
+          // Check 2: N+1 sequential execution
+          if (loopIterations > 1 && !isPipelined) {
+            const wastedRttMs = (loopIterations - 1) * estimatedRttMs;
+            violations.push(`N_PLUS_ONE_SEQUENTIAL_LOOP: Executed ${loopIterations} queries sequentially without wire pipelining, wasting ~${wastedRttMs.toFixed(1)}ms in idle network RTT.`);
+            recommendations.push('Wrap loop queries in pgx.Batch (Go), connection.pipeline() (Python), or Drizzle batching to amortize network latency to 1 RTT.');
+          }
+
+          // Check 3: Text format serialization
+          if (!usesBinaryFormat) {
+            violations.push(`TEXT_FORMAT_SERIALIZATION: High-density types sent/received as ASCII strings (format=0), burning CPU in string parsing.`);
+            recommendations.push('Enable native binary format (format=1) for UUID, TIMESTAMPTZ, BIGINT, and VECTOR types.');
+          }
+
+          // Check 4: Socket Nagle delay risk
+          if (!socketNoDelay) {
+            violations.push(`SOCKET_NAGLE_DELAY_RISK: TCP_NODELAY is false, exposing sub-MSS protocol frames to 40ms kernel delayed ACK stutters.`);
+            recommendations.push('Configure client socket dialer with { noDelay: true } to disable Nagle buffering.');
+          }
+
+          const sequentialLatencyMs = loopIterations * (estimatedRttMs + 0.2);
+          const pipelinedLatencyMs = isPipelined
+            ? estimatedRttMs + loopIterations * 0.2
+            : sequentialLatencyMs;
+          const latencySavedMs = Math.max(0, sequentialLatencyMs - pipelinedLatencyMs);
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                status: violations.length === 0 ? 'COMPLIANT' : 'OPTIMIZATION_REQUIRED',
+                violationsCount: violations.length,
+                violations,
+                recommendations,
+                telemetry: {
+                  loopIterations,
+                  estimatedRttMs,
+                  sequentialEstimatedLatencyMs: Number(sequentialLatencyMs.toFixed(2)),
+                  pipelinedEstimatedLatencyMs: Number(pipelinedLatencyMs.toFixed(2)),
+                  rttLatencySavedMs: Number(latencySavedMs.toFixed(2)),
+                  speedupFactor: Number((sequentialLatencyMs / Math.max(pipelinedLatencyMs, 0.1)).toFixed(2)),
+                },
+              }, null, 2),
+            }],
+          };
+        }
+      );
     }
     ```

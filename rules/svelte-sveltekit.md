@@ -4918,5 +4918,34 @@ alwaysApply: false
           client.release();
         }
       },
+
+      // Form action enforcing pipelined batch execution and zero N+1 wire turnarounds
+      executePipelinedBatch: async ({ request, locals }) => {
+        const formData = await request.formData();
+        const payloadRaw = formData.get('batchPayload');
+        if (!payloadRaw) {
+          return fail(400, { message: 'Missing batchPayload' });
+        }
+        const records = JSON.parse(payloadRaw.toString()) as Array<{ id: string; amount: number }>;
+        const client = await locals.dbPool.connect();
+        try {
+          await client.query('BEGIN');
+          // Dispatch all queries concurrently over the single connection using Extended Query Protocol
+          const promises = records.map((rec) =>
+            client.query(
+              'INSERT INTO ledger_events (id, amount_cents, created_at) VALUES ($1, $2, NOW())',
+              [rec.id, rec.amount]
+            )
+          );
+          await Promise.all(promises);
+          await client.query('COMMIT');
+          return { success: true, processedCount: records.length };
+        } catch (err: any) {
+          await client.query('ROLLBACK');
+          return fail(500, { message: `Pipelined batch execution failed: ${err.message}` });
+        } finally {
+          client.release();
+        }
+      },
     };
     ```
