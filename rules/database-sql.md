@@ -3894,6 +3894,19 @@ alwaysApply: false
     - Enforce **Replication Lag Monitoring**: abort or throttle repack if standby replica `replay_lag` exceeds 30 seconds.
     - Enforce **Automated Zombie Object Sentinels**: execute `pg_repack --clean` pre-flight and schedule sentinels alerting on any orphaned triggers matching `repack_trigger%`.
 
+- **Hash Joins, Multi-Batch Spills, Bucketing Skew & Memory Allocation Invariants (PostgreSQL)**:
+  - ❌ **Anti-Pattern: Multi-Batch Grace Hash Spills, Skewed Bucket Collisions & Postmaster OOM**:
+    - Allowing Hash Join nodes to exceed `work_mem * hash_mem_multiplier`, triggering multi-batch spills (`Batches > 1`) that flush inner and outer tuples to disk files, generating gigabytes of `temp_blks_written` and exploding query latency by $10\times–100\times$.
+    - Joining on high-skew, low-entropy columns (e.g., `status = 'ACTIVE'` or dominant `tenant_id`) as the sole join key, causing millions of rows to hash into the same bucket and degrading $O(1)$ lookups into $O(N)$ linear pointer-chasing CPU stalls.
+    - Setting global `work_mem` excessively high across connection pools, causing concurrent multi-worker parallel joins to allocate $W \times K \times \text{work\_mem} \times \text{hash\_mem\_multiplier}$, triggering Linux kernel OOM killer termination of PostgreSQL backends.
+    - Operating with stale statistics where the query planner reverses join roles, building the in-memory hash table on the 10-million row outer table instead of the 10,000-row inner dimension table.
+  - ✅ **Production Invariant**:
+    - Enforce **Single-Batch In-Memory Execution Invariant**: assert `Batches = 1` and `TempWrittenBlocks = 0` via `EXPLAIN (ANALYZE, BUFFERS)` in test and CI pipelines.
+    - Enforce **Transaction-Scoped Memory Sizing**: calibrate memory dynamically via `SET LOCAL work_mem` and `SET LOCAL hash_mem_multiplier = 2.0` bounded by a strict session ceiling ($\le 25\%$ of host RAM).
+    - Enforce **Hash Entropy & Composite Join Keys**: combine low-cardinality keys with high-cardinality attributes (e.g., `ON (a.tenant_id = b.tenant_id AND a.account_id = b.account_id)`) to distribute hash keys uniformly across all buckets.
+    - Enforce **Strict Inner Table Cardinality Prerequisite**: guarantee that the inner build relation is the smaller dataset by running `ANALYZE` after bulk ingestions or migrations.
+    - Enforce **Parallel Shared Hash Join DSM Calibration**: allocate adequate Dynamic Shared Memory (`max_dsm_memory`) and tune `max_parallel_workers_per_gather` to ensure workers cooperate on a single shared hash table without barrier desynchronization.
+
 
 
 

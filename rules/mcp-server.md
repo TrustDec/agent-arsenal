@@ -6733,6 +6733,62 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         };
       }
     );
+
+    // Tool: Audit Hash Join execution plan for multi-batch disk spills and memory boundaries
+    this.server.tool(
+      'audit_hash_join_plan',
+      'Parses EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) execution trees to verify single-batch Hash Join compliance (Batches = 1, TempWrittenBlocks = 0)',
+      {
+        planJson: z.string().describe('Raw JSON output from EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)'),
+        maxSessionMemoryMB: z.number().default(512).describe('Maximum permissible work_mem in megabytes'),
+      },
+      async (args) => {
+        const parsed = JSON.parse(args.planJson);
+        const rootPlan = parsed[0]?.Plan;
+        if (!rootPlan) {
+          throw new Error('Invalid EXPLAIN JSON format: missing root Plan node');
+        }
+
+        let maxBatches = 1;
+        let tempWrittenBlocks = 0;
+        let peakMemoryKB = 0;
+
+        const traverse = (node: any) => {
+          if (node['Node Type'] === 'Hash') {
+            const b = node['Hash Batches'] ?? 1;
+            if (b > maxBatches) maxBatches = b;
+            peakMemoryKB += node['Peak Memory Usage'] ?? 0;
+          }
+          tempWrittenBlocks += node['Temp Written Blocks'] ?? 0;
+          if (Array.isArray(node.Plans)) {
+            for (const child of node.Plans) traverse(child);
+          }
+        };
+
+        traverse(rootPlan);
+
+        const isSingleBatch = maxBatches === 1 && tempWrittenBlocks === 0;
+        const recommendedWorkMemMB = isSingleBatch
+          ? 4
+          : Math.min(args.maxSessionMemoryMB, Math.ceil((peakMemoryKB * maxBatches * 1.25) / (2.0 * 1024)));
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              isSingleBatch,
+              maxBatches,
+              tempWrittenBlocks,
+              peakMemoryKB,
+              status: isSingleBatch ? 'compliant' : 'spill_detected',
+              recommendedGUC: isSingleBatch
+                ? '-- Current memory allocation is optimal'
+                : `SET LOCAL work_mem = '${recommendedWorkMemMB}MB'; SET LOCAL hash_mem_multiplier = 2.0;`,
+            }, null, 2),
+          }],
+        };
+      }
+    );
   }
   ```
 

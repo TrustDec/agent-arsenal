@@ -6427,6 +6427,53 @@ In SvelteKit administrative consoles and system diagnostics:
   </div>
   ```
 
+- **Svelte 5 Runes Invariant: Reactive Hash Join Spill & Memory Sentinel Component**:
+  - Always use Svelte 5 runes (`$state`, `$derived`, `$props`) to display database query plan metrics, isolating disk spillage warnings with neutral typography and accessible contrast:
+  ```svelte
+  <script lang="ts">
+    interface Props {
+      queryName: string;
+      batches: number;
+      tempWrittenBlocks: number;
+      peakMemoryKB: number;
+      workMemMB: number;
+    }
+
+    let { queryName, batches, tempWrittenBlocks, peakMemoryKB, workMemMB }: Props = $props();
+
+    const isSingleBatch = $derived(batches === 1 && tempWrittenBlocks === 0);
+    const memoryUsedMB = $derived((peakMemoryKB / 1024).toFixed(1));
+    const diskSpillMB = $derived(((tempWrittenBlocks * 8) / 1024).toFixed(1));
+  </script>
+
+  <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 space-y-4">
+    <div class="flex items-center justify-between">
+      <div>
+        <h4 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{queryName}</h4>
+        <span class="text-xs text-zinc-500">PostgreSQL Hash Join Memory & Batch Sentinel</span>
+      </div>
+      <span class="px-2.5 py-1 rounded-full text-xs font-medium {isSingleBatch ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-400' : 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-400'}">
+        {isSingleBatch ? 'In-Memory (Single Batch)' : `Multi-Batch Spill (${batches} Batches)`}
+      </span>
+    </div>
+
+    <div class="grid grid-cols-3 gap-3 text-xs">
+      <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+        <span class="text-zinc-500">Peak Memory:</span>
+        <span class="block font-mono font-medium text-zinc-900 dark:text-zinc-100">{memoryUsedMB} MB / {workMemMB} MB</span>
+      </div>
+      <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+        <span class="text-zinc-500">Hash Batches:</span>
+        <span class="block font-mono font-medium {batches === 1 ? 'text-zinc-900 dark:text-zinc-100' : 'text-rose-600'}">{batches}</span>
+      </div>
+      <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+        <span class="text-zinc-500">Temp Disk Spill:</span>
+        <span class="block font-mono font-medium {tempWrittenBlocks === 0 ? 'text-emerald-600' : 'text-rose-600'}">{diskSpillMB} MB</span>
+      </div>
+    </div>
+  </div>
+  ```
+
 
 
 

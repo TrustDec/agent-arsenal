@@ -9097,6 +9097,57 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **PostgreSQL Hash Join Single-Batch In-Memory Execution & Memory Sizing in Go**:
+  - ❌ **Anti-Pattern**: Executing large multi-table joins without transaction-scoped memory management, causing PostgreSQL to spill Hash Join nodes to disk (`Batches > 1`), thrashing NVMe write IOPS and increasing query latency by $20\times–100\times$.
+  - ✅ **Production Invariant**: Use `jackc/pgx/v5` to size `work_mem` and `hash_mem_multiplier` dynamically based on estimated inner build relation rows and average row width, asserting `Batches == 1` and `TempWrittenBlocks == 0` in test suites:
+  ```go
+  // HashJoinGovernor manages transaction memory for zero-disk-spill hash joins
+  type HashJoinGovernor struct {
+  	Pool *pgxpool.Pool
+  }
+
+  // ExecuteSingleBatch executes a read query with dynamic memory tuning
+  func (g *HashJoinGovernor) ExecuteSingleBatch(
+  	ctx context.Context,
+  	estimatedInnerRows int64,
+  	avgRowWidthBytes int,
+  	fn func(tx pgx.Tx) error,
+  ) error {
+  	// Calculate memory required: (width + 40 bytes tuple/ptr overhead) * rows * 1.3 buffer
+  	rowBytes := int64(avgRowWidthBytes + 40)
+  	totalNeededBytes := int64(float64(estimatedInnerRows*rowBytes) * 1.30)
+
+  	// hash_mem_multiplier = 2.0
+  	workMemMB := int(math.Ceil(float64(totalNeededBytes) / (2.0 * 1024 * 1024)))
+  	if workMemMB < 4 {
+  		workMemMB = 4
+  	}
+  	if workMemMB > 512 {
+  		workMemMB = 512 // Cap at 512MB per session to prevent OOM
+  	}
+
+  	tx, err := g.Pool.Begin(ctx)
+  	if err != nil {
+  		return fmt.Errorf("begin tx: %w", err)
+  	}
+  	defer tx.Rollback(ctx)
+
+  	setWorkMem := fmt.Sprintf("SET LOCAL work_mem = '%dMB'", workMemMB)
+  	if _, err := tx.Exec(ctx, setWorkMem); err != nil {
+  		return fmt.Errorf("set work_mem: %w", err)
+  	}
+  	if _, err := tx.Exec(ctx, "SET LOCAL hash_mem_multiplier = 2.0"); err != nil {
+  		return fmt.Errorf("set hash_mem_multiplier: %w", err)
+  	}
+
+  	if err := fn(tx); err != nil {
+  		return err
+  	}
+
+  	return tx.Commit(ctx)
+  }
+  ```
+
 
 
 
