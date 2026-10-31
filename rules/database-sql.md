@@ -3563,6 +3563,21 @@ alwaysApply: false
     - Pin connection checkout for the entire cursor lifecycle: execute `BEGIN`, `DECLARE`, chunked `FETCH`, `CLOSE`, and `COMMIT` within a single dedicated connection checkout.
     - Guarantee portal cleanup with RAII patterns (`defer tx.Exec("CLOSE cur")` in Go, `finally { client.release() }` in TypeScript).
 
+- **Database Collations, Unicode Normalization (NFC/NFD), ICU Locales, Case-Insensitive Search & B-Tree glibc Corruption Defense**:
+  - ❌ **Anti-Pattern: glibc Collation Drift, Case-Sensitive Impersonation & Unindexed Functions**:
+    - Relying on default host OS glibc collations (`libc`) across Linux upgrades without monitoring `pg_collation.collversion`, leading to silent B-Tree index corruption, broken binary search lookups, and duplicate unique keys.
+    - Declaring unique constraints on emails or usernames under case-sensitive collations, allowing `admin@corp.com` and `Admin@Corp.com` to register concurrently (CWE-178).
+    - Querying case-folded columns with unindexed `WHERE LOWER(email) = LOWER($1)`, turning logarithmic $\mathcal{O}(\log N)$ index seeks into $\mathcal{O}(N)$ sequential table scans.
+    - Accepting raw Unicode strings without canonical normalization, allowing visually identical decomposed NFD strings (`café`) and precomposed NFC strings to bypass unique constraints and authorization checks.
+    - Storing UUIDs, API keys, tokens, and hashes under natural language collations, wasting up to 45% of CPU time executing multi-weight `strcoll()` linguistic routines instead of hardware `memcmp()`.
+    - Querying prefix wildcards `WHERE sku LIKE 'PROD-%'` under locale collations without `text_pattern_ops` or `COLLATE "C"`, disabling B-Tree index acceleration.
+  - ✅ **Production Invariant**:
+    - Force `COLLATE "C"` or `COLLATE "POSIX"` on all synthetic identifiers, UUIDs, tokens, and hashes for $3\times–8\times$ faster joins and index lookups.
+    - Enforce Canonical Unicode Composition (NFC) at the boundary gateway and in schema check constraints: `CHECK (username = unicode_normalize_nfc(username))`.
+    - For case-insensitive user identities, utilize PostgreSQL 12+ non-deterministic ICU collations (`provider = icu`, `locale = 'und-u-ks-level2'`, `deterministic = false`) or deterministic functional unique indexes `CREATE UNIQUE INDEX ON users (LOWER(email))`.
+    - Always specify `text_pattern_ops` or `varchar_pattern_ops` when creating B-Tree indexes intended for wildcard prefix matching under locale collations.
+    - Establish automated CI/CD and deployment sentinels to monitor `pg_collation.collversion` vs `pg_collation_actual_version(oid)` and run zero-downtime `REINDEX CONCURRENTLY` runbooks on OS upgrades.
+
 
 
 

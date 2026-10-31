@@ -6108,4 +6108,90 @@ func StreamRecordsChunkedCursor(
 
 	return nil
 }
+
+// UserIdentity represents a canonicalized user entity with collation invariants.
+type UserIdentity struct {
+	ID          string
+	APIToken    string
+	Username    string
+	Email       string
+	AccountCode string
+}
+
+// CanonicalizeUnicodeInput enforces Unicode NFC normalization and strips boundary whitespace,
+// preventing NFD homoglyph attacks and duplicate account creation (CWE-178).
+func CanonicalizeUnicodeInput(input string) string {
+	// Decompose then compose back into canonical precomposed form (NFC)
+	return strings.TrimSpace(norm.NFC.String(input))
+}
+
+// CreateUserCanonical inserts an account ensuring boundary Unicode normalization,
+// lowercase email domain handling, and machine-token COLLATE "C" assignment.
+func CreateUserCanonical(ctx context.Context, pool *pgxpool.Pool, user UserIdentity) error {
+	canonicalUsername := CanonicalizeUnicodeInput(user.Username)
+	canonicalEmail := strings.ToLower(CanonicalizeUnicodeInput(user.Email))
+
+	query := `
+		INSERT INTO users (id, api_token, username, email, account_code)
+		VALUES ($1, $2, $3, $4, $5)
+	`
+	_, err := pool.Exec(ctx, query,
+		user.ID,
+		user.APIToken,       // Uses COLLATE "C" on column definition
+		canonicalUsername,   // Uses case_insensitive_icu collation
+		canonicalEmail,      // Functional lower index & NFC constraint
+		user.AccountCode,    // Uses text_pattern_ops index
+	)
+	if err != nil {
+		return fmt.Errorf("failed inserting canonical user identity: %w", err)
+	}
+	return nil
+}
+
+// FindUserByEmailCaseInsensitive executes an index-accelerated query matching LOWER(email).
+func FindUserByEmailCaseInsensitive(ctx context.Context, pool *pgxpool.Pool, rawEmail string) (*UserIdentity, error) {
+	canonicalEmail := strings.ToLower(CanonicalizeUnicodeInput(rawEmail))
+
+	query := `
+		SELECT id, api_token, username, email, account_code
+		FROM users
+		WHERE LOWER(email) = $1
+		LIMIT 1
+	`
+	var u UserIdentity
+	err := pool.QueryRow(ctx, query, canonicalEmail).Scan(
+		&u.ID,
+		&u.APIToken,
+		&u.Username,
+		&u.Email,
+		&u.AccountCode,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("querying user by case-insensitive email failed: %w", err)
+	}
+	return &u, nil
+}
+
+// VerifyDatabaseCollationIntegrity verifies that no host OS glibc or ICU upgrade has invalidated
+// active database collations, preventing silent B-Tree binary search index corruption.
+func VerifyDatabaseCollationIntegrity(ctx context.Context, pool *pgxpool.Pool) (bool, string, error) {
+	query := `
+		SELECT count(*)
+		FROM pg_collation
+		WHERE collversion IS NOT NULL AND collversion <> pg_collation_actual_version(oid);
+	`
+	var mismatchCount int
+	if err := pool.QueryRow(ctx, query).Scan(&mismatchCount); err != nil {
+		return false, "", fmt.Errorf("evaluating collation version integrity failed: %w", err)
+	}
+
+	if mismatchCount > 0 {
+		return false, fmt.Sprintf("CRITICAL: Detected %d collation version mismatches! B-Tree indexes may be corrupted. Run REINDEX CONCURRENTLY immediately.", mismatchCount), nil
+	}
+
+	return true, "All PostgreSQL collations are in sync with host OS/ICU libraries.", nil
+}
 ```

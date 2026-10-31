@@ -4556,5 +4556,75 @@ alwaysApply: false
           };
         }
       );
+
+      // Audit SQL Collation, Unicode Normalization & glibc Corruption Invariants
+      server.tool(
+        'audit_sql_collation_unicode_invariants',
+        'Statically audits SQL schemas and queries for missing COLLATE "C" machine identifiers, unindexed LOWER() functions, missing Unicode NFC check constraints, and non-sargable LIKE prefixes.',
+        {
+          sql: z.string().describe('The SQL schema DDL or query string to audit.'),
+        },
+        async ({ sql }) => {
+          const warnings: string[] = [];
+          const recommendations: string[] = [];
+          const normalized = sql.replace(/\s+/g, ' ');
+
+          // 1. Machine identifiers missing COLLATE "C"
+          const machineIdMatch = /\b(token|api_key|hash|session_id|secret|checksum|sku)\s+(?:VARCHAR|TEXT|CHAR)\b/i.exec(normalized);
+          if (machineIdMatch && !/\bCOLLATE\s+("C"|'C'|C|POSIX)\b/i.test(normalized)) {
+            warnings.push(
+              `MACHINE_IDENTIFIER_MISSING_COLLATE_C: Column '${machineIdMatch[1]}' uses natural-language collation. Incurs heavy strcoll() CPU overhead during joins and lookups.`
+            );
+            recommendations.push(
+              `Add COLLATE "C" to the column definition: ${machineIdMatch[1]} VARCHAR(...) COLLATE "C"`
+            );
+          }
+
+          // 2. Identity tables missing Unicode NFC normalization check
+          if (/\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(users|accounts|profiles)\b/i.test(normalized)) {
+            if (!/unicode_normalize_nfc/i.test(normalized)) {
+              warnings.push(
+                'IDENTITY_TABLE_MISSING_UNICODE_NFC_CHECK: Identity table lacks CHECK (username = unicode_normalize_nfc(username)) constraint. Vulnerable to NFD homoglyph duplicate attacks (CWE-178).'
+              );
+              recommendations.push(
+                'Add constraint: CONSTRAINT ck_username_nfc CHECK (username = unicode_normalize_nfc(username))'
+              );
+            }
+          }
+
+          // 3. Unindexed functional LOWER() in WHERE clause
+          if (/\bWHERE\s+LOWER\s*\(\s*\w+\s*\)\s*=\s*(?:LOWER|\$|')/i.test(normalized)) {
+            warnings.push(
+              'UNINDEXED_FUNCTIONAL_LOWER: Predicate uses LOWER(col) = ... which cannot traverse standard B-Tree indexes, triggering full sequential scans.'
+            );
+            recommendations.push(
+              'Create a functional unique index: CREATE UNIQUE INDEX ON table (LOWER(column)) or migrate to PostgreSQL 12+ non-deterministic ICU collation.'
+            );
+          }
+
+          // 4. Prefix LIKE search without pattern ops
+          if (/\bWHERE\s+\w+\s+LIKE\s+'[a-zA-Z0-9_\-]+%'/i.test(normalized) && !/text_pattern_ops|varchar_pattern_ops|"C"/i.test(normalized)) {
+            warnings.push(
+              'PREFIX_LIKE_MISSING_PATTERN_OPS: Prefix LIKE query cannot use standard locale B-Tree index and will trigger sequential table scan.'
+            );
+            recommendations.push(
+              'Create B-Tree index using text_pattern_ops or pin column to COLLATE "C".'
+            );
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                hasWarnings: warnings.length > 0,
+                warningsCount: warnings.length,
+                warnings,
+                recommendations,
+                status: warnings.length === 0 ? 'OPTIMAL' : 'REMEDIATION_REQUIRED',
+              }, null, 2),
+            }],
+          };
+        }
+      );
     }
     ```

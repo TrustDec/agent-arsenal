@@ -4794,5 +4794,43 @@ alwaysApply: false
           },
         });
       },
+
+      // User registration form action enforcing Unicode NFC canonicalization and case-insensitive invariants
+      registerUser: async ({ request, locals }) => {
+        const formData = await request.formData();
+        const rawUsername = formData.get('username')?.toString() ?? '';
+        const rawEmail = formData.get('email')?.toString() ?? '';
+
+        if (!rawUsername.trim() || !rawEmail.trim()) {
+          return fail(400, { message: 'Username and email are required.' });
+        }
+
+        // Canonicalize Unicode to Form C (NFC) and fold email case
+        const canonicalUsername = rawUsername.normalize('NFC').trim();
+        const canonicalEmail = rawEmail.normalize('NFC').trim().toLowerCase();
+
+        const client = await locals.dbPool.connect();
+        try {
+          // Uses case_insensitive_icu collation for username and functional LOWER() index on email
+          const res = await client.query(
+            `INSERT INTO users (id, api_token, session_hash, username, email, account_code)
+             VALUES (gen_random_uuid(), gen_random_uuid()::text, gen_random_uuid()::text, $1, $2, $3)
+             RETURNING id, username, email`,
+            [canonicalUsername, canonicalEmail, 'ACC-DEFAULT']
+          );
+
+          return { success: true, user: res.rows[0] };
+        } catch (err: any) {
+          if (err.code === '23505') {
+            return fail(409, { message: 'Username or email is already registered.' });
+          }
+          if (err.code === '23514') {
+            return fail(422, { message: 'Provided identity violates Unicode canonical normalization invariants.' });
+          }
+          return fail(500, { message: `Registration error: ${err.message}` });
+        } finally {
+          client.release();
+        }
+      },
     };
     ```

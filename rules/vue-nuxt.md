@@ -3966,4 +3966,65 @@ alwaysApply: false
 
       return sendStream(event, stream);
     });
+
+    // composables/useUnicodeCanonicalize.ts - Unicode Form C (NFC) Canonicalization Composable
+    export function useUnicodeCanonicalize() {
+      // Normalizes strings to Unicode NFC and strips whitespace
+      const canonicalize = (val: string): string => {
+        if (!val) return '';
+        return val.normalize('NFC').trim();
+      };
+
+      // Canonicalizes email addresses (NFC + lowercase domain)
+      const canonicalizeEmail = (email: string): string => {
+        if (!email) return '';
+        const trimmed = email.normalize('NFC').trim();
+        const atIdx = trimmed.lastIndexOf('@');
+        if (atIdx === -1) return trimmed.toLowerCase();
+        const local = trimmed.slice(0, atIdx);
+        const domain = trimmed.slice(atIdx + 1).toLowerCase();
+        return `${local}@${domain}`;
+      };
+
+      return {
+        canonicalize,
+        canonicalizeEmail,
+      };
+    }
+
+    // server/api/v1/auth/register.post.ts - Nitro Auth Endpoint with Invariant Enforcement
+    export default defineEventHandler(async (event) => {
+      const body = await readBody(event);
+      const rawUsername = body.username as string;
+      const rawEmail = body.email as string;
+
+      if (!rawUsername || !rawEmail) {
+        throw createError({ statusCode: 400, message: 'Username and email are required.' });
+      }
+
+      // Enforce Unicode NFC Canonicalization
+      const canonicalUsername = rawUsername.normalize('NFC').trim();
+      const canonicalEmail = rawEmail.normalize('NFC').trim().toLowerCase();
+
+      const db = useDatabase();
+      try {
+        // Leverages PostgreSQL case_insensitive_icu collation and uidx_users_email_lower
+        const result = await db.query(
+          `INSERT INTO users (id, api_token, session_hash, username, email, account_code)
+           VALUES (gen_random_uuid(), gen_random_uuid()::text, gen_random_uuid()::text, $1, $2, $3)
+           RETURNING id, username, email, created_at`,
+          [canonicalUsername, canonicalEmail, 'ACC-DEFAULT']
+        );
+
+        return { success: true, user: result.rows[0] };
+      } catch (err: any) {
+        if (err.code === '23505') { // Unique violation
+          throw createError({ statusCode: 409, message: 'Username or email already registered.' });
+        }
+        if (err.code === '23514') { // Check constraint violation (e.g. NFC failure)
+          throw createError({ statusCode: 422, message: 'Input violates Unicode canonical normalization standards.' });
+        }
+        throw createError({ statusCode: 500, message: 'Internal registration failure.' });
+      }
+    });
     ```
