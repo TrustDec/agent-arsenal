@@ -5924,6 +5924,72 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
       }
     );
   }
+
+  /**
+   * MCP Tool: Expression Index & AST Subsumption Auditor
+   * Analyzes PostgreSQL queries to ensure predicates match functional index ASTs,
+   * detects unused expression indexes, and recommends STORED generated columns.
+   */
+  export function registerExpressionIndexAuditorTool(server: McpServer, pool: Pool) {
+    server.tool(
+      'audit_expression_index_subsumption',
+      'Audits whether a query predicate successfully subsumes existing expression indexes or flags sequential scans',
+      {
+        querySql: z.string().describe('The SQL query to analyze with EXPLAIN (ANALYZE, BUFFERS)'),
+        targetTable: z.string().optional().describe('Target table to inspect for existing expression indexes'),
+      },
+      async ({ querySql, targetTable }) => {
+        const client = await pool.connect();
+        try {
+          // 1. Run EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+          const explainRes = await client.query(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${querySql}`);
+          const planWrapper = explainRes.rows[0]['QUERY PLAN'][0];
+          const plan = planWrapper['Plan'];
+          const executionTimeMs = planWrapper['Execution Time'] ?? planWrapper['Total Runtime'] ?? 0;
+          const planType = plan['Node Type'] as string;
+          const indexName = plan['Index Name'] as string | undefined;
+
+          // 2. Query existing expression indexes on the relation if provided
+          let existingExprIndexes: unknown[] = [];
+          if (targetTable) {
+            const idxRes = await client.query(`
+              SELECT
+                indexrelname AS index_name,
+                pg_get_indexdef(indexrelid) AS index_def,
+                idx_scan AS scan_count
+              FROM pg_stat_user_indexes
+              JOIN pg_index USING (indexrelid)
+              WHERE relname = $1 AND indexprs IS NOT NULL;
+            `, [targetTable]);
+            existingExprIndexes = idxRes.rows;
+          }
+
+          const isSubsumed = planType !== 'SeqScan' && !!indexName;
+          let recommendation = 'Query predicate successfully utilizes index.';
+          if (!isSubsumed) {
+            recommendation = `CRITICAL SUBSUMPTION FAILURE: Query executed as ${planType} (Time: ${executionTimeMs}ms). ` +
+              `Check exact AST match, type cast symmetry (e.g. text vs int in JSONB), and collation rules.`;
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                isSubsumed,
+                planType,
+                indexUsed: indexName ?? null,
+                executionTimeMs,
+                existingExprIndexes,
+                recommendation,
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
+  }
   ```
 
 

@@ -7934,6 +7934,94 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **PostgreSQL Expression Index & STORED Generated Column Subsumption Repository**:
+  - Implement type-safe query builders using `jackc/pgx/v5` ensuring strict AST congruence between query predicates and expression indexes.
+  - Standardize on `STORED` generated columns for projected fields to enable 100% Index-Only Scans with zero runtime expression re-evaluation.
+
+  ```go
+  // internal/store/subsumption_repository.go
+  package store
+
+  import (
+  	"context"
+  	"errors"
+  	"fmt"
+  	"log/slog"
+  	"strings"
+  	"time"
+
+  	"github.com/jackc/pgx/v5"
+  	"github.com/jackc/pgx/v5/pgxpool"
+  )
+
+  type SubsumptionRepository struct {
+  	pool   *pgxpool.Pool
+  	logger *slog.Logger
+  }
+
+  func NewSubsumptionRepository(pool *pgxpool.Pool, logger *slog.Logger) *SubsumptionRepository {
+  	return &SubsumptionRepository{pool: pool, logger: logger}
+  }
+
+  type NormalizedUser struct {
+  	ID             string    `json:"id"`
+  	Email          string    `json:"email"`
+  	LowerEmail     string    `json:"lower_email"`
+  	CreatedAt      time.Time `json:"created_at"`
+  }
+
+  // LookupUserByNormalizedEmail leverages STORED generated column for Index-Only Scans
+  func (r *SubsumptionRepository) LookupUserByNormalizedEmail(ctx context.Context, email string) (*NormalizedUser, error) {
+  	clean := strings.TrimSpace(strings.ToLower(email))
+
+  	// Strict AST subsumption: matches CREATE INDEX idx_users_lower_email_c ON users (lower_email COLLATE "C")
+  	query := `
+  		SELECT id, email, lower_email, created_at
+  		FROM users
+  		WHERE lower_email = $1 COLLATE "C"
+  		LIMIT 1;
+  	`
+  	var u NormalizedUser
+  	err := r.pool.QueryRow(ctx, query, clean).Scan(&u.ID, &u.Email, &u.LowerEmail, &u.CreatedAt)
+  	if err != nil {
+  		if errors.Is(err, pgx.ErrNoRows) {
+  			return nil, nil
+  		}
+  		return nil, fmt.Errorf("LookupUserByNormalizedEmail failed: %w", err)
+  	}
+  	return &u, nil
+  }
+
+  // QueryJSONBEventByTenantID ensures exact AST type-casting congruence with expression index
+  func (r *SubsumptionRepository) QueryJSONBEventByTenantID(ctx context.Context, tenantID int64, limit int) ([]string, error) {
+  	// Index: CREATE INDEX idx_events_tenant ON events (((payload->>'tenant_id')::bigint));
+  	// AST Invariant: ((payload->>'tenant_id')::bigint) = $1
+  	query := `
+  		SELECT id
+  		FROM events
+  		WHERE ((payload->>'tenant_id')::bigint) = $1
+  		ORDER BY id DESC
+  		LIMIT $2;
+  	`
+  	rows, err := r.pool.Query(ctx, query, tenantID, limit)
+  	if err != nil {
+  		return nil, fmt.Errorf("QueryJSONBEventByTenantID query failed: %w", err)
+  	}
+  	defer rows.Close()
+
+  	var ids []string
+  	for rows.Next() {
+  		var id string
+  		if err := rows.Scan(&id); err != nil {
+  			return nil, err
+  		}
+  		ids = append(ids, id)
+  	}
+  	return ids, rows.Err()
+  }
+  ```
+
+
 
 
 

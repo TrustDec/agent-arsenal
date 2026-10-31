@@ -4957,6 +4957,80 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   </template>
   ```
 
+- **PostgreSQL Expression Index & AST Subsumption Card (Vue 3 / Nuxt Composition API)**:
+  - Deliver clean micro-bordered cards auditing whether queries hit expression indexes or trigger catastrophic sequential scans.
+
+  ```vue
+  <!-- components/database/ExpressionIndexSubsumptionCard.vue -->
+  <script setup lang="ts">
+  import { computed } from 'vue';
+
+  interface SubsumptionAudit {
+    tableName: string;
+    predicateSnippet: string;
+    isSubsumed: boolean;
+    planType: 'IndexScan' | 'IndexOnlyScan' | 'BitmapIndexScan' | 'SeqScan';
+    indexName?: string;
+    cost: number;
+    executionTimeMs: number;
+  }
+
+  const props = defineProps<{
+    audit: SubsumptionAudit;
+  }>();
+
+  const isSeqScan = computed(() => props.audit.planType === 'SeqScan');
+  const badgeClass = computed(() => {
+    if (isSeqScan.value) {
+      return 'bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/40 dark:text-rose-400 dark:border-rose-900';
+    }
+    if (props.audit.planType === 'IndexOnlyScan') {
+      return 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-400 dark:border-emerald-900';
+    }
+    return 'bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-950/40 dark:text-blue-400 dark:border-blue-900';
+  });
+  </script>
+
+  <template>
+    <div class="p-4 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-xs">
+      <div class="flex items-center justify-between pb-3 border-b border-zinc-100 dark:border-zinc-800/80">
+        <div class="truncate max-w-[70%]">
+          <h3 class="font-medium text-sm text-zinc-900 dark:text-zinc-100 truncate">AST Subsumption Audit</h3>
+          <p class="text-xs text-zinc-500 font-mono mt-0.5 truncate">{{ audit.tableName }} &middot; {{ audit.predicateSnippet }}</p>
+        </div>
+        <span class="text-xs px-2.5 py-0.5 rounded border font-mono font-medium" :class="badgeClass">
+          {{ audit.planType }}
+        </span>
+      </div>
+
+      <div class="grid grid-cols-3 gap-3 my-3 text-xs">
+        <div class="p-2 rounded bg-zinc-50 dark:bg-zinc-800/50">
+          <div class="text-zinc-400 text-2xs mb-0.5">SUBSUMED?</div>
+          <div class="font-mono font-bold" :class="audit.isSubsumed ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'">
+            {{ audit.isSubsumed ? 'YES' : 'NO (FALLBACK)' }}
+          </div>
+        </div>
+        <div class="p-2 rounded bg-zinc-50 dark:bg-zinc-800/50">
+          <div class="text-zinc-400 text-2xs mb-0.5">INDEX USED</div>
+          <div class="font-mono font-bold text-zinc-900 dark:text-zinc-100 truncate">
+            {{ audit.indexName ?? 'None (SeqScan)' }}
+          </div>
+        </div>
+        <div class="p-2 rounded bg-zinc-50 dark:bg-zinc-800/50">
+          <div class="text-zinc-400 text-2xs mb-0.5">EXEC TIME</div>
+          <div class="font-mono font-bold" :class="isSeqScan ? 'text-rose-600 dark:text-rose-400' : 'text-emerald-600 dark:text-emerald-400'">
+            {{ audit.executionTimeMs.toFixed(2) }}ms
+          </div>
+        </div>
+      </div>
+
+      <div v-if="isSeqScan" class="pt-2 border-t border-rose-100 dark:border-rose-900/40 text-xs text-rose-600 dark:text-rose-400 font-mono">
+        ⚠️ AST Subsumption Failure: Predicate did not match expression index AST. Align type casts or deploy STORED generated column.
+      </div>
+    </div>
+  </template>
+  ```
+
 
 
 

@@ -3780,6 +3780,19 @@ alwaysApply: false
     - Enforce **Optimization Pass CPU Fencing**: set `jit_optimize_above_cost = -1` and `jit_inline_above_cost = -1` on high-throughput mixed workloads to retain sub-5ms expression JIT while eliminating LLVM optimization thrashing.
     - Continuous **EXPLAIN JIT Telemetry**: extract `JIT.Timing.Total` from `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)`; automatically reject PRs proposing secondary indexes when query latency is dominated by JIT compilation ($\rho_{\text{jit}} > 15\%$).
 
+- **Expression Indexes, STORED Generated Columns & AST Subsumption Fencing (PostgreSQL 12–17+)**:
+  - ❌ **Anti-Pattern: AST Subsumption Failure & Fake IMMUTABLE Corruption**:
+    - Writing queries with `WHERE email ILIKE $1` or `WHERE LOWER(email::text) = ...` against indexes defined on `(LOWER(email))`, failing planner AST pattern matching and triggering 45-second sequential scans across 50M rows.
+    - Declaring functions `IMMUTABLE` that rely on session `TIMEZONE`, `now()`, or dynamic table queries, silently corrupting B-Tree ordering invariants.
+    - Creating functional indexes on attributes frequently projected in `SELECT` lists, failing to leverage Index-Only Scans and missing native `pg_stats` histogram statistics provided by `GENERATED ALWAYS AS (expr) STORED`.
+    - Mismatching JSONB arrow operators: indexing `(payload->>'id')` (text) while querying with integer equality `((payload->>'id')::bigint = $1)`.
+  - ✅ **Production Invariant**:
+    - Enforce **Strict Volatility & Timezone Fencing**: verify `provolatile = 'i'` and require explicit UTC conversions `(date_trunc('day', created_at AT TIME ZONE 'UTC'))`.
+    - Enforce **AST Subsumption Congruence**: maintain 100% syntactic congruence between query `WHERE` predicates and index expressions, including exact type casts.
+    - Deploy **STORED Generated Columns for Projected Keys**: use `GENERATED ALWAYS AS (expr) STORED` when attributes are projected or referenced in foreign keys; reserve expression indexes for pure filter predicates.
+    - Enforce **Collation "C" Fencing**: append `COLLATE "C"` to text expressions (`(LOWER(slug) COLLATE "C")`) to immunize against OS glibc upgrades and accelerate `memcmp()` comparisons.
+
+
 
 
 

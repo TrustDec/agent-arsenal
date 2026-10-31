@@ -53,6 +53,7 @@ When given a coding or debugging task, always follow this sequence:
 - **Memory Bank & Compacting Protocol**: In complex multi-turn sessions, maintain a rolling compact state (`[Goal] -> [Verified Ground Truth] -> [Applied Diffs] -> [Next Action]`). When context approaches capacity, compress conversation turns into dense structured milestones to eliminate "Lost in the Middle" attention degradation.
 - **Bounded Diagnostic Truncation**: When running tests or linters, extract only the failing trace and line numbers. Never ingest 500 lines of passing green tests into prompt memory.
 - **MCP & Tool Calling Payload Virtualization**: When calling Model Context Protocol (MCP) servers or CLI tools that return multi-entity records, enforce bounded pagination (`limit <= 25`), select projections, and summarize data at the tool layer. Never pull megabytes of raw JSON responses into LLM context window memory.
+- **Dynamic Tool Schema Loading**: For large toolsets (>25 tools), defer loading full JSON schemas into the active context until the tool category is explicitly activated, avoiding prompt token exhaustion.
 - **Bitwise Cache Invariance**: Ensure instructions, schemas, and memory banks remain bitwise immutable across turns to maintain hardware KV cache prefix hits (Anthropic prompt caching, OpenAI prefix cache, vLLM RadixAttention).
 
 ---
@@ -63,5 +64,7 @@ When given a coding or debugging task, always follow this sequence:
 - **Bounded Command Outputs**: When inspecting logs or running test suites, use targeted filters, line limits, or `head`/`tail` to prevent dumping thousands of lines of terminal output into the context.
 - **Clean Subprocess Lifecycles**: Never leave orphan background processes or dangling test servers running; ensure test runs and tools terminate cleanly with deterministic exit codes.
 - **Sub-Agent Context Isolation**: Offload heavy exploratory sweeps, repository map generation, and massive benchmark runs to sandboxed sub-agents, returning strictly structured 5-line syntheses to the orchestrator.
+- **Git Worktree Isolation for High-Blast-Radius Tasks**: Isolate broad refactoring runs or risky dependency upgrades in ephemeral git worktrees, verifying clean builds before merging to main.
+
 
 
