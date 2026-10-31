@@ -5300,5 +5300,90 @@ When an MCP server exposes tools that execute database analytical scans, reports
           }
         }
       );
+
+      // Tool: verify_buffer_cache_health
+      server.tool(
+        'verify_buffer_cache_health',
+        'Audits PostgreSQL buffer pool health, per-relation cache hit ratios, bgwriter dirty page efficiency, and detects cold-start risks or double-buffering misconfigurations',
+        {
+          minRelationBlocks: z.number().default(1000).describe('Minimum combined heap blocks (hit + read) to inspect for table cache hit ratios'),
+        },
+        async ({ minRelationBlocks }) => {
+          const client = await pool.connect();
+          try {
+            // 1. Audit bgwriter vs backend writes
+            const bgwriterRes = await client.query<{
+              buffers_clean: string;
+              buffers_backend: string;
+            }>(`SELECT buffers_clean, buffers_backend FROM pg_stat_bgwriter;`);
+
+            const clean = parseInt(bgwriterRes.rows[0]?.buffers_clean ?? '0', 10);
+            const backend = parseInt(bgwriterRes.rows[0]?.buffers_backend ?? '0', 10);
+            const totalWrites = clean + backend;
+            const backendRatio = totalWrites > 0 ? (backend / totalWrites) * 100 : 0;
+
+            // 2. Audit low hit-ratio tables
+            const tablesRes = await client.query<{
+              relname: string;
+              heap_blks_read: string;
+              heap_blks_hit: string;
+              hit_pct: string;
+            }>(`
+              SELECT
+                schemaname || '.' || relname AS relname,
+                heap_blks_read,
+                heap_blks_hit,
+                ROUND((heap_blks_hit::numeric / NULLIF(heap_blks_hit + heap_blks_read, 0)) * 100, 2) AS hit_pct
+              FROM pg_statio_user_tables
+              WHERE (heap_blks_hit + heap_blks_read) >= $1
+              ORDER BY heap_blks_read DESC
+              LIMIT 10;
+            `, [minRelationBlocks]);
+
+            const coldTables = tablesRes.rows.filter(r => parseFloat(r.hit_pct ?? '100') < 95.0);
+            const violations: string[] = [];
+
+            if (backendRatio > 5.0) {
+              violations.push(
+                `BACKEND_WRITE_TAX_ACTIVE: ${backendRatio.toFixed(2)}% of dirty page writes performed by client connections. Tune bgwriter_lru_maxpages and bgwriter_delay.`
+              );
+            }
+
+            if (coldTables.length > 0) {
+              violations.push(
+                `COLD_TABLE_CACHE_DETECTED: ${coldTables.length} relations have < 95% cache hit ratio with significant disk reads. Inspect unindexed scans or run pg_prewarm.`
+              );
+            }
+
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  status: violations.length === 0 ? 'HEALTHY' : 'WARNING',
+                  bgwriterHealth: {
+                    buffersClean: clean,
+                    buffersBackend: backend,
+                    backendWriteRatioPercent: Math.round(backendRatio * 100) / 100,
+                    isHealthy: backendRatio <= 5.0,
+                  },
+                  topRelationsAudited: tablesRes.rows.map(r => ({
+                    relation: r.relname,
+                    blocksRead: parseInt(r.heap_blks_read, 10),
+                    blocksHit: parseInt(r.heap_blks_hit, 10),
+                    hitRatioPercent: parseFloat(r.hit_pct),
+                  })),
+                  coldRelations: coldTables,
+                  violations,
+                  recommendation: violations.length > 0
+                    ? 'Tune bgwriter parameters and check slow queries for unindexed scans bypassing ring buffers.'
+                    : 'Buffer pool and background writer are operating with optimal cache hit ratios.',
+                }, null, 2),
+              }],
+            };
+          } finally {
+            client.release();
+          }
+        }
+      );
     }
     ```

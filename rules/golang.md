@@ -7021,3 +7021,107 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   	return nil
   }
   ```
+
+- **PostgreSQL Buffer Pool & Background Writer (`bgwriter`) Telemetry Sentinel**:
+  - Implement continuous background telemetry inspecting `pg_statio_user_tables` and `pg_stat_bgwriter` using `jackc/pgx/v5`.
+  - Alert when backend client connections are forced to write dirty buffers (`buffers_backend` ratio > 5%) or when high-throughput tables suffer cold cache drops (< 98% hit ratio).
+
+  ```go
+  // internal/telemetry/buffer_cache_sentinel.go
+  package telemetry
+
+  import (
+  	"context"
+  	"fmt"
+  	"log/slog"
+  	"time"
+
+  	"github.com/jackc/pgx/v5/pgxpool"
+  )
+
+  type BufferCacheHealthSentinel struct {
+  	pool   *pgxpool.Pool
+  	logger *slog.Logger
+  }
+
+  func NewBufferCacheHealthSentinel(pool *pgxpool.Pool, logger *slog.Logger) *BufferCacheHealthSentinel {
+  	if logger == nil {
+  		logger = slog.Default()
+  	}
+  	return &BufferCacheHealthSentinel{pool: pool, logger: logger}
+  }
+
+  func (s *BufferCacheHealthSentinel) Start(ctx context.Context, checkInterval time.Duration) {
+  	ticker := time.NewTicker(checkInterval)
+  	go func() {
+  		defer ticker.Stop()
+  		for {
+  			select {
+  			case <-ctx.Done():
+  				return
+  			case <-ticker.C:
+  				if err := s.Inspect(ctx); err != nil {
+  					s.logger.Error("buffer cache audit failed", slog.String("error", err.Error()))
+  				}
+  			}
+  		}
+  	}()
+  }
+
+  func (s *BufferCacheHealthSentinel) Inspect(ctx context.Context) error {
+  	// 1. Audit bgwriter vs backend dirty page writes
+  	const bgwriterSQL = `
+  		SELECT buffers_clean, buffers_backend
+  		FROM pg_stat_bgwriter;
+  	`
+  	var clean, backend int64
+  	if err := s.pool.QueryRow(ctx, bgwriterSQL).Scan(&clean, &backend); err == nil {
+  		total := clean + backend
+  		if total > 0 {
+  			backendRatio := float64(backend) / float64(total) * 100.0
+  			if backendRatio > 5.0 {
+  				s.logger.Warn("buffer cache backend write tax active",
+  					slog.Float64("backend_write_ratio_pct", backendRatio),
+  					slog.Int64("buffers_backend", backend),
+  					slog.Int64("buffers_clean", clean),
+  					slog.String("recommendation", "increase bgwriter_lru_maxpages to 800 and reduce bgwriter_delay to 10ms"),
+  				)
+  			}
+  		}
+  	}
+
+  	// 2. Audit per-table cache hit ratios on high-volume tables
+  	const tableSQL = `
+  		SELECT schemaname || '.' || relname AS relname,
+  		       heap_blks_read, heap_blks_hit,
+  		       ROUND((heap_blks_hit::numeric / NULLIF(heap_blks_hit + heap_blks_read, 0)) * 100, 2) AS hit_pct
+  		FROM pg_statio_user_tables
+  		WHERE (heap_blks_hit + heap_blks_read) > 2000
+  		  AND (heap_blks_hit::numeric / NULLIF(heap_blks_hit + heap_blks_read, 0)) < 0.98
+  		ORDER BY heap_blks_read DESC
+  		LIMIT 5;
+  	`
+  	rows, err := s.pool.Query(ctx, tableSQL)
+  	if err != nil {
+  		return fmt.Errorf("query pg_statio_user_tables failed: %w", err)
+  	}
+  	defer rows.Close()
+
+  	for rows.Next() {
+  		var relname string
+  		var read, hit int64
+  		var hitPct *float64
+  		if err := rows.Scan(&relname, &read, &hit, &hitPct); err == nil && hitPct != nil {
+  			s.logger.Warn("table cache hit ratio below threshold",
+  				slog.String("relation", relname),
+  				slog.Float64("hit_ratio_pct", *hitPct),
+  				slog.Int64("blocks_read", read),
+  				slog.Int64("blocks_hit", hit),
+  				slog.String("action", "check for unindexed scans or consider pg_prewarm"),
+  			)
+  		}
+  	}
+  	return nil
+  }
+  ```
+

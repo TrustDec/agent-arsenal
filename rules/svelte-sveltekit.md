@@ -5164,3 +5164,96 @@ In SvelteKit administrative consoles and system diagnostics:
     {/if}
   </div>
   ```
+
+- **PostgreSQL Buffer Pool & `bgwriter` Health Monitor Component (Svelte 5 Runes)**:
+  - Administrative dashboard component with Apple/Vercel design system displaying per-relation cache hit ratios, backend write tax indicators, and cold table alerts.
+
+  ```svelte
+  <!-- src/routes/admin/buffercache/+page.svelte -->
+  <script lang="ts">
+    interface RelationMetric {
+      relation: string;
+      blocksRead: number;
+      blocksHit: number;
+      hitRatioPercent: number;
+    }
+
+    interface BgwriterStats {
+      buffersClean: number;
+      buffersBackend: number;
+      backendWriteRatioPercent: number;
+    }
+
+    let { data } = $props<{
+      data: {
+        bgwriter: BgwriterStats;
+        relations: RelationMetric[];
+      };
+    }>();
+
+    let hasBackendWriteTax = $derived(
+      data.bgwriter.backendWriteRatioPercent > 5.0
+    );
+
+    let coldRelations = $derived(
+      data.relations.filter(r => r.hitRatioPercent < 95.0)
+    );
+  </script>
+
+  <div class="space-y-6 rounded-xl border border-zinc-200 dark:border-zinc-800 p-6 bg-white dark:bg-zinc-900 shadow-sm">
+    <div class="flex items-center justify-between pb-4 border-b border-zinc-100 dark:border-zinc-800">
+      <div>
+        <h2 class="text-base font-semibold text-zinc-900 dark:text-zinc-100">Buffer Pool & bgwriter Health</h2>
+        <p class="text-xs text-zinc-500">PostgreSQL shared_buffers eviction & synchronous write tax telemetry</p>
+      </div>
+      <div class="flex gap-2">
+        <span
+          class={hasBackendWriteTax 
+            ? 'rounded-full bg-amber-100 px-3 py-1 font-mono text-xs font-semibold text-amber-800 dark:bg-amber-950/50 dark:text-amber-300' 
+            : 'rounded-full bg-emerald-100 px-3 py-1 font-mono text-xs font-semibold text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400'}
+        >
+          {hasBackendWriteTax ? `BACKEND TAX: ${data.bgwriter.backendWriteRatioPercent}%` : 'BGWRITER OPTIMAL'}
+        </span>
+      </div>
+    </div>
+
+    <!-- Summary Metrics -->
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div class="p-4 rounded-lg bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-200/50 dark:border-zinc-700/50">
+        <p class="text-xs text-zinc-500 font-medium">Clean Buffers (bgwriter)</p>
+        <p class="text-xl font-bold font-mono text-zinc-900 dark:text-zinc-100 mt-1">{data.bgwriter.buffersClean.toLocaleString()}</p>
+      </div>
+      <div class="p-4 rounded-lg bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-200/50 dark:border-zinc-700/50">
+        <p class="text-xs text-zinc-500 font-medium">Backend Writes (Query Thread)</p>
+        <p class={hasBackendWriteTax ? 'text-xl font-bold font-mono text-amber-600 mt-1' : 'text-xl font-bold font-mono text-zinc-900 dark:text-zinc-100 mt-1'}>
+          {data.bgwriter.buffersBackend.toLocaleString()}
+        </p>
+      </div>
+      <div class="p-4 rounded-lg bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-200/50 dark:border-zinc-700/50">
+        <p class="text-xs text-zinc-500 font-medium">Cold Relations Detected</p>
+        <p class={coldRelations.length > 0 ? 'text-xl font-bold font-mono text-red-600 mt-1' : 'text-xl font-bold font-mono text-emerald-600 mt-1'}>
+          {coldRelations.length}
+        </p>
+      </div>
+    </div>
+
+    <!-- Table List -->
+    <div>
+      <h3 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-3">Top Relations Cache Hit Status</h3>
+      <div class="divide-y divide-zinc-100 dark:divide-zinc-800 font-mono text-xs">
+        {#each data.relations as rel (rel.relation)}
+          <div class="flex items-center justify-between py-2.5">
+            <span class="text-zinc-700 dark:text-zinc-300 truncate max-w-sm">{rel.relation}</span>
+            <div class="flex items-center gap-4">
+              <span class="text-zinc-400 text-2xs">Reads: {rel.blocksRead} | Hits: {rel.blocksHit}</span>
+              <span class={rel.hitRatioPercent < 95.0 ? 'text-red-600 font-bold' : 'text-emerald-600'}>
+                {rel.hitRatioPercent.toFixed(1)}%
+              </span>
+            </div>
+          </div>
+        {/each}
+      </div>
+    </div>
+  </div>
+  ```
+

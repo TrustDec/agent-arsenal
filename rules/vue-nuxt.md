@@ -4405,3 +4405,100 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
     </div>
   </template>
   ```
+
+- **PostgreSQL Buffer Pool & `bgwriter` Telemetry Monitor (Vue 3 / Nuxt 3)**:
+  - Telemetry card with Apple/Vercel design system displaying per-table cache hit ratios, backend write tax indicators, and cold relation warnings.
+
+  ```vue
+  <!-- components/BufferCacheMonitor.vue -->
+  <script setup lang="ts">
+  interface RelationMetric {
+    relation: string;
+    blocksRead: number;
+    blocksHit: number;
+    hitRatioPercent: number;
+  }
+
+  interface BgwriterStats {
+    buffersClean: number;
+    buffersBackend: number;
+    backendWriteRatioPercent: number;
+  }
+
+  interface CacheHealthResponse {
+    bgwriter: BgwriterStats;
+    relations: RelationMetric[];
+  }
+
+  const { data: cacheData, refresh } = await useFetch<CacheHealthResponse>('/api/admin/buffercache', {
+    default: () => ({
+      bgwriter: { buffersClean: 0, buffersBackend: 0, backendWriteRatioPercent: 0 },
+      relations: [],
+    }),
+  });
+
+  const hasBackendWriteTax = computed(() => 
+    (cacheData.value?.bgwriter.backendWriteRatioPercent ?? 0) > 5.0
+  );
+
+  const coldRelations = computed(() => 
+    cacheData.value?.relations.filter(r => r.hitRatioPercent < 95.0) ?? []
+  );
+  </script>
+
+  <template>
+    <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 p-5 bg-white dark:bg-zinc-900 shadow-sm space-y-5">
+      <div class="flex items-center justify-between pb-4 border-b border-zinc-100 dark:border-zinc-800">
+        <div>
+          <h3 class="font-medium text-zinc-900 dark:text-zinc-100">Buffer Pool & bgwriter Telemetry</h3>
+          <p class="text-xs text-zinc-500">PostgreSQL shared_buffers residency & synchronous write tax defense</p>
+        </div>
+        <span
+          :class="hasBackendWriteTax ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/50 dark:text-amber-300' : 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400'"
+          class="text-xs font-mono font-medium px-2.5 py-1 rounded-full"
+        >
+          {{ hasBackendWriteTax ? `BACKEND TAX: ${cacheData.bgwriter.backendWriteRatioPercent}%` : 'BGWRITER OPTIMAL' }}
+        </span>
+      </div>
+
+      <!-- Quick Metrics Grid -->
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <div class="p-3.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/40 border border-zinc-100 dark:border-zinc-800">
+          <p class="text-2xs uppercase tracking-wider text-zinc-400 font-semibold">Clean Buffers</p>
+          <p class="text-lg font-mono font-bold text-zinc-900 dark:text-zinc-100 mt-0.5">
+            {{ cacheData.bgwriter.buffersClean.toLocaleString() }}
+          </p>
+        </div>
+        <div class="p-3.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/40 border border-zinc-100 dark:border-zinc-800">
+          <p class="text-2xs uppercase tracking-wider text-zinc-400 font-semibold">Backend Writes</p>
+          <p :class="hasBackendWriteTax ? 'text-amber-600' : 'text-zinc-900 dark:text-zinc-100'" class="text-lg font-mono font-bold mt-0.5">
+            {{ cacheData.bgwriter.buffersBackend.toLocaleString() }}
+          </p>
+        </div>
+        <div class="p-3.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/40 border border-zinc-100 dark:border-zinc-800">
+          <p class="text-2xs uppercase tracking-wider text-zinc-400 font-semibold">Cold Relations</p>
+          <p :class="coldRelations.length > 0 ? 'text-red-600' : 'text-emerald-600'" class="text-lg font-mono font-bold mt-0.5">
+            {{ coldRelations.length }}
+          </p>
+        </div>
+      </div>
+
+      <!-- Top Relations List -->
+      <div class="mt-4">
+        <h4 class="text-2xs font-semibold uppercase tracking-wider text-zinc-400 mb-2">High-Volume Relation Hit Ratios</h4>
+        <ul class="divide-y divide-zinc-100 dark:divide-zinc-800 font-mono text-xs">
+          <li v-for="rel in cacheData.relations" :key="rel.relation" class="py-2.5 flex items-center justify-between">
+            <span class="truncate max-w-sm text-zinc-700 dark:text-zinc-300">{{ rel.relation }}</span>
+            <div class="flex items-center gap-3">
+              <span class="text-2xs text-zinc-400">R: {{ rel.blocksRead }} / H: {{ rel.blocksHit }}</span>
+              <span :class="rel.hitRatioPercent < 95.0 ? 'text-red-600 font-bold' : 'text-emerald-600'">
+                {{ rel.hitRatioPercent.toFixed(1) }}%
+              </span>
+            </div>
+          </li>
+        </ul>
+      </div>
+    </div>
+  </template>
+  ```
+

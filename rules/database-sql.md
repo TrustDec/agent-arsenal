@@ -3695,6 +3695,21 @@ alwaysApply: false
     - Require the coordinator to write a durable `COMMITTING` record to local Write-Ahead Log (WAL) storage BEFORE emitting Phase 2 `COMMIT PREPARED` to any participant node.
     - Deploy continuous background sentinels querying `pg_prepared_xacts`: emit warnings for prepared transactions older than 30s, critical alerts at 60s, and execute coordinated reconciliation to prevent cluster $x_{\min}$ horizon pinning and dead tuple accumulation.
 
+- **Database Buffer Pool Eviction, `shared_buffers` Sizing, Clock-Sweep Degradation & `bgwriter` Calibration Defense**:
+  - ❌ **Anti-Pattern: Global Cache Ratio Mirage, Ring Buffer Bypass & Synchronous Backend Write Tax**:
+    - Relying on instance-wide aggregate cache hit ratio `sum(blks_hit) / sum(blks_hit + blks_read)`, observing 99.8% while core production tables silently drop to 60% hit ratio due to cold I/O reads on unindexed filters, spiking p99 primary key lookup latency from 0.3ms to 35ms.
+    - Issuing queries with `LIMIT` or multi-range unindexed scans on large tables that bypass the 256KB `BAS_BULKREAD` ring buffer, reading hundreds of thousands of cold blocks directly into `shared_buffers` and evicting the active OLTP working set into disk.
+    - Allocating 80%–90% of system RAM to `shared_buffers`, starving the Linux kernel Page Cache, inducing massive double-buffering penalties, and exhausting connection `work_mem` until the Linux OOM killer sends `SIGKILL` to the PostgreSQL postmaster.
+    - Leaving `bgwriter_lru_maxpages` at default 100 with `bgwriter_delay = 200ms`, forcing client connection backends to synchronously write dirty buffers to disk during query execution (`buffers_backend` spikes in `pg_stat_bgwriter`), injecting blocking disk write stalls into user transactions.
+    - Restarting database nodes or promoting HA standby replicas with empty `shared_buffers`, allowing hundreds of concurrent API threads to hammer cold disk blocks simultaneously, saturating IOPS in a thundering herd and crashing connection pools.
+  - ✅ **Production Invariant**:
+    - Calibrate **Mathematical Memory Limits**: set `shared_buffers = min(0.25 * RAM, 32GB)` and `effective_cache_size = 0.75 * RAM`. Reserve remaining RAM for Linux Page Cache double-buffering and per-connection `work_mem`.
+    - Enforce **Per-Relation Cache Hit Telemetry**: monitor `pg_statio_user_tables` and `pg_statio_user_indexes` individually, requiring $\ge 98\%$ cache hit ratios on high-throughput OLTP tables and alerting on cold block read spikes.
+    - Protect **Ring Buffer Access Strategies**: enforce keyset pagination and composite index seeks on analytical queries to prevent scans from bypassing `BAS_BULKREAD` and evicting hot working sets.
+    - Proactively Tune **Background Writer (`bgwriter`)**: configure `bgwriter_delay = 10ms`, `bgwriter_lru_maxpages = 800`, and `bgwriter_lru_multiplier = 3.0` to guarantee `buffers_backend / (buffers_backend + buffers_clean) < 0.05`.
+    - Deploy **Zero-Downtime Cache Warm-Up**: enable `pg_prewarm` in `shared_preload_libraries` with `autopreload = true`, ensuring buffer states are automatically persisted and restored across planned restarts and HA promotions.
+
+
 
 
 
