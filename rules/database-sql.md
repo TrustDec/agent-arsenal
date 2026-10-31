@@ -3548,6 +3548,21 @@ alwaysApply: false
     - Pin `SET search_path = pg_catalog, pg_temp` on every `SECURITY DEFINER` routine and strictly enforce least-privilege `REVOKE ALL FROM PUBLIC`.
     - In dynamic SQL, always parameterize literals with `USING` and sanitize table/column identifiers with `format('%I', identifier)`.
 
+- **Database Server-Side Cursors, Portal Fetching, Stream Chunking & Client Memory OOM Defense**:
+  - ❌ **Anti-Pattern: Unbounded In-Memory Buffering, Snapshot xmin Pinning & Dangerous WITH HOLD**:
+    - Eagerly loading millions of rows into application memory with `await db.select().from(table)` or unchunked driver queries, triggering process container OOM kills (`SIGKILL 137`).
+    - Opening a server cursor inside a long-running transaction while slowly consuming records over hours, pinning the database transaction horizon ($x_{\text{min}}$) and freezing Autovacuum cluster-wide.
+    - Declaring `CURSOR WITH HOLD` to bypass transaction duration limits, forcing PostgreSQL on `COMMIT` to eagerly copy all remaining unconsumed tuples into `pgsql_tmp` disk files, exhausting NVMe disk space and causing massive write I/O stalls.
+    - Executing cursor queries across multiple roundtrips behind transaction-mode PgBouncer, causing subsequent `FETCH` statements to land on different backend server connections and crash with `ERROR: cursor "..." does not exist`.
+    - Omitting `NO SCROLL`, forcing the planner to inject a `Materialize` node and tuplestore buffer to support backward scrolling, destroying streaming pipelining.
+    - Leaving cursor portals open on error paths or early loop breaks without an explicit `CLOSE cursor_name`, leaking portal descriptors and table locks.
+  - ✅ **Production Invariant**:
+    - Mandate bounded stream processing (`pgx.Rows`, `pg-query-stream`, `asyncpg.Cursor`) with constant memory consumption $M = \mathcal{O}(B)$ where batch size $B \le 2000$.
+    - Enforce strict transaction timeout ladders (`idle_in_transaction_session_timeout = '30s'`) on cursor transactions; for long-running batch jobs exceeding 5 minutes, transition to keyset seek pagination across sub-second independent transactions.
+    - Always declare cursors with explicit `NO SCROLL`: `DECLARE cur NO SCROLL CURSOR FOR SELECT ...`.
+    - Pin connection checkout for the entire cursor lifecycle: execute `BEGIN`, `DECLARE`, chunked `FETCH`, `CLOSE`, and `COMMIT` within a single dedicated connection checkout.
+    - Guarantee portal cleanup with RAII patterns (`defer tx.Exec("CLOSE cur")` in Go, `finally { client.release() }` in TypeScript).
+
 
 
 

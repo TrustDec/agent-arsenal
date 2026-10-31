@@ -3895,4 +3895,75 @@ alwaysApply: false
         client.release();
       }
     });
+
+    // server/api/v1/audit/stream-export.get.ts - Nitro Streaming Endpoint
+    // Streams audit events using a server-side NO SCROLL cursor and Web Streams with constant RAM
+    export default defineEventHandler(async (event) => {
+      const tenantId = event.context.auth?.tenantId;
+      if (!tenantId) {
+        throw createError({ statusCode: 401, message: 'Unauthorized' });
+      }
+
+      const client = await useDatabase().connect();
+      const cursorName = 'nitro_audit_stream_cur';
+      let inTransaction = false;
+
+      setResponseHeader(event, 'Content-Type', 'application/x-ndjson');
+      setResponseHeader(event, 'Content-Disposition', 'attachment; filename="export.ndjson"');
+
+      const stream = new ReadableStream({
+        async start(controller) {
+          try {
+            await client.query('BEGIN READ ONLY');
+            await client.query("SET LOCAL idle_in_transaction_session_timeout = '20s'");
+            await client.query(
+              `DECLARE ${cursorName} NO SCROLL CURSOR FOR
+               SELECT id, payload, created_at
+               FROM audit_events
+               WHERE tenant_id = $1
+               ORDER BY created_at ASC, id ASC`,
+              [tenantId]
+            );
+            inTransaction = true;
+          } catch (err: any) {
+            controller.error(err);
+            client.release();
+          }
+        },
+        async pull(controller) {
+          try {
+            const res = await client.query(`FETCH FORWARD 500 FROM ${cursorName}`);
+            if (res.rows.length === 0) {
+              if (inTransaction) {
+                await client.query(`CLOSE ${cursorName}`);
+                await client.query('COMMIT');
+                inTransaction = false;
+              }
+              client.release();
+              controller.close();
+              return;
+            }
+
+            const encoder = new TextEncoder();
+            for (const row of res.rows) {
+              controller.enqueue(encoder.encode(JSON.stringify(row) + '\n'));
+            }
+          } catch (err: any) {
+            if (inTransaction) {
+              await client.query('ROLLBACK').catch(() => {});
+            }
+            client.release();
+            controller.error(err);
+          }
+        },
+        async cancel() {
+          if (inTransaction) {
+            await client.query('ROLLBACK').catch(() => {});
+          }
+          client.release();
+        },
+      });
+
+      return sendStream(event, stream);
+    });
     ```

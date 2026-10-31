@@ -4480,5 +4480,81 @@ alwaysApply: false
           };
         }
       );
+
+      // Audit SQL Server-Side Cursors, Streaming Result Sets & Memory OOM Defense
+      server.tool(
+        'audit_sql_cursor_streaming_invariants',
+        'Statically audits SQL cursor declarations and batch queries for NO SCROLL optimization, WITH HOLD disk spill hazards, missing CLOSE statements, and unbounded memory risks.',
+        {
+          sql: z.string().describe('The SQL script, cursor declaration, or batch query to audit.'),
+        },
+        async ({ sql }) => {
+          const warnings: string[] = [];
+          const recommendations: string[] = [];
+          const normalized = sql.replace(/\s+/g, ' ');
+
+          // 1. Missing NO SCROLL on cursor declaration
+          if (/\bDECLARE\s+\w+\s+(?:BINARY\s+)?(?:INSENSITIVE\s+)?CURSOR\b/i.test(normalized)) {
+            if (!/\bNO\s+SCROLL\b/i.test(normalized)) {
+              warnings.push(
+                'CURSOR_MISSING_NO_SCROLL: Cursor declaration omits explicit `NO SCROLL`. PostgreSQL optimizer may instantiate a tuplestore Materialize node, degrading streaming throughput.'
+              );
+              recommendations.push(
+                'Declare cursor with `DECLARE <name> NO SCROLL CURSOR FOR SELECT ...`.'
+              );
+            }
+          }
+
+          // 2. Dangerous WITH HOLD cursor
+          if (/\bCURSOR\s+WITH\s+HOLD\b/i.test(normalized)) {
+            warnings.push(
+              'CURSOR_DANGEROUS_WITH_HOLD: Cursor declared `WITH HOLD`. On COMMIT, PostgreSQL eagerly copies all remaining candidate rows to temporary disk files (pgsql_tmp), risking disk space exhaustion.'
+            );
+            recommendations.push(
+              'Remove `WITH HOLD`. Keep cursor within a scoped transaction or transition to keyset seek pagination for long-running batch jobs.'
+            );
+          }
+
+          // 3. Unbounded query on large event/audit tables without cursor or LIMIT
+          if (/\bSELECT\b/i.test(normalized) && !/\b(LIMIT|FETCH\s+FIRST|DECLARE)\b/i.test(normalized)) {
+            if (/FROM\s+(?:audit_events|events|logs|transactions|orders)\b/i.test(normalized)) {
+              warnings.push(
+                'UNBOUNDED_HIGH_VOLUME_QUERY: Query reads from high-volume table without LIMIT or cursor streaming, introducing client-side process OOM risk.'
+              );
+              recommendations.push(
+                'Use server-side cursor streaming (pg-query-stream, pgx.Rows) or keyset pagination.'
+              );
+            }
+          }
+
+          // 4. Missing CLOSE statement
+          const declareMatch = /\bDECLARE\s+(\w+)\s+.*CURSOR\b/i.exec(normalized);
+          if (declareMatch) {
+            const cursorName = declareMatch[1];
+            const closeRegex = new RegExp(`\\bCLOSE\\s+(${cursorName}|ALL)\\b`, 'i');
+            if (!closeRegex.test(normalized)) {
+              warnings.push(
+                `CURSOR_LEAK_MISSING_CLOSE: Cursor '${cursorName}' is declared but never closed with explicit 'CLOSE ${cursorName}'.`
+              );
+              recommendations.push(
+                `Always append 'CLOSE ${cursorName};' before transaction commit or in a finally/defer guard block.`
+              );
+            }
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                hasWarnings: warnings.length > 0,
+                warningsCount: warnings.length,
+                warnings,
+                recommendations,
+                status: warnings.length === 0 ? 'OPTIMAL' : 'REMEDIATION_REQUIRED',
+              }, null, 2),
+            }],
+          };
+        }
+      );
     }
     ```

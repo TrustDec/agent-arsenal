@@ -5995,4 +5995,117 @@ func BatchUpdateInventoryWithStatementAudit(
 
 	return nil
 }
+
+// BoundedCursorRecord represents a streaming batch payload.
+type BoundedCursorRecord struct {
+	ID        string
+	TenantID  string
+	Payload   []byte
+	CreatedAt time.Time
+}
+
+// StreamRecordsChunkedCursor streams large datasets with a server-side NO SCROLL cursor,
+// enforcing strict timeout ladders and constant memory allocation to prevent client OOMs.
+func StreamRecordsChunkedCursor(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	tenantID string,
+	batchSize int,
+	consumeChunk func([]BoundedCursorRecord) error,
+) error {
+	if batchSize <= 0 || batchSize > 5000 {
+		batchSize = 1000
+	}
+
+	// 1. Acquire dedicated single connection for the entire cursor lifecycle
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to acquire connection for cursor stream: %w", err)
+	}
+	defer conn.Release()
+
+	// 2. Open Read-Only Transaction with bounded idle and statement timeouts
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.ReadCommitted,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return fmt.Errorf("failed starting cursor transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, "SET LOCAL idle_in_transaction_session_timeout = '20s'"); err != nil {
+		return fmt.Errorf("failed setting idle in transaction timeout: %w", err)
+	}
+
+	cursorName := "stream_records_portal"
+	declareSQL := fmt.Sprintf(
+		`DECLARE %s NO SCROLL CURSOR FOR
+		 SELECT id, tenant_id, payload, created_at
+		 FROM audit_events
+		 WHERE tenant_id = $1
+		 ORDER BY created_at ASC, id ASC`,
+		cursorName,
+	)
+
+	if _, err := tx.Exec(ctx, declareSQL, tenantID); err != nil {
+		return fmt.Errorf("failed declaring NO SCROLL cursor: %w", err)
+	}
+
+	// Safe RAII portal cleanup
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_, _ = tx.Exec(closeCtx, fmt.Sprintf("CLOSE %s", cursorName))
+	}()
+
+	fetchSQL := fmt.Sprintf("FETCH FORWARD %d FROM %s", batchSize, cursorName)
+	buffer := make([]BoundedCursorRecord, 0, batchSize)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		rows, err := tx.Query(ctx, fetchSQL)
+		if err != nil {
+			return fmt.Errorf("cursor fetch failed: %w", err)
+		}
+
+		buffer = buffer[:0]
+		for rows.Next() {
+			var rec BoundedCursorRecord
+			if err := rows.Scan(&rec.ID, &rec.TenantID, &rec.Payload, &rec.CreatedAt); err != nil {
+				rows.Close()
+				return fmt.Errorf("cursor row scan error: %w", err)
+			}
+			buffer = append(buffer, rec)
+		}
+		rows.Close()
+
+		if len(buffer) == 0 {
+			break
+		}
+
+		if err := consumeChunk(buffer); err != nil {
+			return fmt.Errorf("consumer chunk processing error: %w", err)
+		}
+
+		if len(buffer) < batchSize {
+			break
+		}
+	}
+
+	if _, err := tx.Exec(ctx, fmt.Sprintf("CLOSE %s", cursorName)); err != nil {
+		return fmt.Errorf("failed closing cursor portal: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed committing cursor transaction: %w", err)
+	}
+
+	return nil
+}
 ```

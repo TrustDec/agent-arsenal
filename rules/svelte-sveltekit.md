@@ -4724,5 +4724,75 @@ alwaysApply: false
           return fail(500, { message: `Batch inventory adjustment failed: ${err.message}` });
         }
       },
+
+      // Streaming NDJSON export action leveraging server-side cursor with constant memory footprint
+      exportAuditEvents: async ({ locals }) => {
+        const tenantId = locals.tenantId;
+        const client = await locals.dbPool.connect();
+
+        let cursorActive = false;
+        const cursorName = 'svelte_export_cur';
+
+        const stream = new ReadableStream({
+          async start(controller) {
+            try {
+              await client.query('BEGIN READ ONLY');
+              await client.query("SET LOCAL idle_in_transaction_session_timeout = '20s'");
+              await client.query(
+                `DECLARE ${cursorName} NO SCROLL CURSOR FOR
+                 SELECT id, payload, created_at
+                 FROM audit_events
+                 WHERE tenant_id = $1
+                 ORDER BY created_at ASC, id ASC`,
+                [tenantId]
+              );
+              cursorActive = true;
+            } catch (err: any) {
+              controller.error(err);
+              client.release();
+            }
+          },
+          async pull(controller) {
+            try {
+              const res = await client.query(`FETCH FORWARD 500 FROM ${cursorName}`);
+              if (res.rows.length === 0) {
+                if (cursorActive) {
+                  await client.query(`CLOSE ${cursorName}`);
+                  await client.query('COMMIT');
+                  cursorActive = false;
+                }
+                client.release();
+                controller.close();
+                return;
+              }
+
+              const encoder = new TextEncoder();
+              for (const row of res.rows) {
+                controller.enqueue(encoder.encode(JSON.stringify(row) + '\n'));
+              }
+            } catch (err: any) {
+              if (cursorActive) {
+                await client.query('ROLLBACK').catch(() => {});
+              }
+              client.release();
+              controller.error(err);
+            }
+          },
+          async cancel() {
+            if (cursorActive) {
+              await client.query('ROLLBACK').catch(() => {});
+            }
+            client.release();
+          },
+        });
+
+        return new Response(stream, {
+          headers: {
+            'Content-Type': 'application/x-ndjson',
+            'Content-Disposition': 'attachment; filename="audit_events.ndjson"',
+            'Cache-Control': 'no-cache',
+          },
+        });
+      },
     };
     ```
