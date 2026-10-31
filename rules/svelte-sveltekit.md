@@ -4680,5 +4680,49 @@ alwaysApply: false
           return fail(500, { message: `Failed loading breadcrumbs: ${err.message}` });
         }
       },
+
+      // Batch inventory stock adjustment action
+      // Enforces tenant fencing and leverages statement transition table audit triggers
+      batchUpdateInventory: async ({ request, locals }) => {
+        const tenantId = locals.tenantId;
+        const formData = await request.formData();
+        const payloadRaw = formData.get('updates');
+
+        if (typeof payloadRaw !== 'string') {
+          return fail(400, { message: 'Missing updates payload' });
+        }
+
+        let updates: Array<{ id: string; quantity: number; unitPrice: number }>;
+        try {
+          updates = JSON.parse(payloadRaw);
+        } catch {
+          return fail(400, { message: 'Malformed JSON payload' });
+        }
+
+        const ids = updates.map((u) => u.id);
+        const qtys = updates.map((u) => u.quantity);
+        const prices = updates.map((u) => u.unitPrice);
+
+        const batchUpdateQuery = `
+          UPDATE inventory_items AS inv
+          SET quantity = data.new_qty,
+              unit_price = data.new_price
+          FROM (
+            SELECT * FROM UNNEST($1::uuid[], $2::int4[], $3::numeric[])
+            AS t(id, new_qty, new_price)
+          ) AS data
+          WHERE inv.id = data.id AND inv.tenant_id = $4::uuid;
+        `;
+
+        try {
+          await locals.db.tx(async (t: any) => {
+            await t.none("SELECT set_config('app.current_tenant_id', $1, true)", [tenantId]);
+            await t.none(batchUpdateQuery, [ids, qtys, prices, tenantId]);
+          });
+          return { success: true, count: updates.length };
+        } catch (err: any) {
+          return fail(500, { message: `Batch inventory adjustment failed: ${err.message}` });
+        }
+      },
     };
     ```

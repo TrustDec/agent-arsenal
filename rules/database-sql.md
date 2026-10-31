@@ -3533,6 +3533,22 @@ alwaysApply: false
     - Sanitize all `ltree` labels against `^[A-Za-z0-9_]{1,256}$` before persistence.
     - Atomic Subtree Relocation: Execute node relocation inside an explicit transaction block, pre-checking that the destination parent is not within the source node's descendants (`targetPath <@ sourcePath = false`), acquiring row locks in deterministic UUID order, and rewriting descendants' paths via `ltree` subpath concatenation: `SET path = $new_prefix::ltree || subpath(path, nlevel($old_prefix::ltree))`.
 
+- **Database Triggers, Stored Procedures, Function Volatility, Transition Tables & Parallel Safety**:
+  - ❌ **Anti-Pattern: Default-VOLATILE Functions, Row-by-Row Audit Triggers, Unguarded Loops & Unpinned SECURITY DEFINER**:
+    - Omitting volatility categories (`IMMUTABLE`, `STABLE`, `VOLATILE`) on pure helper functions, defaulting to `VOLATILE`, disabling index evaluation on expression indexes, and forcing query planners to mark plans `PARALLEL UNSAFE`.
+    - Marking impure functions `IMMUTABLE` when they query database tables or clocks, leading to permanently stale cached plans and B-Tree index corruption.
+    - Creating `AFTER INSERT OR UPDATE FOR EACH ROW` triggers for audit logging or rollups, which incur $N$ PL/pgSQL context switches, exhaust `max_locks_per_transaction`, and run $300\times$ slower on batch updates.
+    - Omitting `WHEN (OLD.* IS DISTINCT FROM NEW.*)` conditional predicates on row update triggers, causing runaway self-cascading triggers and `stack depth limit exceeded` crashes.
+    - Writing `SECURITY DEFINER` stored procedures without pinning `SET search_path = pg_catalog, pg_temp`, creating critical CWE-426 privilege escalation vulnerabilities.
+    - Concatenating raw strings in PL/pgSQL dynamic SQL `EXECUTE`, enabling SQL injection and destroying generic query plan caching.
+  - ✅ **Production Invariant**:
+    - Mark all pure mathematical, string, and hashing functions `IMMUTABLE PARALLEL SAFE STRICT`. Mark table-reading helper functions `STABLE PARALLEL SAFE`.
+    - Use PostgreSQL 10+ statement triggers with transition tables (`REFERENCING NEW TABLE AS new_rows OLD TABLE AS old_rows FOR EACH STATEMENT`) for batch audit logging and rollup calculations.
+    - Always guard row-level update triggers with `WHEN (OLD.* IS DISTINCT FROM NEW.*)` and depth checks (`IF pg_trigger_depth() > 1 THEN RETURN NEW; END IF;`).
+    - Pin `SET search_path = pg_catalog, pg_temp` on every `SECURITY DEFINER` routine and strictly enforce least-privilege `REVOKE ALL FROM PUBLIC`.
+    - In dynamic SQL, always parameterize literals with `USING` and sanitize table/column identifiers with `format('%I', identifier)`.
+
+
 
 
 

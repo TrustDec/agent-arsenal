@@ -4395,5 +4395,90 @@ alwaysApply: false
           };
         }
       );
+
+      // Audit SQL Triggers, Stored Procedures, Volatility & Transition Table Invariants
+      server.tool(
+        'audit_sql_trigger_procedure_invariants',
+        'Statically audits SQL functions, procedures, and triggers for volatility tags, transition tables, search_path pinning, and dynamic SQL safety.',
+        {
+          sql: z.string().describe('The SQL DDL or function/trigger definition to audit.'),
+        },
+        async ({ sql }) => {
+          const warnings: string[] = [];
+          const recommendations: string[] = [];
+          const normalized = sql.replace(/\s+/g, ' ');
+
+          // 1. Missing function volatility
+          if (/CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\b/i.test(normalized) && !/RETURNS\s+trigger\b/i.test(normalized)) {
+            const hasVolatility = /\b(IMMUTABLE|STABLE|VOLATILE)\b/i.test(normalized);
+            if (!hasVolatility) {
+              warnings.push(
+                'FUNCTION_VOLATILITY_MISSING: Function definition lacks IMMUTABLE, STABLE, or VOLATILE annotation. Defaults to VOLATILE, paralyzing query plans and parallel workers.'
+              );
+              recommendations.push(
+                'Explicitly declare volatility (e.g. IMMUTABLE PARALLEL SAFE STRICT for pure functions).'
+              );
+            }
+          }
+
+          // 2. SECURITY DEFINER without pinned search_path (CWE-426)
+          if (/\bSECURITY\s+DEFINER\b/i.test(normalized)) {
+            const hasPinnedSearchPath = /SET\s+search_path\s*=\s*pg_catalog/i.test(normalized);
+            if (!hasPinnedSearchPath) {
+              warnings.push(
+                'SECURITY_DEFINER_UNPINNED_SEARCH_PATH: SECURITY DEFINER routine omits `SET search_path = pg_catalog, pg_temp`. Vulnerable to privilege escalation via schema hijacking (CWE-426).'
+              );
+              recommendations.push(
+                'Append `SET search_path = pg_catalog, pg_temp` to the function or procedure definition.'
+              );
+            }
+          }
+
+          // 3. Row-level audit triggers instead of statement transition tables
+          if (/CREATE\s+TRIGGER\b/i.test(normalized) && /\bFOR\s+EACH\s+ROW\b/i.test(normalized)) {
+            if (/audit|log|history|event/i.test(normalized)) {
+              warnings.push(
+                'ROW_LEVEL_AUDIT_TRIGGER: Audit trigger executes FOR EACH ROW, creating O(N) PL/pgSQL context switches and risking lock table exhaustion during bulk operations.'
+              );
+              recommendations.push(
+                'Refactor to FOR EACH STATEMENT with PostgreSQL 10+ transition tables: REFERENCING NEW TABLE AS new_table OLD TABLE AS old_table.'
+              );
+            }
+
+            // 4. Missing WHEN clause on row update trigger
+            if (/\bUPDATE\b/i.test(normalized) && !/\bWHEN\b/i.test(normalized)) {
+              warnings.push(
+                'MISSING_TRIGGER_WHEN_CLAUSE: Row-level UPDATE trigger fires unconditionally without a WHEN clause, risking recursive cascade loops.'
+              );
+              recommendations.push(
+                'Add `WHEN (OLD.* IS DISTINCT FROM NEW.*)` conditional predicate.'
+              );
+            }
+          }
+
+          // 5. Dynamic SQL string concatenation
+          if (/\bEXECUTE\b/i.test(normalized) && /EXECUTE\s+.*\|\|/i.test(normalized)) {
+            warnings.push(
+              'DYNAMIC_SQL_STRING_CONCATENATION: Dynamic SQL EXECUTE uses raw string concatenation, introducing SQL injection risk and breaking plan caching.'
+            );
+            recommendations.push(
+              'Use format() with %I for identifiers and USING clause for query parameter literals.'
+            );
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                hasWarnings: warnings.length > 0,
+                warningsCount: warnings.length,
+                warnings,
+                recommendations,
+                status: warnings.length === 0 ? 'OPTIMAL' : 'REMEDIATION_REQUIRED',
+              }, null, 2),
+            }],
+          };
+        }
+      );
     }
     ```

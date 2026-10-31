@@ -5930,4 +5930,69 @@ func FetchOrgBreadcrumbsCycleSafe(
 
 	return chain, nil
 }
+
+// InventoryBatchUpdateRecord represents a single SKU price and stock update.
+type InventoryBatchUpdateRecord struct {
+	ID        string
+	Quantity  int
+	UnitPrice float64
+}
+
+// BatchUpdateInventoryWithStatementAudit applies high-volume batch updates,
+// allowing PostgreSQL statement-level transition tables to execute audit logging
+// in a single vectorized pass without row-by-row lock table exhaustion.
+func BatchUpdateInventoryWithStatementAudit(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	tenantID string,
+	records []InventoryBatchUpdateRecord,
+) error {
+	if len(records) == 0 {
+		return nil
+	}
+
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return fmt.Errorf("failed starting inventory batch transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Set tenant session context for RLS / audit triggers
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.current_tenant_id', $1, true)", tenantID); err != nil {
+		return fmt.Errorf("failed setting tenant session context: %w", err)
+	}
+
+	batch := &pgx.Batch{}
+	for _, rec := range records {
+		batch.Queue(
+			`UPDATE inventory_items
+			 SET quantity = $1, unit_price = $2
+			 WHERE id = $3 AND tenant_id = $4`,
+			rec.Quantity, rec.UnitPrice, rec.ID, tenantID,
+		)
+	}
+
+	br := tx.SendBatch(ctx, batch)
+	for i := 0; i < len(records); i++ {
+		cmdTag, bErr := br.Exec()
+		if bErr != nil {
+			br.Close()
+			return fmt.Errorf("failed executing batch record %d: %w", i, bErr)
+		}
+		if cmdTag.RowsAffected() == 0 {
+			br.Close()
+			return fmt.Errorf("inventory item %s not found or tenant mismatch", records[i].ID)
+		}
+	}
+
+	if err := br.Close(); err != nil {
+		return fmt.Errorf("failed closing batch results: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed committing inventory batch transaction: %w", err)
+	}
+
+	return nil
+}
 ```

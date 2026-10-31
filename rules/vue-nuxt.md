@@ -3849,4 +3849,50 @@ alwaysApply: false
         client.release();
       }
     });
+
+    // server/api/v1/inventory/batch-update.post.ts - Batch Inventory Update Endpoint
+    // Leverages PostgreSQL statement transition tables for vectorized audit logging
+    export default defineEventHandler(async (event) => {
+      const tenantId = event.context.auth?.tenantId;
+      if (!tenantId) {
+        throw createError({ statusCode: 401, message: 'Unauthorized' });
+      }
+
+      const body = await readBody(event);
+      const updates = body.updates as Array<{ id: string; quantity: number; unitPrice: number }>;
+      if (!Array.isArray(updates) || updates.length === 0) {
+        throw createError({ statusCode: 400, message: 'Invalid or empty updates array' });
+      }
+
+      const client = await useDatabase().connect();
+      try {
+        await client.query('BEGIN');
+
+        // Set tenant session context for RLS / audit triggers
+        await client.query("SELECT set_config('app.current_tenant_id', $1, true)", [tenantId]);
+
+        // Vectorized bulk update via JSONB recordset - statement transition table triggers execute once
+        const updateSql = `
+          WITH batch_data AS (
+            SELECT * FROM jsonb_to_recordset($1::jsonb) 
+            AS x(id uuid, quantity int, unit_price numeric)
+          )
+          UPDATE inventory_items inv
+          SET quantity = b.quantity,
+              unit_price = b.unit_price
+          FROM batch_data b
+          WHERE inv.id = b.id AND inv.tenant_id = $2::uuid;
+        `;
+
+        const result = await client.query(updateSql, [JSON.stringify(updates), tenantId]);
+
+        await client.query('COMMIT');
+        return { success: true, updatedCount: result.rowCount };
+      } catch (err: any) {
+        await client.query('ROLLBACK');
+        throw createError({ statusCode: 500, message: `Batch inventory update failed: ${err.message}` });
+      } finally {
+        client.release();
+      }
+    });
     ```
