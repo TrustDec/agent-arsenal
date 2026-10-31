@@ -3880,6 +3880,21 @@ alwaysApply: false
     - Enforce **CI SubPlan Elimination Assertions**: run `EXPLAIN (FORMAT JSON)` in test pipelines to assert zero `SubPlan` nodes on set difference and existence query paths.
     - Enforce **Supporting B-Tree Index on Child Join Columns**: ensure all subquery join keys (`child.parent_id`) possess a supporting B-Tree index to allow index probe scans during anti/semi-join execution.
 
+- **pg_repack Online Table Bloat Compaction & Exclusive Lock Minimization Invariants (PostgreSQL)**:
+  - ❌ **Anti-Pattern: Destructive `VACUUM FULL`, 2.2x Disk Exhaustion & Head-of-Line Lock Blockade**:
+    - Executing `VACUUM FULL table_name;` on live production databases to reclaim space, acquiring an `ACCESS EXCLUSIVE` lock that blocks all concurrent `SELECT`, `INSERT`, `UPDATE`, and `DELETE` queries for hours, starving connection pools.
+    - Running `pg_repack` without verifying that free disk space exceeds $2.2 \times (\text{heap\_size} + \text{index\_size})$, causing disks to hit 100% capacity and forcing PostgreSQL into emergency read-only panics.
+    - Launching `pg_repack` without `--wait-timeout 2`, causing its catalog swap step to wait indefinitely in lock queues behind long transactions and blocking all subsequent application queries.
+    - Killing aborted repack jobs with `SIGKILL` without running `pg_repack --clean`, leaving zombie `repack_trigger` triggers and accumulating multi-gigabyte orphaned log tables.
+    - Attempting `pg_repack` on tables lacking a `PRIMARY KEY` or `UNIQUE NOT NULL` constraint, failing after hours of wasted disk I/O.
+  - ✅ **Production Invariant**:
+    - Enforce **Strict Zero `VACUUM FULL` in Production**: compact bloated live tables exclusively via `pg_repack` or `REINDEX TABLE CONCURRENTLY`.
+    - Enforce **Pre-Flight Disk Safety Headroom**: verify Available Disk $\ge 2.2 \times \text{pg\_total\_relation\_size(table)}$ before starting repack.
+    - Enforce **Mandatory Lock Timeouts & Non-Killing Options**: always invoke `pg_repack` with `--wait-timeout=2` and `--no-kill-backend` to guarantee zero lock-wait queue cascades.
+    - Enforce **Replication Lag Monitoring**: abort or throttle repack if standby replica `replay_lag` exceeds 30 seconds.
+    - Enforce **Automated Zombie Object Sentinels**: execute `pg_repack --clean` pre-flight and schedule sentinels alerting on any orphaned triggers matching `repack_trigger%`.
+
+
 
 
 

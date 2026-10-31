@@ -6364,6 +6364,69 @@ In SvelteKit administrative consoles and system diagnostics:
   </div>
   ```
 
+- **Svelte 5 Runes for Online Table Bloat Compaction (`pg_repack`) Pre-Flight Sentinel**:
+  - ✅ **Production Invariant**: Use Svelte 5 `$derived` and `$props` to compute disk safety ratios ($D \ge 2.2\times$), detect orphaned triggers, and gate compaction commands:
+  ```svelte
+  <script lang="ts">
+    interface TableCompactionProps {
+      tableName: string;
+      tableSizeBytes: number;
+      availableDiskBytes: number;
+      hasPrimaryKey: boolean;
+      standbyLagSec: number;
+      orphanTriggerCount: number;
+    }
+
+    const {
+      tableName,
+      tableSizeBytes,
+      availableDiskBytes,
+      hasPrimaryKey,
+      standbyLagSec,
+      orphanTriggerCount,
+    }: TableCompactionProps = $props();
+
+    // Svelte 5 $derived computations
+    const requiredDiskBytes = $derived(Math.ceil(tableSizeBytes * 2.2));
+    const hasEnoughDisk = $derived(availableDiskBytes >= requiredDiskBytes);
+    const isReplicationHealthy = $derived(standbyLagSec <= 30);
+    const hasNoOrphanTriggers = $derived(orphanTriggerCount === 0);
+
+    const isSafeToRepack = $derived(
+      hasPrimaryKey && hasEnoughDisk && isReplicationHealthy && hasNoOrphanTriggers
+    );
+
+    const recommendedCommand = $derived(
+      isSafeToRepack
+        ? `pg_repack --table="${tableName}" --wait-timeout=2 --no-kill-backend --no-order`
+        : null
+    );
+  </script>
+
+  <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 space-y-4">
+    <div class="flex items-center justify-between">
+      <div>
+        <h4 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">pg_repack Safety Guard</h4>
+        <span class="text-xs text-zinc-500">2.2x Disk Headroom & Lock Minimization Sentinel</span>
+      </div>
+      <span class="px-2.5 py-1 rounded-full text-xs font-medium {isSafeToRepack ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-400' : 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-400'}">
+        {isSafeToRepack ? 'Pre-flight Passed' : 'Compaction Blocked'}
+      </span>
+    </div>
+
+    <div class="grid grid-cols-2 gap-3 text-xs">
+      <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+        <span class="text-zinc-500">Required Free Disk (2.2x):</span>
+        <span class="block font-mono font-medium text-zinc-900 dark:text-zinc-100">{(requiredDiskBytes / 1e9).toFixed(2)} GB</span>
+      </div>
+      <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+        <span class="text-zinc-500">Available Storage:</span>
+        <span class="block font-mono font-medium {hasEnoughDisk ? 'text-emerald-600' : 'text-rose-600'}">{(availableDiskBytes / 1e9).toFixed(2)} GB</span>
+      </div>
+    </div>
+  </div>
+  ```
+
 
 
 

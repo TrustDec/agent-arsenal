@@ -9030,6 +9030,73 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **PostgreSQL Online Bloat Compaction (`pg_repack`) Pre-Flight & Safe Invocation in Go**:
+  - ❌ **Anti-Pattern**: Triggering `VACUUM FULL` from Go maintenance daemons, or executing `pg_repack` CLI subprocesses without verifying disk headroom $\ge 2.2\times$, primary key presence, or lock timeouts.
+  - ✅ **Production Invariant**: Implement pre-flight validation using `jackc/pgx/v5` to assert constraint readiness, inspect for zombie `repack_trigger` artifacts, and wrap execution in strict `--wait-timeout=2` and timeout contexts:
+  ```go
+  // RepackPreflightGuard enforces safety invariants prior to online table compaction
+  type RepackPreflightGuard struct {
+  	Pool *pgxpool.Pool
+  }
+
+  type RepackAssessment struct {
+  	SchemaName         string
+  	TableName          string
+  	TotalSizeBytes     int64
+  	RequiredDiskBytes  int64
+  	HasPrimaryKey      bool
+  	OrphanTriggerCount int
+  }
+
+  // AssessRelation evaluates whether a table can be safely repacked
+  func (g *RepackPreflightGuard) AssessRelation(ctx context.Context, schema, table string, freeDiskBytes int64) (*RepackAssessment, error) {
+  	query := `
+  		SELECT
+  			pg_total_relation_size(c.oid) AS total_size,
+  			EXISTS (
+  				SELECT 1 FROM pg_constraint con
+  				WHERE con.conrelid = c.oid AND con.contype IN ('p', 'u')
+  			) AS has_pk,
+  			(
+  				SELECT COUNT(*) FROM pg_trigger trg
+  				WHERE trg.tgrelid = c.oid AND trg.tgname LIKE 'repack_trigger%'
+  			) AS orphan_count
+  		FROM pg_class c
+  		JOIN pg_namespace n ON n.oid = c.relnamespace
+  		WHERE n.nspname = $1 AND c.relname = $2;
+  	`
+
+  	var totalBytes int64
+  	var hasPK bool
+  	var orphanCount int
+
+  	err := g.Pool.QueryRow(ctx, query, schema, table).Scan(&totalBytes, &hasPK, &orphanCount)
+  	if err != nil {
+  		return nil, fmt.Errorf("failed assessing table %s.%s: %w", schema, table, err)
+  	}
+
+  	requiredDisk := int64(float64(totalBytes) * 2.2)
+  	if !hasPK {
+  		return nil, fmt.Errorf("table %s.%s lacks primary key or unique not-null constraint: cannot repack", schema, table)
+  	}
+  	if orphanCount > 0 {
+  		return nil, fmt.Errorf("table %s.%s has %d orphaned repack trigger(s): run pg_repack --clean first", schema, table, orphanCount)
+  	}
+  	if freeDiskBytes < requiredDisk {
+  		return nil, fmt.Errorf("insufficient disk space for %s.%s: requires %d bytes (2.2x), available %d bytes", schema, table, requiredDisk, freeDiskBytes)
+  	}
+
+  	return &RepackAssessment{
+  		SchemaName:         schema,
+  		TableName:          table,
+  		TotalSizeBytes:     totalBytes,
+  		RequiredDiskBytes:  requiredDisk,
+  		HasPrimaryKey:      hasPK,
+  		OrphanTriggerCount: orphanCount,
+  	}, nil
+  }
+  ```
+
 
 
 

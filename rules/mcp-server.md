@@ -6682,6 +6682,57 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         };
       }
     );
+
+    // MCP Tool: Online Table Compaction & pg_repack Pre-Flight Safety Sentinel
+    server.tool(
+      'evaluate_pg_repack_safety',
+      'Assesses PostgreSQL table bloat, verifies PRIMARY KEY requirements, 2.2x disk headroom, replication lag, and generates safe pg_repack CLI invocation.',
+      {
+        schemaName: z.string().default('public'),
+        tableName: z.string().describe('Target table name to assess for bloat compaction'),
+        tableSizeBytes: z.number().describe('Total table and secondary index size in bytes'),
+        availableDiskBytes: z.number().describe('Available free storage on host filesystem in bytes'),
+        hasPrimaryKey: z.boolean().describe('Whether table possesses a PRIMARY KEY or NOT-NULL UNIQUE constraint'),
+        standbyLagSeconds: z.number().default(0).describe('Current max standby replication replay lag in seconds'),
+        orphanTriggerCount: z.number().default(0).describe('Count of existing repack_trigger triggers on target table'),
+      },
+      async (args) => {
+        const blockingErrors: string[] = [];
+        const requiredDiskBytes = Math.ceil(args.tableSizeBytes * 2.2);
+
+        if (!args.hasPrimaryKey) {
+          blockingErrors.push(`Table ${args.schemaName}.${args.tableName} has no PRIMARY KEY or NOT-NULL UNIQUE constraint.`);
+        }
+        if (args.availableDiskBytes < requiredDiskBytes) {
+          blockingErrors.push(`Insufficient disk: Required ${(requiredDiskBytes / 1e9).toFixed(2)} GB (2.2x), Available ${(args.availableDiskBytes / 1e9).toFixed(2)} GB.`);
+        }
+        if (args.orphanTriggerCount > 0) {
+          blockingErrors.push(`Found ${args.orphanTriggerCount} stale repack_trigger(s). Run 'pg_repack --clean' first.`);
+        }
+        if (args.standbyLagSeconds > 30) {
+          blockingErrors.push(`Replication lag (${args.standbyLagSeconds.toFixed(1)}s) exceeds 30s safety threshold.`);
+        }
+
+        const isSafe = blockingErrors.length === 0;
+        const recommendedCommand = isSafe
+          ? `pg_repack --table="${args.schemaName}.${args.tableName}" --wait-timeout=2 --no-kill-backend --no-order`
+          : null;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              status: isSafe ? 'approved' : 'rejected',
+              canExecute: isSafe,
+              requiredDiskBytes,
+              availableDiskBytes: args.availableDiskBytes,
+              blockingErrors,
+              recommendedCommand,
+            }, null, 2),
+          }],
+        };
+      }
+    );
   }
   ```
 

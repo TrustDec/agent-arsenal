@@ -5597,6 +5597,69 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   </template>
   ```
 
+- **Vue 3.5 Reactive Destructuring for Table Compaction (`pg_repack`) Headroom Audit**:
+  - ✅ **Production Invariant**: Use Vue 3.5 reactive props destructuring and computed properties to evaluate compaction prerequisites, primary keys, and 2.2x free space:
+  ```vue
+  <script setup lang="ts">
+  import { computed } from 'vue';
+
+  // Vue 3.5 reactive props destructuring
+  const {
+    tableName = '',
+    tableSizeBytes = 0,
+    availableDiskBytes = 0,
+    hasPrimaryKey = false,
+    orphanTriggers = 0,
+    standbyLagSeconds = 0,
+  } = defineProps<{
+    tableName?: string;
+    tableSizeBytes?: number;
+    availableDiskBytes?: number;
+    hasPrimaryKey?: boolean;
+    orphanTriggers?: number;
+    standbyLagSeconds?: number;
+  }>();
+
+  const requiredDiskBytes = computed(() => Math.ceil(tableSizeBytes * 2.2));
+  const hasDiskHeadroom = computed(() => availableDiskBytes >= requiredDiskBytes.value);
+  const isLagAcceptable = computed(() => standbyLagSeconds <= 30);
+  const isTriggerClean = computed(() => orphanTriggers === 0);
+
+  const canExecuteRepack = computed(() =>
+    hasPrimaryKey && hasDiskHeadroom.value && isLagAcceptable.value && isTriggerClean.value
+  );
+
+  const commandPreview = computed(() =>
+    canExecuteRepack.value
+      ? `pg_repack --table="${tableName}" --wait-timeout=2 --no-kill-backend --no-order`
+      : null
+  );
+  </script>
+
+  <template>
+    <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 space-y-4">
+      <div class="flex items-center justify-between">
+        <div>
+          <h4 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">PostgreSQL Bloat Compaction Sentinel</h4>
+          <span class="text-xs text-zinc-500">pg_repack 2.2x Disk & Lock Queue Defense</span>
+        </div>
+        <span
+          class="px-2.5 py-1 rounded-full text-xs font-medium"
+          :class="canExecuteRepack ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-400' : 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-400'"
+        >
+          {{ canExecuteRepack ? 'Safe to Compact' : 'Compaction Guard Blocked' }}
+        </span>
+      </div>
+      <div v-if="!canExecuteRepack" class="p-3 rounded-lg bg-rose-50 dark:bg-rose-950/40 text-xs text-rose-700 dark:text-rose-300 space-y-1">
+        <p v-if="!hasPrimaryKey">CRITICAL: Table lacks PRIMARY KEY or UNIQUE NOT NULL constraint.</p>
+        <p v-if="!hasDiskHeadroom">CRITICAL: Insufficient disk space for 2.2x repack shadow table.</p>
+        <p v-if="!isTriggerClean">HIGH: Orphaned repack triggers detected. Run pg_repack --clean.</p>
+        <p v-if="!isLagAcceptable">WARN: Standby replication lag exceeds 30s threshold.</p>
+      </div>
+    </div>
+  </template>
+  ```
+
 
 
 
