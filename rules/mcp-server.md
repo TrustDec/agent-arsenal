@@ -3861,5 +3861,115 @@ alwaysApply: false
           }
         }
       );
+
+      // Diagnostic Tool: Inspect Partial Index & Filtered Predicate Health
+      server.tool(
+        'inspect_partial_index_safety',
+        'Audits PostgreSQL tables for asymmetric queue skew, partial index predicates, soft-delete unique invariants, and autovacuum scale factors',
+        {
+          tableName: z.string().describe('Target table name to audit'),
+        },
+        async ({ tableName }) => {
+          const client = await pool.connect();
+          try {
+            // 1. Inspect existing partial indexes
+            const partialIdxRes = await client.query(`
+              SELECT
+                i.relname AS index_name,
+                idx.indisunique AS is_unique,
+                pg_get_expr(idx.indpred, idx.indrelid) AS partial_predicate,
+                stat.idx_scan,
+                stat.idx_tup_read,
+                pg_size_pretty(pg_relation_size(i.oid)) AS index_size
+              FROM pg_class c
+              JOIN pg_index idx ON c.oid = idx.indrelid
+              JOIN pg_class i ON i.oid = idx.indexrelid
+              JOIN pg_stat_user_indexes stat ON stat.indexrelid = idx.indexrelid
+              WHERE c.relname = $1
+                AND idx.indpred IS NOT NULL
+              ORDER BY stat.idx_scan DESC;
+            `, [tableName]);
+
+            // 2. Inspect table columns for soft-delete pattern
+            const colRes = await client.query(`
+              SELECT column_name, data_type, is_nullable
+              FROM information_schema.columns
+              WHERE table_name = $1
+                AND column_name IN ('deleted_at', 'status', 'state');
+            `, [tableName]);
+
+            const hasSoftDelete = colRes.rows.some((r: any) => r.column_name === 'deleted_at');
+            const hasStatus = colRes.rows.some((r: any) => ['status', 'state'].includes(r.column_name));
+
+            // 3. Inspect autovacuum settings
+            const autoVacRes = await client.query(`
+              SELECT reloptions, n_live_tup, n_dead_tup
+              FROM pg_class c
+              JOIN pg_stat_user_tables s ON s.relname = c.relname
+              WHERE c.relname = $1;
+            `, [tableName]);
+
+            const reloptions: string[] = autoVacRes.rows[0]?.reloptions ?? [];
+            const liveTuples = Number(autoVacRes.rows[0]?.n_live_tup ?? 0);
+            const deadTuples = Number(autoVacRes.rows[0]?.n_dead_tup ?? 0);
+            const hasTunedVacuum = reloptions.some((opt: string) =>
+              opt.includes('autovacuum_vacuum_scale_factor=0.0')
+            );
+
+            const warnings: string[] = [];
+
+            if (hasSoftDelete) {
+              const hasSoftDeleteUnique = partialIdxRes.rows.some((r: any) =>
+                r.is_unique && r.partial_predicate?.includes('deleted_at IS NULL')
+              );
+              if (!hasSoftDeleteUnique) {
+                warnings.push(
+                  `SOFT_DELETE_UNIQUE_MISSING: Table '${tableName}' has a 'deleted_at' column but no partial unique index ` +
+                  `with 'WHERE deleted_at IS NULL'. Standard UNIQUE constraints will break user re-registration.`
+                );
+              }
+            }
+
+            if (hasStatus && partialIdxRes.rowCount === 0 && liveTuples > 50000) {
+              warnings.push(
+                `ASYMMETRIC_QUEUE_SKEW: Table '${tableName}' has status columns and high row count (${liveTuples}) ` +
+                `but no partial queue indexes detected. Consider adding a partial index for PENDING/ACTIVE tasks.`
+              );
+            }
+
+            if (partialIdxRes.rowCount > 0 && !hasTunedVacuum) {
+              warnings.push(
+                `AUTOVACUUM_CHURN_RISK: Table '${tableName}' maintains partial queue indexes with frequent turnover. ` +
+                `Tune autovacuum: ALTER TABLE ${tableName} SET (autovacuum_vacuum_scale_factor = 0.05);`
+              );
+            }
+
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  tableName,
+                  liveTuples,
+                  deadTuples,
+                  partialIndexCount: partialIdxRes.rowCount,
+                  partialIndexes: partialIdxRes.rows,
+                  hasTunedVacuum,
+                  warnings,
+                  recommendation: warnings.length === 0
+                    ? 'Partial index and predicate invariants are fully satisfied.'
+                    : 'Remediate missing partial unique indexes or tune autovacuum churn parameters.',
+                }, null, 2),
+              }],
+            };
+          } catch (err: any) {
+            return {
+              isError: true,
+              content: [{ type: 'text', text: `Failed to inspect partial index safety: ${err.message}` }],
+            };
+          } finally {
+            client.release();
+          }
+        }
+      );
     }
     ```

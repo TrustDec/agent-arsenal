@@ -3473,4 +3473,44 @@ alwaysApply: false
         client.release();
       }
     });
+
+    // server/api/tasks/poll.post.ts
+    // Invariant: Non-blocking worker dequeue over asymmetric partial queue index.
+    // Relies on: CREATE INDEX idx_tasks_pending_queue ON tasks (tenant_id, created_at) WHERE status = 'PENDING' WITH (fillfactor = 85);
+    // Hardcodes literal "status = 'PENDING'" in SQL to guarantee partial index match across generic and custom plans.
+    export const pollPendingTaskHandler = defineEventHandler(async (event) => {
+      const body = await readBody(event);
+      const tenantId = body?.tenantId as string;
+      if (!tenantId) {
+        throw createError({ statusCode: 400, message: 'Missing tenantId parameter' });
+      }
+
+      const client = await useDatabase().connect();
+      try {
+        const sql = `
+          UPDATE tasks
+          SET status = 'PROCESSING',
+              updated_at = CLOCK_TIMESTAMP()
+          WHERE id = (
+            SELECT id
+            FROM tasks
+            WHERE tenant_id = $1
+              AND status = 'PENDING'
+            ORDER BY created_at ASC
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+          )
+          RETURNING id, tenant_id, payload, created_at;
+        `;
+        const res = await client.query(sql, [tenantId]);
+        if (res.rowCount === 0) {
+          return { success: true, task: null };
+        }
+        return { success: true, task: res.rows[0] };
+      } catch (err: any) {
+        throw createError({ statusCode: 500, message: `Failed to poll task: ${err.message}` });
+      } finally {
+        client.release();
+      }
+    });
     ```

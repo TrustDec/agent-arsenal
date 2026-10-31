@@ -3264,3 +3264,43 @@ alwaysApply: false
     JOIN pg_statio_user_indexes stat ON stat.indexrelid = idx.indexrelid
     WHERE c.relname = 'users';
     ```
+
+- **Partial Indexes, Filtered Predicates, NULL Compaction & Soft-Delete Uniqueness Defense**:
+  - ❌ **Anti-Pattern: Monolithic Asymmetric Queue Indexing & Parameterized Non-Match Trap**:
+    - Creating standard indexes across 200M rows where 99% are completed or historical tombstones (`CREATE INDEX ON tasks (tenant_id, status, created_at)`), wasting 25 GB of buffer RAM on dormant records.
+    - Parameterizing the partial predicate in prepared statements (`WHERE tenant_id = $1 AND status = $2`), preventing the PostgreSQL planner from proving predicate implication in generic plans and forcing 45-second sequential scans.
+    - Applying unconditional unique constraints to soft-delete tables (`UNIQUE (tenant_id, email)`), permanently locking soft-deleted users out of re-registration with SQLSTATE `23505`.
+    - Full indexing of sparse optional attributes where 90%+ of values are NULL (`CREATE INDEX ON orders (dispute_id)`), polluting B-Tree leaves with millions of useless NULL pointers.
+  - ✅ **Production Invariant**:
+    - Build partial indexes strictly covering the active working set (`WHERE status IN ('PENDING', 'QUEUED')`) with `fillfactor = 85` to accommodate queue turnover.
+    - Enforce business uniqueness on soft-delete models via partial unique indexes: `CREATE UNIQUE INDEX ... (tenant_id, lower(email)) WHERE deleted_at IS NULL`.
+    - Statically hardcode the matching literal condition in SQL (`WHERE tenant_id = $1 AND status = 'PENDING'`) so query planners match the partial index under both custom and generic execution plans.
+    - Compact sparse foreign keys and error codes via `WHERE column IS NOT NULL`.
+    - Tune autovacuum on high-churn partial queue tables (`autovacuum_vacuum_scale_factor = 0.05`).
+
+    ```sql
+    -- 1. Asymmetric Queue Partial Index with Fillfactor for High Churn
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_pending_queue
+    ON tasks (tenant_id, created_at)
+    WHERE status IN ('PENDING', 'QUEUED')
+    WITH (fillfactor = 85);
+
+    -- 2. Soft-Delete Partial Unique Index
+    CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS uq_users_active_email
+    ON users (tenant_id, lower(email))
+    WHERE deleted_at IS NULL;
+
+    -- 3. Sparse NULL Compaction Index (Saves 99% storage on optional attributes)
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_unresolved_disputes
+    ON orders (dispute_id, customer_id, created_at)
+    WHERE dispute_id IS NOT NULL;
+
+    -- 4. Audit Table Skew and Partial Index Candidates
+    SELECT
+      relname AS table_name,
+      n_live_tup AS live_tuples,
+      n_dead_tup AS dead_tuples,
+      ROUND((n_dead_tup::numeric / NULLIF(n_live_tup + n_dead_tup, 0)::numeric) * 100, 2) AS dead_tuple_pct
+    FROM pg_stat_user_tables
+    WHERE relname IN ('tasks', 'users', 'orders');
+    ```

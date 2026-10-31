@@ -4393,5 +4393,35 @@ alwaysApply: false
           return fail(500, { message: 'Failed to retrieve order summary.' });
         }
       },
+
+      // Soft-delete resilient account registration
+      // Relies on: CREATE UNIQUE INDEX uq_users_active_email ON users (tenant_id, lower(email)) WHERE deleted_at IS NULL;
+      // Allows previously deleted accounts to re-register without unique constraint violations.
+      registerUser: async ({ request, locals }) => {
+        const data = await request.formData();
+        const tenantId = data.get('tenantId')?.toString();
+        const email = data.get('email')?.toString();
+        const passwordHash = data.get('passwordHash')?.toString();
+
+        if (!tenantId || !email || !passwordHash) {
+          return fail(400, { message: 'Missing required registration fields' });
+        }
+
+        try {
+          const user = await locals.db.one(
+            `INSERT INTO users (tenant_id, email, password_hash, created_at)
+             VALUES ($1, lower($2), $3, CLOCK_TIMESTAMP())
+             RETURNING id, email, created_at;`,
+            [tenantId, email, passwordHash]
+          );
+
+          return { success: true, user };
+        } catch (err: any) {
+          if (err.code === '23505') {
+            return fail(409, { message: 'An active account with this email address already exists.' });
+          }
+          return fail(500, { message: 'Account registration failed.' });
+        }
+      },
     };
     ```

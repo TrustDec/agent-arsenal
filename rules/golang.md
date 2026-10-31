@@ -5431,4 +5431,79 @@ func AuditVisibilityMapCoverage(ctx context.Context, pool *pgxpool.Pool, tableNa
 	}
 	return heapFetchRatio, nil
 }
+
+// PartialQueueTask represents a work item consumed from an asymmetric queue.
+type PartialQueueTask struct {
+	ID        string    `json:"id"`
+	TenantID  string    `json:"tenant_id"`
+	Payload   string    `json:"payload"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// PollPartialQueueTask dequeues the oldest pending task using PostgreSQL FOR UPDATE SKIP LOCKED
+// over an asymmetric partial queue index:
+// CREATE INDEX idx_tasks_pending_queue ON tasks (tenant_id, created_at) WHERE status = 'PENDING' WITH (fillfactor = 85);
+// INVARIANT: "status = 'PENDING'" is hardcoded as a static literal in the SQL text, ensuring generic plan
+// parameter sniffing never prevents PostgreSQL from selecting the partial index.
+func PollPartialQueueTask(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	tenantID string,
+) (*PartialQueueTask, error) {
+	query := `
+		UPDATE tasks
+		SET status = 'PROCESSING',
+		    updated_at = CLOCK_TIMESTAMP()
+		WHERE id = (
+			SELECT id
+			FROM tasks
+			WHERE tenant_id = $1
+			  AND status = 'PENDING'
+			ORDER BY created_at ASC
+			LIMIT 1
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING id, tenant_id, payload, created_at;
+	`
+	var task PartialQueueTask
+	err := pool.QueryRow(ctx, query, tenantID).Scan(
+		&task.ID,
+		&task.TenantID,
+		&task.Payload,
+		&task.CreatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil // Queue empty
+		}
+		return nil, fmt.Errorf("poll partial queue task: %w", err)
+	}
+	return &task, nil
+}
+
+// CreateActiveUserSafely creates an active account while respecting a soft-delete partial unique index:
+// CREATE UNIQUE INDEX uq_users_active_email ON users (tenant_id, lower(email)) WHERE deleted_at IS NULL;
+func CreateActiveUserSafely(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	tenantID string,
+	email string,
+	passwordHash string,
+) (string, error) {
+	query := `
+		INSERT INTO users (tenant_id, email, password_hash, created_at)
+		VALUES ($1, lower($2), $3, CLOCK_TIMESTAMP())
+		RETURNING id;
+	`
+	var userID string
+	err := pool.QueryRow(ctx, query, tenantID, email, passwordHash).Scan(&userID)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return "", fmt.Errorf("an active user with this email already exists: %w", err)
+		}
+		return "", fmt.Errorf("failed to create active user: %w", err)
+	}
+	return userID, nil
+}
 ```
