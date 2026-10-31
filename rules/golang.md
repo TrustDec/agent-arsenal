@@ -7125,3 +7125,153 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **PostgreSQL B-Tree Index Skip Scan & Recursive CTE Loose Indexscan Repository**:
+  - Implement adaptive distinct key seeking using `jackc/pgx/v5`.
+  - When retrieving distinct tenant IDs or latest event records per entity from multi-million row tables, replace naive `SELECT DISTINCT` with a hardened Recursive CTE loose index scan to avoid full B-Tree leaf-page scans and buffer cache thrashing.
+
+  ```go
+  // internal/store/adaptive_skip_scan.go
+  package store
+
+  import (
+  	"context"
+  	"fmt"
+  	"log/slog"
+  	"math"
+  	"time"
+
+  	"github.com/jackc/pgx/v5/pgxpool"
+  )
+
+  type AdaptiveSkipScanRepository struct {
+  	pool   *pgxpool.Pool
+  	logger *slog.Logger
+  }
+
+  func NewAdaptiveSkipScanRepository(pool *pgxpool.Pool, logger *slog.Logger) *AdaptiveSkipScanRepository {
+  	if logger == nil {
+  		logger = slog.Default()
+  	}
+  	return &AdaptiveSkipScanRepository{pool: pool, logger: logger}
+  }
+
+  // GetDistinctTenants retrieves all distinct tenant IDs, dynamically evaluating
+  // cardinality statistics to choose between Recursive CTE Loose Index Scan and Standard Scan.
+  func (r *AdaptiveSkipScanRepository) GetDistinctTenants(ctx context.Context, tableName, columnName string) ([]string, error) {
+  	// 1. Audit cardinality ratio K / N via pg_stats
+  	const statsSQL = `
+  		SELECT
+  			c.reltuples::bigint AS total_rows,
+  			s.n_distinct
+  		FROM pg_class c
+  		JOIN pg_namespace n ON n.oid = c.relnamespace
+  		JOIN pg_stats s ON s.schemaname = n.nspname AND s.tablename = c.relname
+  		WHERE c.relname = $1 AND s.attname = $2
+  		LIMIT 1;
+  	`
+  	var totalRows int64
+  	var nDistinct float64
+  	err := r.pool.QueryRow(ctx, statsSQL, tableName, columnName).Scan(&totalRows, &nDistinct)
+  	if err != nil {
+  		r.logger.Warn("unable to read stats for skip scan evaluation, falling back to standard distinct",
+  			slog.String("table", tableName),
+  			slog.String("column", columnName),
+  			slog.String("error", err.Error()),
+  		)
+  		return r.execStandardDistinct(ctx, tableName, columnName)
+  	}
+
+  	// Compute distinct keys K
+  	var estimatedK float64
+  	if nDistinct < 0 {
+  		estimatedK = math.Abs(nDistinct) * float64(totalRows)
+  	} else {
+  		estimatedK = nDistinct
+  	}
+
+  	cardinalityRatio := 1.0
+  	if totalRows > 0 {
+  		cardinalityRatio = estimatedK / float64(totalRows)
+  	}
+
+  	// Crossover boundary: if K/N <= 0.05 and table > 50,000 rows, use Recursive CTE Loose Index Scan
+  	if totalRows > 50000 && cardinalityRatio <= 0.05 {
+  		r.logger.Debug("activating loose index scan optimization",
+  			slog.String("table", tableName),
+  			slog.Int64("total_rows", totalRows),
+  			slog.Float64("distinct_keys", estimatedK),
+  			slog.Float64("cardinality_ratio", cardinalityRatio),
+  		)
+  		return r.execLooseIndexScan(ctx, tableName, columnName)
+  	}
+
+  	return r.execStandardDistinct(ctx, tableName, columnName)
+  }
+
+  func (r *AdaptiveSkipScanRepository) execLooseIndexScan(ctx context.Context, tableName, col string) ([]string, error) {
+  	// Hardened Recursive CTE Loose Index Scan:
+  	// 1. Mandatory UNION ALL (zero sort/hash deduplication overhead)
+  	// 2. Mandatory WHERE col IS NOT NULL termination guard
+  	sql := fmt.Sprintf(`
+  		WITH RECURSIVE loose_index_scan AS (
+  			(
+  				SELECT %s
+  				FROM %s
+  				WHERE %s IS NOT NULL
+  				ORDER BY %s ASC
+  				LIMIT 1
+  			)
+  			UNION ALL
+  			SELECT (
+  				SELECT %s
+  				FROM %s
+  				WHERE %s > loose_index_scan.%s
+  				ORDER BY %s ASC
+  				LIMIT 1
+  			)
+  			FROM loose_index_scan
+  			WHERE loose_index_scan.%s IS NOT NULL
+  		)
+  		SELECT %s
+  		FROM loose_index_scan
+  		WHERE %s IS NOT NULL;
+  	`, col, tableName, col, col, col, tableName, col, col, col, col, col, col)
+
+  	rows, err := r.pool.Query(ctx, sql)
+  	if err != nil {
+  		return nil, fmt.Errorf("loose index scan failed on %s.%s: %w", tableName, col, err)
+  	}
+  	defer rows.Close()
+
+  	results := make([]string, 0, 64)
+  	for rows.Next() {
+  		var key string
+  		if err := rows.Scan(&key); err != nil {
+  			return nil, fmt.Errorf("scan key error: %w", err)
+  		}
+  		results = append(results, key)
+  	}
+  	return results, rows.Err()
+  }
+
+  func (r *AdaptiveSkipScanRepository) execStandardDistinct(ctx context.Context, tableName, col string) ([]string, error) {
+  	sql := fmt.Sprintf("SELECT DISTINCT %s FROM %s WHERE %s IS NOT NULL ORDER BY %s ASC;", col, tableName, col, col)
+  	rows, err := r.pool.Query(ctx, sql)
+  	if err != nil {
+  		return nil, fmt.Errorf("standard distinct failed on %s.%s: %w", tableName, col, err)
+  	}
+  	defer rows.Close()
+
+  	results := make([]string, 0, 64)
+  	for rows.Next() {
+  		var key string
+  		if err := rows.Scan(&key); err != nil {
+  			return nil, fmt.Errorf("scan key error: %w", err)
+  		}
+  		results = append(results, key)
+  	}
+  	return results, rows.Err()
+  }
+  ```
+
+

@@ -3709,6 +3709,22 @@ alwaysApply: false
     - Proactively Tune **Background Writer (`bgwriter`)**: configure `bgwriter_delay = 10ms`, `bgwriter_lru_maxpages = 800`, and `bgwriter_lru_multiplier = 3.0` to guarantee `buffers_backend / (buffers_backend + buffers_clean) < 0.05`.
     - Deploy **Zero-Downtime Cache Warm-Up**: enable `pg_prewarm` in `shared_preload_libraries` with `autopreload = true`, ensuring buffer states are automatically persisted and restored across planned restarts and HA promotions.
 
+- **B-Tree Index Skip Scan, Recursive CTE Loose Indexscan & Distinct Optimization Defense**:
+  - ❌ **Anti-Pattern: Full Leaf-Page Traversal, DISTINCT ON Sort Avalanche & In-Loop N+1 Distinct Queries**:
+    - Issuing naive `SELECT DISTINCT col` on multi-million row tables where PostgreSQL lacks native skip scan, reading every single leaf block in the B-Tree index (hundreds of thousands of 8KB pages), thrashing `shared_buffers`, and running for 30+ seconds.
+    - Executing `SELECT DISTINCT ON (prefix_col) * ORDER BY prefix_col, created_at DESC` to find the latest row per entity, forcing PostgreSQL to scan and filter tens of millions of tuples across key boundaries instead of hopping directly to each distinct prefix.
+    - Abruptly abandoning composite B-Tree indexes on `(tenant_id, created_at)` when querying filters on `created_at` alone, falling back to full-table sequential scans instead of skipping through distinct tenant prefixes.
+    - Writing recursive CTEs with `UNION` instead of `UNION ALL`, forcing in-memory hash deduplication, or omitting `WHERE key IS NOT NULL` termination predicates, causing infinite loops, 100% CPU lockups, and `SQLSTATE 54001` statement timeouts.
+    - Incurring the inverted high-cardinality skip penalty by blindly applying loose index scans to near-unique keys ($K \approx N$, e.g. timestamps or primary keys), turning 1 sequential leaf read into tens of thousands of B-Tree traversals and degrading latency by 20x.
+    - Executing application-side loops (`for id in distinctIds { db.query(...) }`) that issue hundreds of queries across network boundaries, wasting connection pool leases and suffering hundreds of network round-trips.
+  - ✅ **Production Invariant**:
+    - Implement **Recursive CTE Emulated Loose Index Scan**: rewrite `SELECT DISTINCT col` into `WITH RECURSIVE loose_index_scan AS ((SELECT col FROM tbl ORDER BY col LIMIT 1) UNION ALL SELECT (SELECT col FROM tbl WHERE col > prev.col ORDER BY col LIMIT 1) FROM prev WHERE prev.col IS NOT NULL) SELECT col FROM loose_index_scan WHERE col IS NOT NULL`, transforming $O(N)$ leaf-page reads into $O(K \log_B N)$ root-to-leaf seeks (sub-millisecond latency).
+    - Deploy **Lateral Keyset Seek for Group Lookups**: pair loose index scans with `CROSS JOIN LATERAL (SELECT * FROM tbl WHERE tbl.prefix = dt.prefix ORDER BY created_at DESC LIMIT 1)` to fetch the newest row per entity in a single database round-trip without sorting the entire table.
+    - Enforce **Strict UNION ALL & Non-Null Guards**: always declare `UNION ALL` in recursive CTEs to eliminate deduplication sorting overhead and enforce `WHERE prev.col IS NOT NULL` to guarantee deterministic termination.
+    - Enforce **Mathematical Cardinality Crossover ($K / N \le 0.05$)**: profile column statistics in `pg_stats` (`n_distinct`); activate loose index scans strictly when distinct keys represent $\le 5\%$ of table size. For high-cardinality columns ($K / N > 0.15$), preserve standard Index Only Scans.
+    - Eliminate **Application N+1 Loops**: execute group aggregation and distinct lookups in a single-roundtrip query within PostgreSQL.
+
+
 
 
 

@@ -5257,3 +5257,96 @@ In SvelteKit administrative consoles and system diagnostics:
   </div>
   ```
 
+- **PostgreSQL B-Tree Index Skip Scan & Distinct Query Audit Component (Svelte 5 Runes)**:
+  - Implement a real-time reactive card tracking queries bottlenecked on `DISTINCT` leaf-page index scans, surfacing one-click Recursive CTE rewrites with estimated buffer savings using `$state` and `$derived`.
+
+  ```svelte
+  <!-- src/lib/components/IndexSkipScanAuditCard.svelte -->
+  <script lang="ts">
+    export interface SkipScanCandidate {
+      id: string;
+      tableName: string;
+      columnName: string;
+      totalRows: number;
+      distinctKeys: number;
+      meanTimeMs: number;
+      sharedBlocks: number;
+      rewrittenSql: string;
+    }
+
+    interface Props {
+      candidates: SkipScanCandidate[];
+    }
+
+    let { candidates }: Props = $props();
+    let copiedId = $state<string | null>(null);
+
+    let highImpactCount = $derived(
+      candidates.filter(c => c.totalRows > 1000000 && (c.distinctKeys / c.totalRows) <= 0.05).length
+    );
+
+    async function copyRewrite(candidate: SkipScanCandidate) {
+      await navigator.clipboard.writeText(candidate.rewrittenSql);
+      copiedId = candidate.id;
+      setTimeout(() => {
+        copiedId = null;
+      }, 2000);
+    }
+  </script>
+
+  <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 shadow-sm space-y-4">
+    <div class="flex items-center justify-between border-b border-zinc-100 dark:border-zinc-800 pb-3">
+      <div>
+        <div class="flex items-center gap-2">
+          <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Index Skip Scan Candidates</h3>
+          {#if candidates.length > 0}
+            <span class="px-2 py-0.5 rounded-full text-2xs font-mono font-medium bg-indigo-50 text-indigo-700 dark:bg-indigo-950/60 dark:text-indigo-400">
+              {candidates.length} Detected
+            </span>
+          {/if}
+        </div>
+        <p class="text-xs text-zinc-500 mt-0.5">Emulate B-Tree skip scan via Recursive CTEs to avoid full leaf traversals.</p>
+      </div>
+
+      {#if highImpactCount > 0}
+        <span class="px-2.5 py-1 rounded-md text-xs font-medium bg-amber-50 text-amber-700 dark:bg-amber-950/50 dark:text-amber-300">
+          {highImpactCount} Critical Opportunities (≥100x Gain)
+        </span>
+      {/if}
+    </div>
+
+    {#if candidates.length === 0}
+      <div class="py-6 text-center text-xs text-zinc-400">
+        No slow DISTINCT leaf-page scans detected. Prefix indexing is optimal.
+      </div>
+    {:else}
+      <div class="divide-y divide-zinc-100 dark:divide-zinc-800">
+        {#each candidates as c (c.id)}
+          <div class="py-3.5 space-y-2">
+            <div class="flex items-center justify-between text-xs font-mono">
+              <span class="font-semibold text-zinc-800 dark:text-zinc-200">{c.tableName}.{c.columnName}</span>
+              <div class="flex items-center gap-3 text-2xs text-zinc-400">
+                <span>Rows: {c.totalRows.toLocaleString()}</span>
+                <span>Keys: {c.distinctKeys.toLocaleString()}</span>
+                <span class="text-amber-600 font-bold">{c.meanTimeMs.toFixed(1)}ms</span>
+              </div>
+            </div>
+
+            <div class="relative">
+              <pre class="p-3 rounded-lg bg-zinc-950 text-zinc-200 font-mono text-2xs overflow-x-auto leading-relaxed">{c.rewrittenSql}</pre>
+              <button
+                type="button"
+                onclick={() => copyRewrite(c)}
+                class="absolute top-2 right-2 px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-2xs font-sans transition-colors"
+              >
+                {copiedId === c.id ? '✓ Copied' : 'Copy SQL'}
+              </button>
+            </div>
+          </div>
+        {/each}
+      </div>
+    {/if}
+  </div>
+  ```
+
+

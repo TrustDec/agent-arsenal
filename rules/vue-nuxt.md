@@ -4502,3 +4502,94 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   </template>
   ```
 
+- **PostgreSQL B-Tree Index Skip Scan & Distinct Query Audit Component**:
+  - Implement a real-time audit card for detecting slow `DISTINCT` queries and providing one-click copyable Recursive CTE Loose Index Scan rewrites with predicted buffer savings.
+
+  ```vue
+  <!-- components/database/IndexSkipScanAuditCard.vue -->
+  <script setup lang="ts">
+  import { ref, computed } from 'vue';
+
+  export interface SkipScanCandidate {
+    id: string;
+    tableName: string;
+    columnName: string;
+    totalRows: number;
+    distinctKeys: number;
+    meanTimeMs: number;
+    sharedBlocks: number;
+    rewrittenSql: string;
+  }
+
+  const props = defineProps<{
+    candidates: SkipScanCandidate[];
+    isScanning?: boolean;
+  }>();
+
+  const copiedId = ref<string | null>(null);
+
+  const copyRewrite = async (candidate: SkipScanCandidate) => {
+    await navigator.clipboard.writeText(candidate.rewrittenSql);
+    copiedId.value = candidate.id;
+    setTimeout(() => {
+      copiedId.value = null;
+    }, 2000);
+  };
+
+  const highImpactCount = computed(() =>
+    props.candidates.filter(c => c.totalRows > 1000000 && (c.distinctKeys / c.totalRows) <= 0.05).length
+  );
+  </script>
+
+  <template>
+    <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 shadow-sm">
+      <div class="flex items-center justify-between border-b border-zinc-100 dark:border-zinc-800 pb-4">
+        <div>
+          <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100 flex items-center gap-2">
+            <span>⚡ Index Skip Scan Opportunities</span>
+            <span v-if="candidates.length > 0" class="px-2 py-0.5 rounded-full text-2xs font-mono font-medium bg-indigo-50 text-indigo-700 dark:bg-indigo-950/60 dark:text-indigo-400">
+              {{ candidates.length }} Detected
+            </span>
+          </h3>
+          <p class="text-xs text-zinc-500 mt-0.5">
+            Identify slow leaf-page traversals on DISTINCT; replace with Recursive CTE Loose Index Seeks.
+          </p>
+        </div>
+        <span v-if="highImpactCount > 0" class="px-2.5 py-1 rounded-md text-xs font-medium bg-amber-50 text-amber-700 dark:bg-amber-950/50 dark:text-amber-300">
+          {{ highImpactCount }} High Impact (≥100x Speedup)
+        </span>
+      </div>
+
+      <div v-if="candidates.length === 0" class="py-8 text-center text-xs text-zinc-400">
+        No slow DISTINCT queries detected. All indexed prefix scans are optimal.
+      </div>
+
+      <div v-else class="divide-y divide-zinc-100 dark:divide-zinc-800 mt-3">
+        <div v-for="c in candidates" :key="c.id" class="py-3.5">
+          <div class="flex items-center justify-between text-xs font-mono">
+            <span class="font-semibold text-zinc-800 dark:text-zinc-200">
+              {{ c.tableName }}.{{ c.columnName }}
+            </span>
+            <div class="flex items-center gap-3 text-2xs text-zinc-400">
+              <span>Rows: {{ c.totalRows.toLocaleString() }}</span>
+              <span>Keys: {{ c.distinctKeys.toLocaleString() }}</span>
+              <span class="text-amber-600 font-bold">{{ c.meanTimeMs.toFixed(1) }}ms</span>
+            </div>
+          </div>
+
+          <div class="mt-2 relative">
+            <pre class="p-2.5 rounded-lg bg-zinc-950 text-zinc-200 font-mono text-2xs overflow-x-auto leading-relaxed">{{ c.rewrittenSql }}</pre>
+            <button
+              @click="copyRewrite(c)"
+              class="absolute top-2 right-2 px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-2xs font-sans transition-colors"
+            >
+              {{ copiedId === c.id ? '✓ Copied' : 'Copy SQL' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </template>
+  ```
+
+
