@@ -3650,6 +3650,23 @@ alwaysApply: false
     - Enforce `max_slot_wal_keep_size = 50GB` on the primary to protect write storage from catastrophic disk full panics while monitoring `pg_replication_slots.wal_status`.
     - Implement driver-level recovery conflict retry middleware catching SQLSTATE `40001`/`57014` with message `conflict with recovery`, applying decorrelated exponential jitter $\tau_k = \min(T_{\max}, \mathcal{U}(T_{\text{base}}, \tau_{k-1} \times 3))$ with rate-limited fallback to the primary writer.
 
+- **Database LISTEN / NOTIFY, Asynchronous Event Streaming, 8000-Byte Payload Limits & `pg_notify` SLRU Buffer Overflow Defense**:
+  - ❌ **Anti-Pattern: 8KB Payload Clifftops, Transaction-Mode PgBouncer Pinning & SLRU Lockouts**:
+    - Serializing entire JSON entities or table rows directly into `pg_notify(channel, row_to_json(NEW)::text)`; when an entity exceeds 8000 bytes (`NOTIFY_PAYLOAD_MAX_LENGTH`), PostgreSQL aborts with `ERROR: payload string too long` (SQLSTATE `54000`), rolling back the entire mutating business transaction.
+    - Subscribing to notifications using `LISTEN` over PgBouncer in `pool_mode = transaction` (port 6432), which either pins backend server connections indefinitely (paralyzing pool multiplexing) or unbinds the connection between transactions, sending notifications to dead backend sessions or leaking events across tenant boundaries.
+    - Allowing slow or hung subscriber processes to stall reading notifications without queue monitoring, causing PostgreSQL shared memory `pg_notify` SLRU ring buffer to hit 100% saturation and aborting all subsequent `NOTIFY` calls cluster-wide with `pg_notify queue is full`.
+    - Failing to implement unconditional channel re-registration in client reconnection supervisors; when cloud NAT gateways drop idle TCP sockets, the client reconnects to a fresh backend without re-issuing `LISTEN`, silently dropping 100% of future notifications with zero error logs.
+    - Relying on `LISTEN / NOTIFY` as the sole source of durable truth for business workflows, resulting in permanent data loss during service restarts or network partitions due to at-most-once delivery semantics.
+    - Emitting notifications from row-level triggers during batch updates, causing tens of thousands of notification packets to flood client event loops simultaneously upon `COMMIT`.
+  - ✅ **Production Invariant**:
+    - Strictly enforce the **Thin Pointer (Claim-Check) Pattern**: payloads transmitted via `pg_notify` MUST be lightweight metadata envelopes strictly bounded under 256 bytes (e.g. `json_build_object('t', event_type, 'id', id, 'ts', epoch)`). Never serialize full domain entities into `NOTIFY`.
+    - Isolate listener connections into a dedicated, direct, unpooled connection pool (direct port 5432 or strict session-mode port), strictly bypassing transaction-mode poolers.
+    - Mandate hybrid **Wakeup + Keyset Outbox Replay**: treat `NOTIFY` solely as a zero-latency signal to wake up worker goroutines/threads; hydrate durable event rows from an append-only Outbox table using keyset seek queries (`WHERE id > :watermark ORDER BY id ASC LIMIT 500`), guaranteeing at-least-once delivery and zero data loss across pod restarts.
+    - Wrap listener sockets in an autonomous supervisor loop with decorrelated exponential jitter reconnection, unconditional `LISTEN` channel re-registration, and synthetic heartbeat watchdogs (`pg_notify('__sys_heartbeat__', now())`) every 20 seconds.
+    - Implement continuous monitoring of `pg_notification_queue_usage()`; alert at > 25% utilization and auto-evict hung listener backends via `pg_terminate_backend()` before queue saturation triggers cluster write lockouts.
+    - Coalesce multi-row batch mutations using statement-level triggers with transition tables (`REFERENCING NEW TABLE AS inserted`) or application-level commit hooks, delivering exactly one aggregated notification per transaction.
+
+
 
 
 

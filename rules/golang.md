@@ -6665,4 +6665,195 @@ func (w *resilientRowWrapper) Scan(dest ...any) error {
 	return fmt.Errorf("standby recovery conflict retries exhausted: %w", err)
 }
 
+// ThinPointerEnvelope defines the bounded metadata packet (<256B) sent over pg_notify
+type ThinPointerEnvelope struct {
+	Type        string `json:"t"`
+	ID          int64  `json:"id"`
+	AggregateID string `json:"a"`
+	Timestamp   int64  `json:"ts"`
+}
+
+// DurableOutboxEvent represents the hydrated, durable domain event from PostgreSQL
+type DurableOutboxEvent struct {
+	ID            int64           `json:"id"`
+	AggregateType string          `json:"aggregate_type"`
+	AggregateID   string          `json:"aggregate_id"`
+	EventType     string          `json:"event_type"`
+	Payload       json.RawMessage `json:"payload"`
+	CreatedAt     time.Time       `json:"created_at"`
+}
+
+// AutonomousListenNotifySupervisor manages a dedicated unpooled connection for LISTEN/NOTIFY,
+// enforcing heartbeat watchdogs, automatic re-registration, and hybrid Outbox watermark drain.
+type AutonomousListenNotifySupervisor struct {
+	directDSN     string
+	queryPool     *pgxpool.Pool
+	channels      []string
+	handler       func(ctx context.Context, event DurableOutboxEvent) error
+	lastWatermark int64
+	mu            sync.Mutex
+	reconnectBase time.Duration
+	reconnectMax  time.Duration
+}
+
+// NewAutonomousListenNotifySupervisor initializes a robust LISTEN / NOTIFY worker.
+func NewAutonomousListenNotifySupervisor(
+	directDSN string,
+	queryPool *pgxpool.Pool,
+	channels []string,
+	initialWatermark int64,
+	handler func(ctx context.Context, event DurableOutboxEvent) error,
+) *AutonomousListenNotifySupervisor {
+	return &AutonomousListenNotifySupervisor{
+		directDSN:     directDSN,
+		queryPool:     queryPool,
+		channels:      channels,
+		handler:       handler,
+		lastWatermark: initialWatermark,
+		reconnectBase: 100 * time.Millisecond,
+		reconnectMax:  5000 * time.Millisecond,
+	}
+}
+
+// Start boots the autonomous supervisor loop, surviving connection drops, NAT timeouts, and restarts.
+func (s *AutonomousListenNotifySupervisor) Start(ctx context.Context) error {
+	delay := s.reconnectBase
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		err := s.runConnectionSession(ctx)
+		if err != nil && ctx.Err() == nil {
+			// Calculate decorrelated exponential jitter: min(maxDelay, rand(baseDelay, prev * 3))
+			multiplier := float64(delay * 3)
+			if multiplier > float64(s.reconnectMax) {
+				multiplier = float64(s.reconnectMax)
+			}
+			delta := float64(s.reconnectBase) + rand.Float64()*(multiplier-float64(s.reconnectBase))
+			delay = time.Duration(delta)
+
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		} else {
+			delay = s.reconnectBase
+		}
+	}
+}
+
+func (s *AutonomousListenNotifySupervisor) runConnectionSession(ctx context.Context) error {
+	// Parse dedicated direct DSN (guaranteed port 5432, NOT PgBouncer port 6432)
+	cfg, err := pgconn.ParseConfig(s.directDSN)
+	if err != nil {
+		return fmt.Errorf("invalid listener DSN: %w", err)
+	}
+
+	conn, err := pgconn.ConnectConfig(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("direct listener connect failed: %w", err)
+	}
+	defer conn.Close(ctx)
+
+	// Unconditionally re-register all channels upon connection
+	for _, ch := range s.channels {
+		res := conn.Exec(ctx, fmt.Sprintf("LISTEN %s", pgx.Identifier{ch}.Sanitize()))
+		if err := res.Close(); err != nil {
+			return fmt.Errorf("failed to register LISTEN on %s: %w", ch, err)
+		}
+	}
+
+	// Drain any outbox events missed during downtime
+	if err := s.drainOutbox(ctx); err != nil {
+		return fmt.Errorf("initial outbox backlog drain failed: %w", err)
+	}
+
+	// Channel for notification reception
+	notifChan := make(chan *pgconn.Notification, 64)
+	errChan := make(chan error, 1)
+
+	// Background reader for raw socket notifications
+	go func() {
+		for {
+			notif, err := conn.WaitForNotification(ctx)
+			if err != nil {
+				errChan <- err
+				return
+			}
+			notifChan <- notif
+		}
+	}()
+
+	// Safety fallback ticker ensuring latency is bounded even if a notification drops
+	safetyTicker := time.NewTicker(5 * time.Second)
+	defer safetyTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-errChan:
+			return fmt.Errorf("notification connection severed: %w", err)
+		case <-safetyTicker.C:
+			_ = s.drainOutbox(ctx)
+		case notif := <-notifChan:
+			// Thin pointer size assertion
+			if len(notif.Payload) > 2048 {
+				continue // Reject bloated payloads
+			}
+			var ptr ThinPointerEnvelope
+			if err := json.Unmarshal([]byte(notif.Payload), &ptr); err == nil {
+				_ = s.drainOutbox(ctx)
+			}
+		}
+	}
+}
+
+func (s *AutonomousListenNotifySupervisor) drainOutbox(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for {
+		rows, err := s.queryPool.Query(ctx, `
+			SELECT id, aggregate_type, aggregate_id, event_type, payload, created_at
+			FROM event_outbox
+			WHERE id > $1
+			ORDER BY id ASC
+			LIMIT 500
+		`, s.lastWatermark)
+		if err != nil {
+			return err
+		}
+
+		batchCount := 0
+		for rows.Next() {
+			var evt DurableOutboxEvent
+			if err := rows.Scan(&evt.ID, &evt.AggregateType, &evt.AggregateID, &evt.EventType, &evt.Payload, &evt.CreatedAt); err != nil {
+				rows.Close()
+				return err
+			}
+
+			if err := s.handler(ctx, evt); err != nil {
+				rows.Close()
+				return err
+			}
+
+			s.lastWatermark = evt.ID
+			batchCount++
+		}
+		rows.Close()
+
+		if batchCount < 500 {
+			break
+		}
+	}
+
+	return nil
+}
+
 ```

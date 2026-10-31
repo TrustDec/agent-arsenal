@@ -4256,3 +4256,58 @@ alwaysApply: false
       throw new Error('Standby recovery conflict retries exhausted');
     }
     ```
+
+- **Nuxt 3 Nitro Server PostgreSQL LISTEN / NOTIFY & Realtime Event Streaming Invariants**:
+  - ❌ **Anti-Pattern: Running LISTEN over Pooled Nitro Clients & Serializing Full Entity JSON**:
+    - Invoking `sql.listen()` using the standard pooled Nitro database client routed through PgBouncer in transaction mode, leading to connection pinning or unhandled server exceptions.
+    - Emitting full reactive component state or large database entities directly in `pg_notify()`, triggering PostgreSQL 8000-byte payload limits (SQLSTATE `54000`) and crashing SSR updates.
+  - ✅ **Production Invariant**:
+    - Instantiate a dedicated unpooled connection specifically for event listening on direct port 5432.
+    - Implement the Thin Pointer (Claim-Check) pattern with monotonic keyset Outbox seek to hydrate live updates before streaming to clients via Server-Sent Events (SSE).
+    ```typescript
+    // server/routes/api/live-events.ts
+    // Nuxt 3 Nitro SSE endpoint consuming PostgreSQL LISTEN/NOTIFY with Claim-Check Outbox hydration
+    import { createEventStream } from 'h3';
+    import postgres from 'postgres';
+
+    export default defineEventHandler(async (event) => {
+      // INVARIANT: Dedicated direct connection on direct port 5432, NOT PgBouncer transaction mode
+      const directListener = postgres(process.env.DIRECT_DATABASE_URL!, {
+        max: 1,
+        idle_timeout: 0,
+        keep_alive: 10,
+      });
+
+      const eventStream = createEventStream(event);
+      let lastProcessedId = 0;
+
+      // Thin Pointer listener waking up Outbox keyset seek
+      await directListener.listen('outbox_stream', async (rawPayload) => {
+        try {
+          const envelope = JSON.parse(rawPayload);
+          const rows = await directListener`
+            SELECT id, aggregate_id, event_type, payload, created_at
+            FROM event_outbox
+            WHERE id > ${lastProcessedId}
+            ORDER BY id ASC
+            LIMIT 50
+          `;
+
+          for (const row of rows) {
+            lastProcessedId = row.id;
+            await eventStream.push(JSON.stringify(row));
+          }
+        } catch (err: any) {
+          console.error('[Nitro Realtime] Outbox hydration failed:', err);
+        }
+      });
+
+      eventStream.onClosed(async () => {
+        try {
+          await directListener.end({ timeout: 2 });
+        } catch (_) {}
+      });
+
+      return eventStream.send();
+    });
+    ```

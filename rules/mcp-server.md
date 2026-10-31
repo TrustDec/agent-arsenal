@@ -5034,5 +5034,118 @@ alwaysApply: false
           };
         }
       );
+
+      // Register Tool: Audit PostgreSQL LISTEN / NOTIFY & Async Event Streaming Invariants
+      server.tool(
+        'audit_listen_notify_invariants',
+        'Audits PostgreSQL LISTEN/NOTIFY pub/sub architecture for 8000-byte payload limits, PgBouncer transaction-mode pinning, SLRU queue saturation, and reconnect resilience',
+        {
+          isPgBouncerTransactionMode: z.boolean().describe('True if listener connects via PgBouncer port 6432 in transaction mode'),
+          maxPayloadSizeBytes: z.number().describe('Maximum byte size sent to pg_notify() in triggers or application code'),
+          hasUnconditionalReRegistration: z.boolean().describe('Whether client supervisor re-issues LISTEN upon reconnecting'),
+          hasOutboxWatermarkReplay: z.boolean().describe('Whether events are backed by a durable Outbox table with keyset seek replay'),
+          slruQueueUsagePct: z.number().describe('Current pg_notification_queue_usage() percentage (0 to 100)'),
+          hasSyntheticHeartbeat: z.boolean().describe('Whether client runs synthetic heartbeat ping/pong to detect dropped TCP sockets'),
+        },
+        async ({
+          isPgBouncerTransactionMode,
+          maxPayloadSizeBytes,
+          hasUnconditionalReRegistration,
+          hasOutboxWatermarkReplay,
+          slruQueueUsagePct,
+          hasSyntheticHeartbeat,
+        }) => {
+          const violations: string[] = [];
+          const recommendations: string[] = [];
+
+          // Invariant 1: 8000-byte payload hard limit
+          if (maxPayloadSizeBytes >= 8000) {
+            violations.push(
+              `FATAL_PAYLOAD_LIMIT_BREACH: Payload size (${maxPayloadSizeBytes}B) >= 8000B PostgreSQL limit. Will crash business transactions with SQLSTATE 54000.`
+            );
+            recommendations.push(
+              'Switch immediately to the Thin Pointer (Claim-Check) pattern: transmit only {"t":"type","id":123} (<256B) and hydrate from the database.'
+            );
+          } else if (maxPayloadSizeBytes > 512) {
+            violations.push(
+              `HIGH_PAYLOAD_SIZE_WARNING: Payload size (${maxPayloadSizeBytes}B) is high. Bloats shared memory pg_notify SLRU buffers and risks queue exhaustion.`
+            );
+            recommendations.push('Keep NOTIFY envelopes strictly under 256 bytes.');
+          }
+
+          // Invariant 2: Dedicated direct connection vs PgBouncer transaction pooling
+          if (isPgBouncerTransactionMode) {
+            violations.push(
+              'PGBOUNCER_TRANSACTION_MODE_PINNING: LISTEN executed over transaction-mode pooler. Will pin server connections or deliver notifications to dead backends.'
+            );
+            recommendations.push(
+              'Connect listeners directly to PostgreSQL port 5432 or use a dedicated PgBouncer session-mode listener pool.'
+            );
+          }
+
+          // Invariant 3: Unconditional channel re-registration
+          if (!hasUnconditionalReRegistration) {
+            violations.push(
+              'MISSING_CHANNEL_RE_REGISTRATION: Driver does not re-issue LISTEN upon socket reconnection, silently dropping 100% of future notifications.'
+            );
+            recommendations.push(
+              'Wrap listener in a supervisor that unconditionally executes LISTEN for all channels upon every socket reconnect.'
+            );
+          }
+
+          // Invariant 4: Hybrid Outbox Watermark Replay
+          if (!hasOutboxWatermarkReplay) {
+            violations.push(
+              'AT_MOST_ONCE_DATA_LOSS_HAZARD: Missing durable Outbox table with keyset seek replay. Notifications during pod restarts will be permanently lost.'
+            );
+            recommendations.push(
+              'Implement hybrid Wakeup + Outbox Replay: use NOTIFY as an instant wake trigger, and drain durable events with WHERE id > :watermark ORDER BY id.'
+            );
+          }
+
+          // Invariant 5: SLRU buffer queue telemetry
+          if (slruQueueUsagePct > 50) {
+            violations.push(
+              `CRITICAL_SLRU_QUEUE_SATURATION: pg_notify queue is at ${slruQueueUsagePct}% capacity! Cluster write lockout imminent if it reaches 100%.`
+            );
+            recommendations.push(
+              'Identify and terminate slow or hung listener backends using pg_stat_activity and pg_terminate_backend().'
+            );
+          } else if (slruQueueUsagePct > 25) {
+            violations.push(
+              `ELEVATED_SLRU_QUEUE_USAGE: pg_notify queue is at ${slruQueueUsagePct}%. Investigate lagging subscriber processes.`
+            );
+          }
+
+          // Invariant 6: Synthetic heartbeats
+          if (!hasSyntheticHeartbeat) {
+            violations.push(
+              'MISSING_SYNTHETIC_HEARTBEAT: Client lacks periodic heartbeat ping/pong; silent NAT firewall connection resets will stall listener for hours.'
+            );
+            recommendations.push(
+              'Implement synthetic heartbeat ping/pong (pg_notify("__sys_heartbeat__", now())) every 20 seconds.'
+            );
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                status: violations.length === 0 ? 'COMPLIANT' : 'CRITICAL_RISKS_DETECTED',
+                violationsCount: violations.length,
+                violations,
+                recommendations,
+                assessment: {
+                  isPayloadSafe: maxPayloadSizeBytes < 512,
+                  isConnectionTopologySafe: !isPgBouncerTransactionMode,
+                  isReconnectionResilient: hasUnconditionalReRegistration && hasSyntheticHeartbeat,
+                  isDataLossProtected: hasOutboxWatermarkReplay,
+                  isSlruQueueHealthy: slruQueueUsagePct <= 25,
+                },
+              }, null, 2),
+            }],
+          };
+        }
+      );
     }
     ```

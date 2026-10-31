@@ -4991,5 +4991,54 @@ alwaysApply: false
           }
         }
       },
+
+      // Realtime Server-Sent Events (SSE) bridge using dedicated direct LISTEN/NOTIFY and Outbox hydration
+      streamLiveUpdates: async ({ request, locals }) => {
+        // INVARIANT: Must use direct dedicated connection (port 5432), NEVER PgBouncer transaction pool
+        const directClient = await locals.directDbPool.connect();
+        let lastSeenId = 0;
+
+        const stream = new ReadableStream({
+          async start(controller) {
+            const encoder = new TextEncoder();
+
+            // Register notification listener on dedicated client
+            directClient.on('notification', async (msg) => {
+              if (msg.channel !== 'outbox_stream' || !msg.payload) return;
+
+              try {
+                // Drain durable outbox records using monotonic seek
+                const outboxRes = await directClient.query(
+                  'SELECT id, aggregate_id, event_type, payload FROM event_outbox WHERE id > $1 ORDER BY id ASC LIMIT 50',
+                  [lastSeenId]
+                );
+
+                for (const row of outboxRes.rows) {
+                  lastSeenId = row.id;
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(row)}\n\n`));
+                }
+              } catch (err: any) {
+                controller.error(err);
+              }
+            });
+
+            await directClient.query('LISTEN outbox_stream');
+          },
+          async cancel() {
+            try {
+              await directClient.query('UNLISTEN outbox_stream');
+            } catch (_) {}
+            directClient.release();
+          },
+        });
+
+        return new Response(stream, {
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache, no-transform',
+            'Connection': 'keep-alive',
+          },
+        });
+      },
     };
     ```
