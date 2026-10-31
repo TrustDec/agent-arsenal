@@ -3804,6 +3804,19 @@ alwaysApply: false
     - Enforce **Dynamic `work_mem` Sizing & OOM Fencing**: budget transaction memory: `work_mem = min(work_mem, budget / (W * active_partitions + 1))` to guarantee zero disk spilling (`TempWrittenBlocks = 0`) while preventing host RAM exhaustion.
     - Enforce **Partition Pruning Predicate Symmetry**: always include explicit partition range or equality filters in `WHERE` clauses to bound join planning complexity to $\mathcal{O}(P_{\text{pruned}} \log P_{\text{pruned}})$.
 
+- **Bloom Indexing, Multi-Column Equality Permutations & Lossy Bitmap Scan Defense (PostgreSQL 11–17+)**:
+  - ❌ **Anti-Pattern: Combinatorial B-Tree Sprawl & Non-Sargable Range Queries**:
+    - Creating dozens of composite B-Tree indexes ($2^N$ permutations) to satisfy arbitrary subset multi-facet queries, ballooning storage by $15\times$ and destroying write throughput with index locks.
+    - Using default 80-bit Bloom signatures with uncalibrated 2-bit columns across high-cardinality keys, causing signature saturation ($p_1 \to 1.0$), high false-positive rates ($> 40\%$), and disk-thrashing bitmap heap rechecks.
+    - Applying range (`<`, `>`), inequality, or pattern (`LIKE`) operators against Bloom indexes; Bloom ONLY supports equality (`=`), causing silent fallback to 50M-row sequential scans.
+    - Undersized `work_mem` during Bitmap Index Scans causing exact TID bitmaps to degrade into lossy page pointers (`Lossy: > 0`), forcing full-page tuple rechecks.
+  - ✅ **Production Invariant**:
+    - Enforce **Mathematical Entropy Bit Allocation**: configure explicit `WITH (length = M, col1 = k1, col2 = k2, ...)` where $M \in [256, 1024]$ and $k_i \propto \log_2(\text{n\_distinct}_i)$, bounding total bits $\sum k_i \le 0.70 \cdot M$.
+    - Enforce **Operator Sargability Fencing**: restrict Bloom indexes strictly to equality (`=`) predicates; segregate temporal and range filters to dedicated B-Trees combined via `BitmapAnd`.
+    - Deploy **Transaction-Scoped `work_mem` Fencing**: elevate `work_mem` to $\ge 64\text{MB}$ in faceted search transactions to ensure zero lossy bitmap degradation (`Lossy: 0`).
+    - Enforce **Proactive Autovacuum Compaction**: set `autovacuum_vacuum_scale_factor = 0.05` on Bloom-indexed relations to purge dead signatures and prevent index bloat.
+
+
 
 
 

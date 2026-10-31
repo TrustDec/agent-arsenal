@@ -8098,6 +8098,140 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **PostgreSQL Bloom Index Multi-Facet Equality Repository**:
+  - Implement dynamic multi-attribute facet search queries using `jackc/pgx/v5` with transaction-scoped `work_mem` elevation to prevent lossy bitmap degradation.
+  - Enforce strict equality (`=`) predicates for Bloom-indexed columns while routing temporal ranges to composite B-Trees via `BitmapAnd`.
+
+  ```go
+  // internal/store/bloom_facet_search.go
+  package store
+
+  import (
+  	"context"
+  	"fmt"
+  	"log/slog"
+  	"strings"
+
+  	"github.com/jackc/pgx/v5"
+  	"github.com/jackc/pgx/v5/pgxpool"
+  )
+
+  type FacetSearchFilter struct {
+  	TenantID     *string
+  	UserID       *string
+  	ActionType   *string
+  	ResourceType *string
+  	Status       *string
+  	Limit        int
+  	Offset       int
+  }
+
+  type FacetItem struct {
+  	ID           string `json:"id"`
+  	TenantID     string `json:"tenant_id"`
+  	UserID       string `json:"user_id"`
+  	ActionType   string `json:"action_type"`
+  	ResourceType string `json:"resource_type"`
+  	Status       string `json:"status"`
+  }
+
+  type BloomFacetSearchRepository struct {
+  	pool   *pgxpool.Pool
+  	logger *slog.Logger
+  }
+
+  func NewBloomFacetSearchRepository(pool *pgxpool.Pool, logger *slog.Logger) *BloomFacetSearchRepository {
+  	return &BloomFacetSearchRepository{pool: pool, logger: logger}
+  }
+
+  // Search executes dynamic multi-facet equality queries with transaction-scoped
+  // work_mem protection, ensuring exact Bitmap Index Scans without lossy degradation.
+  func (r *BloomFacetSearchRepository) Search(
+  	ctx context.Context,
+  	filter FacetSearchFilter,
+  ) ([]FacetItem, error) {
+  	tx, err := r.pool.Begin(ctx)
+  	if err != nil {
+  		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+  	}
+  	defer tx.Rollback(ctx)
+
+  	// Invariant: Elevate work_mem to 64MB for facet search to guarantee Lossy: 0
+  	if _, err := tx.Exec(ctx, "SET LOCAL work_mem = '64MB'"); err != nil {
+  		return nil, fmt.Errorf("failed to set local work_mem: %w", err)
+  	}
+
+  	var predicates []string
+  	var args []any
+  	idx := 1
+
+  	addEquality := func(column string, val *string) {
+  		if val != nil {
+  			predicates = append(predicates, fmt.Sprintf("%s = $%d", column, idx))
+  			args = append(args, *val)
+  			idx++
+  		}
+  	}
+
+  	addEquality("tenant_id", filter.TenantID)
+  	addEquality("user_id", filter.UserID)
+  	addEquality("action_type", filter.ActionType)
+  	addEquality("resource_type", filter.ResourceType)
+  	addEquality("status", filter.Status)
+
+  	whereClause := ""
+  	if len(predicates) > 0 {
+  		whereClause = "WHERE " + strings.Join(predicates, " AND ")
+  	}
+
+  	limit := filter.Limit
+  	if limit <= 0 || limit > 500 {
+  		limit = 50
+  	}
+  	offset := filter.Offset
+  	if offset < 0 {
+  		offset = 0
+  	}
+
+  	query := fmt.Sprintf(`
+  		SELECT id, tenant_id, user_id, action_type, resource_type, status
+  		FROM audit_logs
+  		%s
+  		ORDER BY created_at DESC
+  		LIMIT %d OFFSET %d
+  	`, whereClause, limit, offset)
+
+  	rows, err := tx.Query(ctx, query, args...)
+  	if err != nil {
+  		return nil, fmt.Errorf("facet query execution failed: %w", err)
+  	}
+  	defer rows.Close()
+
+  	var results []FacetItem
+  	for rows.Next() {
+  		var item FacetItem
+  		if err := rows.Scan(
+  			&item.ID,
+  			&item.TenantID,
+  			&item.UserID,
+  			&item.ActionType,
+  			&item.ResourceType,
+  			&item.Status,
+  		); err != nil {
+  			return nil, fmt.Errorf("failed to scan item: %w", err)
+  		}
+  		results = append(results, item)
+  	}
+
+  	if err := tx.Commit(ctx); err != nil {
+  		return nil, fmt.Errorf("failed to commit transaction: %w", err)
+  	}
+
+  	return results, nil
+  }
+  ```
+
+
 
 
 

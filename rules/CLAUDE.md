@@ -66,6 +66,8 @@ When given a coding or debugging task, always follow this sequence:
 - **Sub-Agent Context Isolation**: Offload heavy exploratory sweeps, repository map generation, and massive benchmark runs to sandboxed sub-agents, returning strictly structured 5-line syntheses to the orchestrator.
 - **Git Worktree Isolation for High-Blast-Radius Tasks**: Isolate broad refactoring runs or risky dependency upgrades in ephemeral git worktrees, verifying clean builds before merging to main.
 - **Partition-Wise Join & GUC Fencing Discipline**: When generating database queries on partitioned relations, never enable `enable_partitionwise_join` or `enable_partitionwise_aggregate` globally. Scope flags strictly via `SET LOCAL` within transaction boundaries and enforce partition boundary alignment to prevent combinatorial planning storms.
+- **Bloom Index & Multi-Facet Search Discipline**: When indexing tables for arbitrary subset equality queries, avoid combinatorial B-Tree sprawl ($2^N$ indexes). Leverage PostgreSQL `bloom` indexes with explicit entropy-calibrated bit allocations ($M \in [256, 1024]$), enforce strict equality (`=`) predicates, and elevate transaction `work_mem` to guarantee lossless bitmap scans (`Lossy: 0`).
+
 
 
 

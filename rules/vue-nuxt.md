@@ -5096,6 +5096,72 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   </template>
   ```
 
+- **Bloom Index & Lossless Bitmap Scan Telemetry Card (Vue 3 / Nuxt 3)**:
+  - Visual display of Bloom index selectivity, exact vs lossy heap page counts, discarded recheck rows, and query execution time.
+
+  ```vue
+  <!-- components/BloomIndexTelemetryCard.vue -->
+  <script setup lang="ts">
+  import { computed } from 'vue';
+
+  interface BloomTelemetry {
+    indexName: string;
+    tableName: string;
+    signatureLength: number;
+    exactHeapPages: number;
+    lossyHeapPages: number;
+    recheckRowsDiscarded: number;
+    executionTimeMs: number;
+  }
+
+  const props = defineProps<{
+    telemetry: BloomTelemetry;
+  }>();
+
+  const isLossy = computed(() => props.telemetry.lossyHeapPages > 0);
+  const isHealthy = computed(() => !isLossy.value && props.telemetry.recheckRowsDiscarded < 5000);
+  </script>
+
+  <template>
+    <div class="rounded-lg border p-4 bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800">
+      <div class="flex items-center justify-between pb-3 border-b border-zinc-100 dark:border-zinc-800">
+        <div>
+          <h4 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Bloom Index Scan Telemetry</h4>
+          <p class="text-xs text-zinc-500 font-mono">{{ telemetry.tableName }} ({{ telemetry.indexName }})</p>
+        </div>
+        <span
+          class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium"
+          :class="isLossy ? 'bg-rose-50 text-rose-700 dark:bg-rose-950/60 dark:text-rose-400' : isHealthy ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-400' : 'bg-amber-50 text-amber-700 dark:bg-amber-950/60 dark:text-amber-400'"
+        >
+          {{ isLossy ? 'LOSSY BITMAP SPILL' : isHealthy ? 'EXACT LOSSLESS SCAN' : 'HIGH COLLISION RATE' }}
+        </span>
+      </div>
+
+      <div class="grid grid-cols-4 gap-3 my-3 text-xs">
+        <div class="p-2 rounded bg-zinc-50 dark:bg-zinc-800/50">
+          <div class="text-zinc-400 text-2xs mb-0.5">SIGNATURE</div>
+          <div class="font-mono font-bold text-zinc-900 dark:text-zinc-100">{{ telemetry.signatureLength }} bits</div>
+        </div>
+        <div class="p-2 rounded bg-zinc-50 dark:bg-zinc-800/50">
+          <div class="text-zinc-400 text-2xs mb-0.5">EXACT / LOSSY</div>
+          <div class="font-mono font-bold" :class="isLossy ? 'text-rose-600 dark:text-rose-400' : 'text-emerald-600 dark:text-emerald-400'">
+            {{ telemetry.exactHeapPages }} / {{ telemetry.lossyHeapPages }}
+          </div>
+        </div>
+        <div class="p-2 rounded bg-zinc-50 dark:bg-zinc-800/50">
+          <div class="text-zinc-400 text-2xs mb-0.5">RECHECK DISCARD</div>
+          <div class="font-mono font-bold text-zinc-900 dark:text-zinc-100">{{ telemetry.recheckRowsDiscarded }}</div>
+        </div>
+        <div class="p-2 rounded bg-zinc-50 dark:bg-zinc-800/50">
+          <div class="text-zinc-400 text-2xs mb-0.5">EXEC TIME</div>
+          <div class="font-mono font-bold text-zinc-900 dark:text-zinc-100">{{ telemetry.executionTimeMs.toFixed(1) }}ms</div>
+        </div>
+      </div>
+    </div>
+  </template>
+  ```
+
+
 
 
 

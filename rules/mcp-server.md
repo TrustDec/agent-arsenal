@@ -6054,6 +6054,91 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         }
       }
     );
+
+    // MCP Tool: Audit Bloom Index Parameters & Column Entropy Allocation
+    server.registerTool(
+      'audit_bloom_index_parameters',
+      {
+        description: 'Audits existing Bloom indexes or computes mathematically optimal signature length M and per-column bit allocations based on pg_stats entropy',
+        parameters: {
+          tableName: { type: 'string', description: 'Name of the table to analyze' },
+          columns: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'List of column names targeted for multi-facet equality indexing',
+          },
+        },
+      },
+      async (args) => {
+        const client = await pool.connect();
+        try {
+          const statsRes = await client.query(`
+            SELECT
+              attname,
+              n_distinct,
+              null_frac
+            FROM pg_stats
+            WHERE tablename = $1
+              AND attname = ANY($2::text[]);
+          `, [args.tableName, args.columns]);
+
+          if (statsRes.rows.length === 0) {
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  error: `No column statistics found for table '${args.tableName}'. Run ANALYZE first.`,
+                }, null, 2),
+              }],
+            };
+          }
+
+          const M = args.columns.length >= 8 ? 512 : 256;
+          const targetBits = Math.floor(M * Math.LN2);
+
+          const entropyMap: Record<string, number> = {};
+          let totalEntropy = 0;
+
+          for (const row of statsRes.rows) {
+            const nd = Math.abs(Number(row.n_distinct)) || 50;
+            const entropy = Math.log2(Math.max(2, nd));
+            entropyMap[row.attname] = entropy;
+            totalEntropy += entropy;
+          }
+
+          const allocations: Record<string, number> = {};
+          let totalAllocated = 0;
+
+          args.columns.forEach((colName: string, idx: number) => {
+            const entropy = entropyMap[colName] || Math.log2(50);
+            const bits = Math.max(2, Math.min(64, Math.round((entropy / totalEntropy) * targetBits)));
+            allocations[`col${idx + 1}_${colName}`] = bits;
+            totalAllocated += bits;
+          });
+
+          const saturationRatio = totalAllocated / M;
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                tableName: args.tableName,
+                signatureLengthM: M,
+                totalAllocatedBits: totalAllocated,
+                saturationRatio: `${(saturationRatio * 100).toFixed(1)}%`,
+                columnBitAllocations: allocations,
+                optimalDDL: `CREATE INDEX CONCURRENTLY idx_${args.tableName}_bloom ON ${args.tableName} USING bloom (${args.columns.join(', ')}) WITH (length = ${M}, ${Object.entries(allocations).map(([k, v]) => `${k.split('_')[0]} = ${v}`).join(', ')});`,
+                recommendation: saturationRatio <= 0.70
+                  ? 'Parameters are mathematically balanced. Safe for production deployment.'
+                  : 'Signature saturation risk. Elevate signatureLengthM to 512 or 1024 to prevent false positive collisions.',
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
   }
   ```
 
