@@ -4645,5 +4645,40 @@ alwaysApply: false
           return fail(500, { message: `Failed fetching category top products: ${err.message}` });
         }
       },
+
+      // Cycle-safe ancestor breadcrumb loader action
+      // Uses PostgreSQL 14+ CYCLE clause to eliminate N+1 round-trips and prevent infinite loops
+      loadBreadcrumbs: async ({ url, locals }) => {
+        const tenantId = locals.tenantId;
+        const nodeId = url.searchParams.get('nodeId');
+        if (!nodeId) {
+          return fail(400, { message: 'Missing nodeId parameter' });
+        }
+
+        const breadcrumbQuery = `
+          WITH RECURSIVE ancestors AS (
+            SELECT id, parent_id, name, 1 AS depth
+            FROM org_nodes
+            WHERE id = $1 AND tenant_id = $2
+            UNION ALL
+            SELECT p.id, p.parent_id, p.name, a.depth + 1
+            FROM org_nodes p
+            JOIN ancestors a ON p.id = a.parent_id
+            WHERE p.tenant_id = $2 AND a.depth < 30
+          )
+          CYCLE id SET is_cycle USING cycle_path
+          SELECT id, parent_id, name, depth
+          FROM ancestors
+          WHERE NOT is_cycle
+          ORDER BY depth DESC;
+        `;
+
+        try {
+          const breadcrumbs = await locals.db.any(breadcrumbQuery, [nodeId, tenantId]);
+          return { breadcrumbs };
+        } catch (err: any) {
+          return fail(500, { message: `Failed loading breadcrumbs: ${err.message}` });
+        }
+      },
     };
     ```

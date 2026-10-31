@@ -5864,4 +5864,70 @@ func FetchCategoriesTopProductsLateral(
 
 	return results, nil
 }
+
+// HierarchyBreadcrumb represents an ancestor node in an organization or taxonomy tree.
+type HierarchyBreadcrumb struct {
+	ID       string
+	ParentID *string
+	Name     string
+	Depth    int
+}
+
+// FetchOrgBreadcrumbsCycleSafe retrieves the full ancestor chain from leaf to root
+// in a single round-trip using a cycle-safe recursive CTE, completely eliminating N+1 breadcrumb loops.
+func FetchOrgBreadcrumbsCycleSafe(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	tenantID string,
+	targetNodeID string,
+) ([]HierarchyBreadcrumb, error) {
+	const breadcrumbSQL = `
+		WITH RECURSIVE ancestors AS (
+			SELECT
+				n.id,
+				n.parent_id,
+				n.name,
+				1 AS depth
+			FROM org_nodes n
+			WHERE n.id = $1 AND n.tenant_id = $2
+
+			UNION ALL
+
+			SELECT
+				p.id,
+				p.parent_id,
+				p.name,
+				a.depth + 1
+			FROM org_nodes p
+			JOIN ancestors a ON p.id = a.parent_id
+			WHERE p.tenant_id = $2 AND a.depth < 30
+		)
+		CYCLE id SET is_cycle USING cycle_path
+		SELECT id, parent_id, name, depth
+		FROM ancestors
+		WHERE NOT is_cycle
+		ORDER BY depth DESC;
+	`
+
+	rows, err := pool.Query(ctx, breadcrumbSQL, targetNodeID, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("failed executing breadcrumb query: %w", err)
+	}
+	defer rows.Close()
+
+	var chain []HierarchyBreadcrumb
+	for rows.Next() {
+		var item HierarchyBreadcrumb
+		if err := rows.Scan(&item.ID, &item.ParentID, &item.Name, &item.Depth); err != nil {
+			return nil, fmt.Errorf("failed scanning breadcrumb item: %w", err)
+		}
+		chain = append(chain, item)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error during breadcrumb row iteration: %w", err)
+	}
+
+	return chain, nil
+}
 ```

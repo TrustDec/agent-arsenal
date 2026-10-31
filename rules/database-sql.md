@@ -3520,5 +3520,19 @@ alwaysApply: false
     WHERE c.is_visible = true;
     ```
 
+- **Hierarchical Trees, LTree Path Indexing, Closure Tables & Adjacency List Cycle Defense**:
+  - ❌ **Anti-Pattern: Unbounded Recursive CTEs, Naive String LIKE Paths & Self-Parenting Relocation Outages**:
+    - Writing `WITH RECURSIVE` queries without PostgreSQL 14+ `CYCLE` detection or depth limits, which spin into infinite loops and crash connections when cycles are introduced by concurrent unvalidated updates.
+    - Fetching ancestor breadcrumbs via $N$ sequential application-level round-trips (`while (parentId) { SELECT ... }`), multiplying network latency and pool pressure.
+    - Moving nodes via unguarded `UPDATE nodes SET parent_id = $new_parent WHERE id = $id` without verifying that `$new_parent` is not a descendant of `$id`, severing subtrees into disconnected circular islands.
+    - Storing hierarchy paths as raw `VARCHAR` strings and querying subtrees via `WHERE path LIKE '/1/%'`, causing substring collision bugs (`/10/20` matching `/1/%`) and triggering full table scans.
+    - Omitting the B-Tree index on `parent_id` in adjacency list schemas, causing every tree step to execute an $O(N)$ sequential scan.
+  - ✅ **Production Invariant**:
+    - For simple Adjacency Lists, mandate a composite B-Tree index on `(tenant_id, parent_id)`, enforce PostgreSQL 14+ `CYCLE id SET is_cycle USING path`, and cap depth with `WHERE depth <= 25`.
+    - For deep read-heavy hierarchies or taxonomies, deploy PostgreSQL's native `ltree` extension with dual indexing: GiST index (`CREATE INDEX USING gist (path)`) for `<@` (is descendant) and `@>` (is ancestor) subtree queries, and B-Tree index for exact equality and sorting.
+    - Sanitize all `ltree` labels against `^[A-Za-z0-9_]{1,256}$` before persistence.
+    - Atomic Subtree Relocation: Execute node relocation inside an explicit transaction block, pre-checking that the destination parent is not within the source node's descendants (`targetPath <@ sourcePath = false`), acquiring row locks in deterministic UUID order, and rewriting descendants' paths via `ltree` subpath concatenation: `SET path = $new_prefix::ltree || subpath(path, nlevel($old_prefix::ltree))`.
+
+
 
 

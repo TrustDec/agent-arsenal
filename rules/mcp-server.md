@@ -4326,5 +4326,74 @@ alwaysApply: false
           };
         }
       );
+
+      // Audit SQL Hierarchical Tree Queries & Schema Invariants
+      server.tool(
+        'audit_sql_hierarchy_query',
+        'Statically audits SQL queries and DDL for tree modeling, cycle vulnerabilities, and ltree path invariants.',
+        {
+          sql: z.string().describe('The SQL query or DDL statement implementing tree structures or recursive CTEs.'),
+        },
+        async ({ sql }) => {
+          const warnings: string[] = [];
+          const recommendations: string[] = [];
+          const normalized = sql.replace(/\s+/g, ' ');
+
+          // 1. Recursive CTE without cycle detection
+          if (/\bWITH\s+RECURSIVE\b/i.test(normalized)) {
+            const hasCycle = /\bCYCLE\s+[a-zA-Z0-9_]+\s+SET\s+[a-zA-Z0-9_]+\s+USING\b/i.test(normalized);
+            const hasArrayVisited = /ARRAY\[.*?\]|visited\s*\|\|/i.test(normalized);
+            if (!hasCycle && !hasArrayVisited) {
+              warnings.push(
+                'UNBOUNDED_RECURSIVE_LOOP: WITH RECURSIVE query lacks a CYCLE clause or visited array. Any circular graph reference will trigger an infinite loop and OOM crash.'
+              );
+              recommendations.push(
+                'Add PostgreSQL 14+ `CYCLE id SET is_cycle USING path` or an explicit array visited check.'
+              );
+            }
+
+            const hasDepthCap = /\bdepth\s*(<|<=)\s*\d+/i.test(normalized);
+            if (!hasDepthCap) {
+              warnings.push(
+                'MISSING_DEPTH_CEILING: Recursive CTE lacks an explicit depth guard (e.g. `depth < 25`). Deep hierarchies may exhaust memory.'
+              );
+              recommendations.push('Add an explicit depth ceiling condition in the recursive member.');
+            }
+          }
+
+          // 2. Naive string LIKE path matching
+          if (/\bpath\s+LIKE\s+['"][^'"]*%/i.test(normalized)) {
+            warnings.push(
+              'NAIVE_STRING_LIKE_HIERARCHY: Prefix LIKE search on hierarchy path column causes substring collision bugs and full table scans.'
+            );
+            recommendations.push(
+              'Migrate to PostgreSQL native `ltree` extension with GiST `<@` and `@>` path operators.'
+            );
+          }
+
+          // 3. Direct UPDATE parent_id without cycle check
+          if (/UPDATE\s+[a-zA-Z0-9_.]+\s+SET\s+parent_id\s*=/i.test(normalized) && !/WHERE.*NOT\s+IN/i.test(normalized)) {
+            warnings.push(
+              'UNCHECKED_PARENT_RELOCATION: Direct UPDATE of parent_id without descendant exclusion pre-check risks detaching subtrees into circular orphan islands.'
+            );
+            recommendations.push(
+              'Verify that target parent is not within the descendants of the moved node before updating parent_id.'
+            );
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                hasWarnings: warnings.length > 0,
+                warningsCount: warnings.length,
+                warnings,
+                recommendations,
+                status: warnings.length === 0 ? 'OPTIMAL' : 'REMEDIATION_REQUIRED',
+              }, null, 2),
+            }],
+          };
+        }
+      );
     }
     ```

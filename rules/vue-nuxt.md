@@ -3780,4 +3780,73 @@ alwaysApply: false
         client.release();
       }
     });
+
+    // server/api/v1/categories/relocate.post.ts - Safe Subtree Relocation Endpoint
+    // Enforces cycle pre-check and atomic ltree path rewriting in a single transaction
+    export default defineEventHandler(async (event) => {
+      const tenantId = event.context.auth?.tenantId;
+      if (!tenantId) {
+        throw createError({ statusCode: 401, message: 'Unauthorized' });
+      }
+
+      const body = await readBody(event);
+      const { nodeId, newParentId } = body;
+      if (!nodeId) {
+        throw createError({ statusCode: 400, message: 'Missing nodeId parameter' });
+      }
+
+      const client = await useDatabase().connect();
+      try {
+        await client.query('BEGIN');
+
+        // 1. Lock source node and get current path
+        const sourceRes = await client.query(
+          'SELECT path::text, slug FROM categories WHERE id = $1 AND tenant_id = $2 FOR UPDATE',
+          [nodeId, tenantId]
+        );
+        if (sourceRes.rowCount === 0) {
+          throw createError({ statusCode: 404, message: 'Source node not found' });
+        }
+        const { path: currentPath, slug } = sourceRes.rows[0];
+
+        let newBasePath = slug;
+        if (newParentId) {
+          // 2. Lock target parent
+          const parentRes = await client.query(
+            'SELECT path::text FROM categories WHERE id = $1 AND tenant_id = $2 FOR UPDATE',
+            [newParentId, tenantId]
+          );
+          if (parentRes.rowCount === 0) {
+            throw createError({ statusCode: 404, message: 'Target parent node not found' });
+          }
+          const targetPath = parentRes.rows[0].path;
+
+          // 3. Cycle pre-check: target cannot be within currentPath's subtree
+          if (targetPath === currentPath || targetPath.startsWith(`${currentPath}.`)) {
+            throw createError({
+              statusCode: 400,
+              message: 'Cycle detected: Cannot move a node into its own descendant subtree',
+            });
+          }
+          newBasePath = `${targetPath}.${slug}`;
+        }
+
+        // 4. Atomic subtree rewrite via ltree subpath concatenation
+        await client.query(
+          `UPDATE categories
+           SET path = $3::ltree || subpath(path, nlevel($1::ltree))
+           WHERE tenant_id = $2 AND path <@ $1::ltree`,
+          [currentPath, tenantId, newBasePath]
+        );
+
+        await client.query('COMMIT');
+        return { success: true, newPath: newBasePath };
+      } catch (err: any) {
+        await client.query('ROLLBACK');
+        if (err.statusCode) throw err;
+        throw createError({ statusCode: 500, message: `Subtree relocation failed: ${err.message}` });
+      } finally {
+        client.release();
+      }
+    });
     ```
