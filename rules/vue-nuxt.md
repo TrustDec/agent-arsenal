@@ -5976,6 +5976,70 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   </template>
   ```
 
+- **PostgreSQL Sort & Incremental Sort Disk Spill Monitor (Vue 3 / Nuxt 3)**:
+  - ❌ **Anti-Pattern**: Omitting sort execution telemetry in administrative consoles, allowing multi-gigabyte external merge sort disk thrashing to go undetected.
+  - ✅ **Production Invariant**: Implement Vue 3 Composition API reactive components displaying sort space allocation, quicksort vs heapsort status, and incremental sort health:
+  ```vue
+  <script setup lang="ts">
+  import { computed } from 'vue';
+
+  const props = withDefaults(defineProps<{
+    queryTitle?: string;
+    sortMethod?: string;
+    sortSpaceType?: 'Memory' | 'Disk';
+    sortSpaceUsedKb?: number;
+    isIncrementalSort?: boolean;
+    isTopNPreserved?: boolean;
+  }>(), {
+    queryTitle: 'Ordered Query',
+    sortMethod: 'quicksort',
+    sortSpaceType: 'Memory',
+    sortSpaceUsedKb: 0,
+    isIncrementalSort: false,
+    isTopNPreserved: false,
+  });
+
+  const isSpill = computed(() => props.sortSpaceType === 'Disk' || props.sortMethod.includes('external merge'));
+  const sortSpaceMb = computed(() => (props.sortSpaceUsedKb / 1024).toFixed(1));
+  </script>
+
+  <template>
+    <div class="p-4 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm space-y-3">
+      <div class="flex items-center justify-between">
+        <div>
+          <h4 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{{ queryTitle }}</h4>
+          <span class="text-xs text-zinc-500">PostgreSQL Sort Monitor ({{ isIncrementalSort ? 'Incremental Sort' : sortMethod }})</span>
+        </div>
+        <span
+          class="px-2.5 py-1 rounded-full text-xs font-medium"
+          :class="!isSpill ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-400' : 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-400'"
+        >
+          {{ !isSpill ? (isTopNPreserved ? 'Top-N Heapsort (O(K))' : 'In-Memory (Zero Spill)') : `External Merge Spill (${sortSpaceMb} MB)` }}
+        </span>
+      </div>
+
+      <div class="grid grid-cols-3 gap-3 text-xs">
+        <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+          <span class="text-zinc-500">Method:</span>
+          <span class="block font-mono font-medium text-zinc-900 dark:text-zinc-100 truncate">{{ sortMethod }}</span>
+        </div>
+        <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+          <span class="text-zinc-500">Storage / Space:</span>
+          <span class="block font-mono font-medium" :class="!isSpill ? 'text-zinc-900 dark:text-zinc-100' : 'text-rose-600'">
+            {{ sortSpaceType }} ({{ sortSpaceMb }} MB)
+          </span>
+        </div>
+        <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-800/50">
+          <span class="text-zinc-500">Optimization Mode:</span>
+          <span class="block font-mono font-medium text-emerald-600">
+            {{ isIncrementalSort ? 'Incremental Prefix Groups' : isTopNPreserved ? 'Bounded Priority Queue' : 'Full In-Memory Sort' }}
+          </span>
+        </div>
+      </div>
+    </div>
+  </template>
+  ```
+
 
 
 

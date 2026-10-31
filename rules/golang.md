@@ -9436,6 +9436,96 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **PostgreSQL Incremental Sort, External Merge Sort Spills & Top-N Heapsort Invariants in Go**:
+  - ❌ **Anti-Pattern**: Permitting sorting queries to spill temporary runs to disk (`Sort Method: external merge Disk`) or bypassing bounded Top-N Heapsort on `LIMIT` queries, causing NVMe write thrashing and connection pool exhaustion.
+  - ✅ **Production Invariant**: Use `jackc/pgx/v5` with transaction-scoped `SET LOCAL work_mem` calibration, keyset seek pagination, and plan assertion to guarantee zero disk spillage:
+  ```go
+  // SortPlanGovernor manages memory calibration and plan invariants for ORDER BY queries
+  type SortPlanGovernor struct {
+  	Pool *pgxpool.Pool
+  }
+
+  // ExecuteWithCalibratedSortMemory executes an ORDER BY query with transaction-scoped work_mem
+  func (g *SortPlanGovernor) ExecuteWithCalibratedSortMemory(
+  	ctx context.Context,
+  	workMemMB int,
+  	fn func(tx pgx.Tx) error,
+  ) error {
+  	tx, err := g.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+  	if err != nil {
+  		return fmt.Errorf("begin tx: %w", err)
+  	}
+  	defer tx.Rollback(ctx)
+
+  	setSQL := fmt.Sprintf("SET LOCAL work_mem = '%dMB'", workMemMB)
+  	if _, err := tx.Exec(ctx, setSQL); err != nil {
+  		return fmt.Errorf("set local work_mem: %w", err)
+  	}
+
+  	if err := fn(tx); err != nil {
+  		return err
+  	}
+
+  	return tx.Commit(ctx)
+  }
+
+  // AuditSortPlan asserts that an EXPLAIN plan does not spill sort runs to disk
+  func (g *SortPlanGovernor) AuditSortPlan(ctx context.Context, querySQL string, args ...any) error {
+  	explainSQL := fmt.Sprintf("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) %s", querySQL)
+
+  	ctxTimeout, cancel := context.WithTimeout(ctx, 15*time.Second)
+  	defer cancel()
+
+  	var rawJSON []byte
+  	if err := g.Pool.QueryRow(ctxTimeout, explainSQL, args...).Scan(&rawJSON); err != nil {
+  		return fmt.Errorf("explain query failed: %w", err)
+  	}
+
+  	var plans []struct {
+  		Plan map[string]any `json:"Plan"`
+  	}
+  	if err := json.Unmarshal(rawJSON, &plans); err != nil || len(plans) == 0 {
+  		return fmt.Errorf("parse explain json failed: %w", err)
+  	}
+
+  	var diskSpillFound bool
+  	var totalSpilledKb float64
+
+  	var inspect func(node map[string]any)
+  	inspect = func(node map[string]any) {
+  		nodeType, _ := node["Node Type"].(string)
+
+  		if nodeType == "Sort" || nodeType == "Incremental Sort" {
+  			spaceType, _ := node["Sort Space Type"].(string)
+  			method, _ := node["Sort Method"].(string)
+  			spaceUsed, _ := node["Sort Space Used"].(float64)
+
+  			if spaceType == "Disk" || strings.Contains(method, "external merge") {
+  				diskSpillFound = true
+  				totalSpilledKb += spaceUsed
+  			}
+  		}
+
+  		if children, ok := node["Plans"].([]any); ok {
+  			for _, c := range children {
+  				if childMap, ok := c.(map[string]any); ok {
+  					inspect(childMap)
+  				}
+  			}
+  		}
+  	}
+
+  	inspect(plans[0].Plan)
+
+  	if diskSpillFound {
+  		return fmt.Errorf("external merge sort spill detected: %.0f kB written to disk", totalSpilledKb)
+  	}
+
+  	return nil
+  }
+  ```
+
+
 
 
 

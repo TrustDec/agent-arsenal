@@ -3954,6 +3954,21 @@ alwaysApply: false
     - Enforce **Presorted B-Tree Index Coverage**: for high-cardinality groups ($K \ge 100,000$), create composite B-Tree indexes matching grouping keys to achieve $O(1)$ constant-memory streaming `GroupAggregate`.
     - Enforce **LIMIT Early-Termination Pipelining**: pair presorted B-Tree indexes with `GroupAggregate` on `ORDER BY ... LIMIT K` queries to stream Top-$K$ groups in $O(K)$ time.
 
+- **Incremental Sort, External Merge Sort Spills & Top-N Heapsort Invariants (PostgreSQL)**:
+  - ❌ **Anti-Pattern: External Merge Spills, LIMIT Bypassing & Deep Offset Thrashing**:
+    - Permitting sorting operations to exceed `work_mem`, spilling intermediate runs to temporary disk files (`Sort Method: external merge Disk`), causing NVMe write thrashing and degrading p99 query latency by 50x–200x.
+    - Wrapping `ORDER BY ... LIMIT K` queries in opaque CTEs or window functions, losing optimizer LIMIT pushdown and forcing unbounded Quicksort/External Merge sorts over millions of rows before discarding 99.9% of tuples.
+    - Using `Incremental Sort` on degenerate low-cardinality prefix columns (e.g. boolean flags or unpartitioned status), causing single prefix groups to balloon past `work_mem` and trigger disk spills.
+    - Sorting high-volume text columns under default locale collations, burning 85% CPU in libc `strcoll()` string comparisons instead of direct byte comparisons.
+    - Employing large `OFFSET` values (`OFFSET 100000 LIMIT 20`), forcing the database engine to sort, materialize, and discard hundreds of thousands of tuples.
+  - ✅ **Production Invariant**:
+    - Enforce **Single-Run In-Memory Sorting**: assert `Sort Space Type == "Memory"` and zero disk spillage (`Disk Usage == 0 kB`) across all execution plans via automated CI gates.
+    - Enforce **Top-N Heapsort Preservation**: ensure `ORDER BY ... LIMIT K` queries maintain bounded Top-N Heapsort (`Sort Method: top-N heapsort`), restricting memory consumption to $O(K)$.
+    - Enforce **Incremental Sort Prefix Alignment**: align multi-column orderings with existing B-Tree prefix indexes to activate PostgreSQL 13+ `Incremental Sort`, verifying that prefix key entropy prevents group memory explosion.
+    - Enforce **COLLATE "C" Binary Comparison Acceleration**: explicitly assign `COLLATE "C"` to sort expressions and index definitions for text attributes, replacing `strcoll()` with single-instruction `memcmp()`.
+    - Enforce **Keyset Seek Pagination**: eliminate deep `OFFSET` pagination in favor of cursor-based seek predicates (`WHERE (col, id) < ($c, $i) ORDER BY col DESC, id DESC LIMIT K`), guaranteeing $O(1)$ memory and sub-millisecond execution.
+
+
 
 
 

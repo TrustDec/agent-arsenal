@@ -7092,6 +7092,83 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         };
       }
     );
+
+    // Tool: Audit Sort plan for External Merge Sort spills, Incremental Sort & Top-N Heapsort compliance
+    this.server.tool(
+      'audit_sort_plan',
+      'Parses EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) execution trees to verify zero-spill sorting compliance (Sort Space Type == Memory, disk usage == 0 kB, top-N heapsort preservation on LIMIT queries, and incremental sort health)',
+      {
+        planJson: z.string().describe('Raw JSON output from EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)'),
+        queryHasLimit: z.boolean().optional().describe('Whether the original query contained a LIMIT clause'),
+      },
+      async (args) => {
+        const parsed = JSON.parse(args.planJson);
+        const rootPlan = parsed[0]?.Plan ?? parsed?.Plan;
+        if (!rootPlan) {
+          throw new Error('Invalid EXPLAIN JSON format: missing root Plan node');
+        }
+
+        let hasDiskSpill = false;
+        let isTopNPreserved = false;
+        let hasIncrementalSort = false;
+        let maxSortSpaceKb = 0;
+        let detectedMethod = '';
+
+        const traverse = (node: any) => {
+          const nodeType = node['Node Type'] ?? '';
+          if (nodeType === 'Sort' || nodeType === 'Incremental Sort') {
+            const spaceType = node['Sort Space Type'] ?? '';
+            const method = node['Sort Method'] ?? '';
+            const spaceUsed = node['Sort Space Used'] ?? 0;
+
+            if (spaceUsed > maxSortSpaceKb) {
+              maxSortSpaceKb = spaceUsed;
+              detectedMethod = method;
+            }
+
+            if (nodeType === 'Incremental Sort') {
+              hasIncrementalSort = true;
+            }
+
+            if (spaceType === 'Disk' || method.includes('external merge')) {
+              hasDiskSpill = true;
+            }
+
+            if (method.includes('top-N heapsort')) {
+              isTopNPreserved = true;
+            }
+          }
+
+          for (const child of node.Plans ?? []) {
+            traverse(child);
+          }
+        };
+
+        traverse(rootPlan);
+
+        const suggestedWorkMemMb = Math.max(Math.ceil((maxSortSpaceKb * 1.5) / 1024), 32);
+        const isCompliant = !hasDiskSpill && (!args.queryHasLimit || isTopNPreserved || detectedMethod === '');
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              hasDiskSpill,
+              isTopNPreserved,
+              hasIncrementalSort,
+              detectedMethod,
+              maxSortSpaceKb,
+              status: isCompliant ? 'compliant' : hasDiskSpill ? 'external_merge_disk_spill' : 'top_n_heapsort_bypassed',
+              recommendation: hasDiskSpill
+                ? `CRITICAL: Sort spilled to disk (${maxSortSpaceKb} kB). Increase transaction memory: SET LOCAL work_mem = '${suggestedWorkMemMb}MB', or eliminate sort using composite B-Tree index.`
+                : args.queryHasLimit && !isTopNPreserved
+                ? 'WARNING: Query contains LIMIT but used full sort instead of bounded top-N heapsort. Push LIMIT into subquery.'
+                : '-- Sort plan is fully compliant (zero disk spills, memory-bounded)',
+            }, null, 2),
+          }],
+        };
+      }
+    );
   }
   ```
 
