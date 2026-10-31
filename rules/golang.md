@@ -6552,4 +6552,117 @@ func (m *WirePipelineBatchManager[T]) ExecutePipelined(ctx context.Context, item
 	return nil
 }
 
+// StandbyConflictRetryRouter intercepts PostgreSQL read-replica recovery conflicts (SQLSTATE 40001 / 57014)
+// and executes resilient decorrelated jitter retries with bounded primary writer fallback.
+type StandbyConflictRetryRouter struct {
+	primaryPool *pgxpool.Pool
+	replicaPool *pgxpool.Pool
+	maxRetries  int
+	baseDelay   time.Duration
+	maxDelay    time.Duration
+	allowFallback bool
+}
+
+// NewStandbyConflictRetryRouter builds a production-grade standby query router.
+func NewStandbyConflictRetryRouter(primary, replica *pgxpool.Pool, allowPrimaryFallback bool) *StandbyConflictRetryRouter {
+	return &StandbyConflictRetryRouter{
+		primaryPool:   primary,
+		replicaPool:   replica,
+		maxRetries:    3,
+		baseDelay:     50 * time.Millisecond,
+		maxDelay:      2500 * time.Millisecond,
+		allowFallback: allowPrimaryFallback,
+	}
+}
+
+// IsRecoveryConflict evaluates if a given database error originates from a Hot Standby WAL replay conflict.
+func IsRecoveryConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		// SQLSTATE 40001 (serialization_failure) or 57014 (query_canceled)
+		if pgErr.Code == "40001" || pgErr.Code == "57014" {
+			combined := strings.ToLower(pgErr.Message + " " + pgErr.Detail)
+			return strings.Contains(combined, "conflict with recovery")
+		}
+	}
+	return false
+}
+
+// QueryRowResilient executes a single-row read on the read replica, applying decorrelated jitter retries on conflict.
+func (r *StandbyConflictRetryRouter) QueryRowResilient(
+	ctx context.Context,
+	sql string,
+	args ...any,
+) pgx.Row {
+	// For single-row queries, we wrap the execution in a helper that can retry on replica conflict
+	delay := r.baseDelay
+	for attempt := 1; attempt <= r.maxRetries; attempt++ {
+		row := r.replicaPool.QueryRow(ctx, sql, args...)
+		// Note: pgx.Row errors are evaluated on Scan; we return a lazy wrapper
+		return &resilientRowWrapper{
+			ctx:           ctx,
+			router:        r,
+			sql:           sql,
+			args:          args,
+			activeRow:     row,
+			attempt:       attempt,
+			currentDelay:  delay,
+		}
+	}
+	return r.primaryPool.QueryRow(ctx, sql, args...)
+}
+
+type resilientRowWrapper struct {
+	ctx          context.Context
+	router       *StandbyConflictRetryRouter
+	sql          string
+	args         []any
+	activeRow    pgx.Row
+	attempt      int
+	currentDelay time.Duration
+}
+
+func (w *resilientRowWrapper) Scan(dest ...any) error {
+	err := w.activeRow.Scan(dest...)
+	if err == nil {
+		return nil
+	}
+	if !IsRecoveryConflict(err) {
+		return err
+	}
+
+	delay := w.currentDelay
+	for attempt := w.attempt + 1; attempt <= w.router.maxRetries; attempt++ {
+		// Calculate decorrelated jitter backoff: min(maxDelay, rand(baseDelay, prev * 3))
+		multiplier := float64(delay * 3)
+		if multiplier > float64(w.router.maxDelay) {
+			multiplier = float64(w.router.maxDelay)
+		}
+		delta := float64(delay) + rand.Float64()*(multiplier-float64(delay))
+		delay = time.Duration(delta)
+
+		select {
+		case <-w.ctx.Done():
+			return w.ctx.Err()
+		case <-time.After(delay):
+		}
+
+		err = w.router.replicaPool.QueryRow(w.ctx, w.sql, w.args...).Scan(dest...)
+		if err == nil {
+			return nil
+		}
+		if !IsRecoveryConflict(err) {
+			return err
+		}
+	}
+
+	if w.router.allowFallback {
+		return w.router.primaryPool.QueryRow(w.ctx, w.sql, w.args...).Scan(dest...)
+	}
+	return fmt.Errorf("standby recovery conflict retries exhausted: %w", err)
+}
+
 ```

@@ -4939,5 +4939,100 @@ alwaysApply: false
           };
         }
       );
+
+      // Register Tool: Audit PostgreSQL Read Replica Standby Recovery Conflicts & Feedback Invariants
+      server.tool(
+        'audit_standby_recovery_conflicts',
+        'Audits PostgreSQL read-replica standby recovery conflict settings, timeout ladders, feedback bloat risks, and replication slot quotas',
+        {
+          statementTimeoutMs: z.number().describe('Replica statement_timeout in milliseconds'),
+          maxStandbyStreamingDelayMs: z.number().describe('Replica max_standby_streaming_delay in milliseconds'),
+          hotStandbyFeedback: z.boolean().describe('Whether hot_standby_feedback is enabled'),
+          idleInTransactionTimeoutMs: z.number().describe('idle_in_transaction_session_timeout in milliseconds'),
+          maxSlotWalKeepSizeMb: z.number().describe('Primary max_slot_wal_keep_size in megabytes (-1 if disabled)'),
+          oldestStandbyXminAge: z.number().optional().describe('Age of oldest standby xmin in transactions'),
+          hasClientRetryInterceptor: z.boolean().describe('Whether client code intercepts SQLSTATE 40001/57014 conflicts'),
+        },
+        async ({
+          statementTimeoutMs,
+          maxStandbyStreamingDelayMs,
+          hotStandbyFeedback,
+          idleInTransactionTimeoutMs,
+          maxSlotWalKeepSizeMb,
+          oldestStandbyXminAge = 0,
+          hasClientRetryInterceptor,
+        }) => {
+          const violations: string[] = [];
+          const recommendations: string[] = [];
+
+          // Invariant 1: Timeout ladder
+          if (statementTimeoutMs >= maxStandbyStreamingDelayMs) {
+            violations.push(
+              `TIMEOUT_LADDER_INVERSION: statement_timeout (${statementTimeoutMs}ms) >= max_standby_streaming_delay (${maxStandbyStreamingDelayMs}ms). Queries will stall WAL recovery before timing out.`
+            );
+            recommendations.push(
+              `Set statement_timeout < max_standby_streaming_delay (e.g. statement_timeout = ${Math.floor(maxStandbyStreamingDelayMs * 0.5)}ms) so queries abort cleanly before recovery halts.`
+            );
+          }
+
+          // Invariant 2: Idle transaction timeout on feedback-enabled standby
+          if (hotStandbyFeedback && (idleInTransactionTimeoutMs === 0 || idleInTransactionTimeoutMs > 10000)) {
+            violations.push(
+              `UNBOUNDED_IDLE_TRANSACTION_FEEDBACK: hot_standby_feedback is ON with idle_in_transaction_session_timeout (${idleInTransactionTimeoutMs}ms > 10s). Leaked transactions will freeze Primary VACUUM.`
+            );
+            recommendations.push(
+              'Configure idle_in_transaction_session_timeout = 5s on read replicas to prevent idle snapshots from pinning upstream vacuum horizons.'
+            );
+          }
+
+          // Invariant 3: Primary bloat check
+          if (hotStandbyFeedback && oldestStandbyXminAge > 500000) {
+            violations.push(
+              `PRIMARY_VACUUM_HORIZON_PINNED: Standby xmin age is ${oldestStandbyXminAge} transactions, blocking autovacuum and driving catastrophic primary table bloat.`
+            );
+            recommendations.push(
+              'Immediately terminate long-running standby transactions and evaluate disabling hot_standby_feedback on analytical nodes.'
+            );
+          }
+
+          // Invariant 4: Replication slot disk safety
+          if (maxSlotWalKeepSizeMb <= 0) {
+            violations.push(
+              'UNBOUNDED_REPLICATION_SLOT: Primary max_slot_wal_keep_size is unset or -1. A stalled standby will accumulate WAL until primary disk reaches 100% and crashes.'
+            );
+            recommendations.push(
+              'Set max_slot_wal_keep_size = 50GB on Primary to enforce hard disk safety boundaries.'
+            );
+          }
+
+          // Invariant 5: Client retry interceptor
+          if (!hasClientRetryInterceptor) {
+            violations.push(
+              'MISSING_CLIENT_RECOVERY_RETRY_HARNESS: Client code lacks interceptors for SQLSTATE 40001/57014 recovery conflicts, causing unhandled 500 crashes.'
+            );
+            recommendations.push(
+              'Wrap replica queries in a retry interceptor applying decorrelated exponential jitter before falling back to primary.'
+            );
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                status: violations.length === 0 ? 'COMPLIANT' : 'CRITICAL_RISKS_DETECTED',
+                violationsCount: violations.length,
+                violations,
+                recommendations,
+                assessment: {
+                  isTimeoutLadderSafe: statementTimeoutMs < maxStandbyStreamingDelayMs,
+                  isPrimaryBloatProtected: !hotStandbyFeedback || (idleInTransactionTimeoutMs <= 10000 && oldestStandbyXminAge < 500000),
+                  isStorageProtected: maxSlotWalKeepSizeMb > 0,
+                  isClientResilient: hasClientRetryInterceptor,
+                },
+              }, null, 2),
+            }],
+          };
+        }
+      );
     }
     ```

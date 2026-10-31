@@ -4206,3 +4206,53 @@ alwaysApply: false
       return { inserted: results.length };
     });
     ```
+
+- **Nuxt 3 Nitro Server Database Read Replica Standby Recovery Conflict Defense**:
+  - ❌ **Anti-Pattern: Unhandled Recovery Aborts & Primary Flooding in SSR Handlers**:
+    - Querying read replicas directly from Nitro routes without catching SQLSTATE `40001` or `57014` (`canceling statement due to conflict with recovery`), causing intermittent HTTP 500 errors during peak primary write traffic.
+    - Catching replica errors and instantly falling back to the Primary writer for all requests without jitter or rate limiting, triggering a cascading thundering herd that takes down the Primary database.
+  - ✅ **Production Invariant**:
+    - Wrap Nitro read queries in a resilient helper that detects recovery conflict signatures, executes decorrelated exponential jitter retries on the replica, and falls back to primary only as a circuit-broken last resort.
+    ```typescript
+    // server/utils/resilient-replica-query.ts
+    // Nitro utility executing resilient reads across PostgreSQL read replicas
+    import { getReplicaClient, getPrimaryClient } from '~/server/utils/db';
+
+    export async function executeResilientReplicaRead<T>(
+      queryBuilder: (sql: any) => Promise<T>,
+      options = { maxRetries: 3, baseDelayMs: 50, maxDelayMs: 2000, allowFallback: true }
+    ): Promise<T> {
+      const replicaSql = getReplicaClient();
+      let delay = options.baseDelayMs;
+
+      for (let attempt = 1; attempt <= options.maxRetries; attempt++) {
+        try {
+          return await queryBuilder(replicaSql);
+        } catch (error: any) {
+          const code = error?.code;
+          const msg = (error?.message || '').toLowerCase();
+          const detail = (error?.detail || '').toLowerCase();
+          const isRecoveryConflict =
+            (code === '40001' || code === '57014') &&
+            (msg.includes('conflict with recovery') || detail.includes('conflict with recovery'));
+
+          if (!isRecoveryConflict) throw error;
+
+          if (attempt === options.maxRetries) {
+            if (options.allowFallback) {
+              const primarySql = getPrimaryClient();
+              return await queryBuilder(primarySql);
+            }
+            throw error;
+          }
+
+          // Decorrelated jitter backoff: min(maxDelay, random(baseDelay, prev * 3))
+          const high = Math.min(options.maxDelayMs, delay * 3);
+          delay = Math.floor(options.baseDelayMs + Math.random() * (high - options.baseDelayMs + 1));
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+      }
+
+      throw new Error('Standby recovery conflict retries exhausted');
+    }
+    ```

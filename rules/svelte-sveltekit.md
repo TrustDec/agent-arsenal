@@ -4947,5 +4947,49 @@ alwaysApply: false
           client.release();
         }
       },
+
+      // Form action handling read replica recovery conflict resilient retry
+      queryStandbyWithRetry: async ({ request, locals }) => {
+        const replicaPool = locals.replicaDbPool;
+        const primaryPool = locals.dbPool;
+        let delayMs = 50;
+        const maxRetries = 3;
+
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+          let client;
+          try {
+            client = await replicaPool.connect();
+            // Bound statement execution strictly under max_standby_streaming_delay
+            await client.query("SET LOCAL statement_timeout = '12000ms'");
+            const res = await client.query('SELECT id, status, updated_at FROM active_jobs ORDER BY id DESC LIMIT 50');
+            return { success: true, jobs: res.rows };
+          } catch (err: any) {
+            const isConflict =
+              (err.code === '40001' || err.code === '57014') &&
+              err.message?.toLowerCase().includes('conflict with recovery');
+
+            if (!isConflict || attempt === maxRetries) {
+              if (isConflict && primaryPool) {
+                // Circuit-broken fallback to primary writer
+                const pClient = await primaryPool.connect();
+                try {
+                  const pRes = await pClient.query('SELECT id, status, updated_at FROM active_jobs ORDER BY id DESC LIMIT 50');
+                  return { success: true, jobs: pRes.rows, fallbackToPrimary: true };
+                } finally {
+                  pClient.release();
+                }
+              }
+              return fail(500, { message: `Standby read failed: ${err.message}` });
+            }
+
+            // Decorrelated jitter retry
+            const high = Math.min(2000, delayMs * 3);
+            delayMs = Math.floor(50 + Math.random() * (high - 50 + 1));
+            await new Promise((r) => setTimeout(r, delayMs));
+          } finally {
+            if (client) client.release();
+          }
+        }
+      },
     };
     ```

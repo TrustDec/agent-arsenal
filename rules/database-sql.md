@@ -3635,6 +3635,22 @@ alwaysApply: false
     - Wrap pipelined operations with transactional savepoints (`SAVEPOINT sp_k`) when partial batch recovery is required, isolating `PGRES_PIPELINE_ABORTED` failures without invalidating entire batches.
     - Explicitly configure client TCP dialers with `TCP_NODELAY = true` and `keepAlive = true` to eradicate 40ms delayed ACK latency cliffs.
 
+- **Database Standby Recovery Conflicts, Snapshot Isolation, `hot_standby_feedback`, Buffer Pin Contention & WAL Replay Starvation Defense**:
+  - ❌ **Anti-Pattern: Standby Query Cancellation Storms, Pinned Primary Vacuum Horizons & Replication Slot Loss**:
+    - Allowing unindexed or long-running read queries on read replicas to exceed `max_standby_streaming_delay` (default 30s), triggering continuous `canceling statement due to conflict with recovery` (SQLSTATE `40001` / `57014`) failures when primary `VACUUM` WAL records clean dead tuples.
+    - Enabling `hot_standby_feedback = on` on read replicas without transaction timeouts or primary bloat monitors; when an unindexed analytical query or forgotten transaction runs for 45 minutes on the replica, it pins the primary's `$x_{\text{min}}$` vacuum horizon, accumulating millions of dead tuples on the primary, degrading B-tree indexes, and pushing the cluster toward XID wraparound emergency shutdowns.
+    - Setting replica `statement_timeout` higher than `max_standby_streaming_delay`, causing queries to stall the replica recovery startup process and create multi-minute replication lag spikes before being killed.
+    - Assuming `hot_standby_feedback = on` protects against buffer pin conflicts, when exclusive page reorganizations during WAL replay kill queries holding buffer pins during sequential table scans regardless of feedback.
+    - Omitting `max_slot_wal_keep_size` on the primary, allowing lagging standby nodes to retain WAL segments until primary disk reaches 100% and crashes the postmaster; or conversely, failing to monitor `wal_status = lost` when replication slots are invalidated.
+    - Failing to implement client-side retry harnesses catching recovery conflicts, treating intentional replica concurrency aborts as unhandled 500 errors or cascading queries to the primary writer in a thundering herd.
+  - ✅ **Production Invariant**:
+    - Strictly enforce the timeout ladder invariant on read replicas: `statement_timeout < max_standby_streaming_delay` (e.g. `statement_timeout = 15s`, `max_standby_streaming_delay = 30s`), guaranteeing queries fail fast or finish before stalling the recovery engine.
+    - Architect a dual-tier replica topology: OLTP Replicas with `hot_standby_feedback = on` and `statement_timeout = 5s` for high-concurrency API reads; Analytical Replicas with `hot_standby_feedback = off` and elevated `max_standby_streaming_delay = 15min` for heavy batch aggregations, completely shielding the primary from bloat.
+    - Enforce `idle_in_transaction_session_timeout = 5s` on all read replicas to prevent idle transactions from pinning upstream Primary vacuum horizons.
+    - Enforce `max_slot_wal_keep_size = 50GB` on the primary to protect write storage from catastrophic disk full panics while monitoring `pg_replication_slots.wal_status`.
+    - Implement driver-level recovery conflict retry middleware catching SQLSTATE `40001`/`57014` with message `conflict with recovery`, applying decorrelated exponential jitter $\tau_k = \min(T_{\max}, \mathcal{U}(T_{\text{base}}, \tau_{k-1} \times 3))$ with rate-limited fallback to the primary writer.
+
+
 
 
 
