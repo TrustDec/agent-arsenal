@@ -4423,5 +4423,44 @@ alwaysApply: false
           return fail(500, { message: 'Account registration failed.' });
         }
       },
+
+      // Cycle-safe organizational hierarchy loader
+      // Uses PostgreSQL 14+ CYCLE clause and bounded depth fence to prevent infinite recursion on cyclic edges.
+      getDepartmentTree: async ({ url, locals }) => {
+        const tenantId = locals.tenantId;
+        const rootId = url.searchParams.get('rootId');
+        if (!tenantId || !rootId) {
+          return fail(400, { message: 'Missing tenantId or rootId' });
+        }
+
+        try {
+          const nodes = await locals.db.manyOrNone(
+            `WITH RECURSIVE org_tree AS (
+               SELECT id, parent_id, name, 1 AS depth
+               FROM departments
+               WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL
+
+               UNION ALL
+
+               SELECT d.id, d.parent_id, d.name, t.depth + 1
+               FROM departments d
+               JOIN org_tree t ON d.parent_id = t.id
+               WHERE d.tenant_id = $1 
+                 AND d.deleted_at IS NULL
+                 AND t.depth < 25
+             )
+             CYCLE id SET is_cycle USING path
+             SELECT id, parent_id, name, depth
+             FROM org_tree
+             WHERE NOT is_cycle
+             ORDER BY depth ASC, name ASC;`,
+            [tenantId, rootId]
+          );
+
+          return { success: true, nodes };
+        } catch (err: any) {
+          return fail(500, { message: `Failed to load hierarchy: ${err.message}` });
+        }
+      },
     };
     ```

@@ -3513,4 +3513,50 @@ alwaysApply: false
         client.release();
       }
     });
+
+    // server/api/analytics/customer-summary.get.ts
+    // Invariant: CTE with explicit "AS NOT MATERIALIZED" ensuring predicate pushdown
+    // and preventing the 2+ reference implicit materialization disk spill trap.
+    export const getCustomerSummaryHandler = defineEventHandler(async (event) => {
+      const query = getQuery(event);
+      const tenantId = query.tenantId as string;
+      if (!tenantId) {
+        throw createError({ statusCode: 400, message: 'Missing tenantId query parameter' });
+      }
+
+      const client = await useDatabase().connect();
+      try {
+        const sql = `
+          WITH customer_metrics AS NOT MATERIALIZED (
+            SELECT 
+              customer_id,
+              COUNT(id) AS total_orders,
+              COALESCE(SUM(total_amount), 0) AS lifetime_spend,
+              MAX(created_at) AS last_order_date
+            FROM orders
+            WHERE tenant_id = $1
+            GROUP BY customer_id
+          )
+          SELECT 
+            c.id,
+            c.email,
+            c.name,
+            m.total_orders,
+            m.lifetime_spend,
+            m.last_order_date
+          FROM customers c
+          JOIN customer_metrics m ON m.customer_id = c.id
+          WHERE c.tenant_id = $1
+            AND c.status = 'ACTIVE'
+          ORDER BY m.lifetime_spend DESC
+          LIMIT 100;
+        `;
+        const result = await client.query(sql, [tenantId]);
+        return { success: true, count: result.rowCount, customers: result.rows };
+      } catch (err: any) {
+        throw createError({ statusCode: 500, message: `Failed to fetch customer summary: ${err.message}` });
+      } finally {
+        client.release();
+      }
+    });
     ```

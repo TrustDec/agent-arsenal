@@ -3971,5 +3971,78 @@ alwaysApply: false
           }
         }
       );
+
+      // Diagnostic Tool: Inspect CTE Materialization, Inlining & Recursive Safety
+      server.tool(
+        'inspect_cte_optimization_safety',
+        'Audits SQL queries containing CTEs (WITH queries) for implicit materialization bloat, predicate blockade, unhedged volatile functions, and unbounded recursion cycles',
+        {
+          sqlQuery: z.string().describe('Target SQL query text containing WITH or WITH RECURSIVE'),
+        },
+        async ({ sqlQuery }) => {
+          const normalized = sqlQuery.replace(/\s+/g, ' ').trim();
+          const isCTE = /\bWITH\b/i.test(normalized);
+          const isRecursive = /\bWITH\s+RECURSIVE\b/i.test(normalized);
+          const warnings: string[] = [];
+          const recommendations: string[] = [];
+
+          if (!isCTE) {
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({ isCTE: false, message: 'Query does not contain Common Table Expressions (WITH).' }, null, 2),
+              }],
+            };
+          }
+
+          if (isRecursive) {
+            const hasCycle = /\bCYCLE\b/i.test(normalized);
+            const hasDepthGuard = /\b(depth\s*<|LIMIT\b)/i.test(normalized);
+            if (!hasCycle && !hasDepthGuard) {
+              warnings.push(
+                'UNBOUNDED_RECURSIVE_CTE: Recursive CTE lacks PostgreSQL 14+ CYCLE clause and depth fence. ' +
+                'Cyclic references will cause infinite loops and crash backend memory.'
+              );
+              recommendations.push('Add "CYCLE <pk_col> SET is_cycle USING path" and "WHERE NOT is_cycle".');
+            }
+          }
+
+          // Check for outer WHERE against MATERIALIZED CTE
+          if (/\bAS\s+MATERIALIZED\b/i.test(normalized)) {
+            const hasOuterWhere = /\bSELECT\b.*\bFROM\b.*\bWHERE\b/i.test(normalized);
+            if (hasOuterWhere) {
+              warnings.push(
+                'MATERIALIZED_OPTIMIZATION_FENCE: Query declares AS MATERIALIZED and applies outer WHERE filters. ' +
+                'The optimization fence blocks predicate pushdown, forcing full table scans inside the CTE.'
+              );
+              recommendations.push('Change to "AS NOT MATERIALIZED" or hoist filters directly into the CTE body.');
+            }
+          }
+
+          // Check for volatile functions in inlined CTEs
+          const hasVolatile = /\b(gen_random_uuid\(\)|random\(\)|clock_timestamp\(\)|nextval\()/i.test(normalized);
+          if (hasVolatile && !/\bAS\s+MATERIALIZED\b/i.test(normalized)) {
+            warnings.push(
+              'VOLATILE_FUNCTION_INLINING: CTE contains volatile functions without AS MATERIALIZED. ' +
+              'The planner may re-evaluate the function multiple times per outer row, producing inconsistent values.'
+            );
+            recommendations.push('Declare CTE "AS MATERIALIZED" to force single-pass evaluation.');
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                isCTE: true,
+                isRecursive,
+                warningsCount: warnings.length,
+                warnings,
+                recommendations,
+                status: warnings.length === 0 ? 'OPTIMAL' : 'REMEDIATION_REQUIRED',
+              }, null, 2),
+            }],
+          };
+        }
+      );
     }
     ```

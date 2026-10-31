@@ -5506,4 +5506,67 @@ func CreateActiveUserSafely(
 	}
 	return userID, nil
 }
+
+// OrgHierarchyNode represents a node in an organizational hierarchy.
+type OrgHierarchyNode struct {
+	ID       string  `json:"id"`
+	ParentID *string `json:"parent_id"`
+	Name     string  `json:"name"`
+	Depth    int     `json:"depth"`
+}
+
+// FetchOrgHierarchyCycleSafe queries a recursive department tree with PostgreSQL 14+ CYCLE detection
+// and a hard depth boundary, preventing infinite loops on cyclic edges.
+func FetchOrgHierarchyCycleSafe(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	tenantID string,
+	rootID string,
+	maxDepth int,
+) ([]OrgHierarchyNode, error) {
+	if maxDepth <= 0 || maxDepth > 50 {
+		maxDepth = 25
+	}
+
+	query := `
+		WITH RECURSIVE org_tree AS (
+			SELECT id, parent_id, name, 1 AS depth
+			FROM departments
+			WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL
+
+			UNION ALL
+
+			SELECT d.id, d.parent_id, d.name, t.depth + 1
+			FROM departments d
+			JOIN org_tree t ON d.parent_id = t.id
+			WHERE d.tenant_id = $1 
+			  AND d.deleted_at IS NULL
+			  AND t.depth < $3
+		)
+		CYCLE id SET is_cycle USING path
+		SELECT id, parent_id, name, depth
+		FROM org_tree
+		WHERE NOT is_cycle
+		ORDER BY depth ASC, name ASC;
+	`
+
+	rows, err := pool.Query(ctx, query, tenantID, rootID, maxDepth)
+	if err != nil {
+		return nil, fmt.Errorf("fetch org hierarchy: %w", err)
+	}
+	defer rows.Close()
+
+	var nodes []OrgHierarchyNode
+	for rows.Next() {
+		var node OrgHierarchyNode
+		if err := rows.Scan(&node.ID, &node.ParentID, &node.Name, &node.Depth); err != nil {
+			return nil, fmt.Errorf("scan org node: %w", err)
+		}
+		nodes = append(nodes, node)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate org nodes: %w", err)
+	}
+	return nodes, nil
+}
 ```

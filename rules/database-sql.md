@@ -3304,3 +3304,51 @@ alwaysApply: false
     FROM pg_stat_user_tables
     WHERE relname IN ('tasks', 'users', 'orders');
     ```
+
+- **Common Table Expressions (CTEs), Materialization Controls, Inlining Optimization Fences & Recursive Cycle Defense**:
+  - ❌ **Anti-Pattern: Multiple-Reference Implicit Materialization & Unbounded Recursive Loop**:
+    - Re-referencing a CTE without declaring `AS MATERIALIZED` or `AS NOT MATERIALIZED`: in PostgreSQL 12+, referencing a CTE $\ge 2$ times causes the planner to automatically materialize it into a temporary tuplestore, blowing out `work_mem`, spilling to disk, and stripping index scans from outer joins.
+    - Filtering by `tenant_id` in the outer query while declaring `AS MATERIALIZED` inside the CTE: the optimization fence blocks predicate pushdown, forcing a full table scan across all tenants.
+    - Inlining CTEs with volatile functions like `gen_random_uuid()` or `random()`, causing the function to re-evaluate for every outer row and breaking consistency.
+    - Writing `WITH RECURSIVE` without cycle detection, causing cyclic graphs to trigger infinite loops, memory exhaustion, and OOM postmaster crashes.
+  - ✅ **Production Invariant**:
+    - Explicitly declare `AS NOT MATERIALIZED` when predicate pushdown and index scans must cross CTE boundaries.
+    - Explicitly declare `AS MATERIALIZED` when isolating expensive calculations or volatile functions (`uuid`, `random`) that must evaluate strictly once.
+    - On recursive queries, mandate PostgreSQL 14+ `CYCLE id SET is_cycle USING path` and a depth boundary `WHERE depth < :max_depth`.
+    - On data-modifying CTEs (`WITH deleted AS (DELETE ...) INSERT INTO ...`), consume mutations strictly via `RETURNING` clauses; never query the modified table within the same statement expecting to see CTE mutations.
+
+    ```sql
+    -- 1. Explicit Inlining for Predicate Pushdown and Index Usage
+    WITH customer_metrics AS NOT MATERIALIZED (
+      SELECT 
+        customer_id,
+        count(id) AS total_orders,
+        sum(total_amount) AS lifetime_spend
+      FROM orders
+      WHERE created_at >= NOW() - INTERVAL '90 days'
+      GROUP BY customer_id
+    )
+    SELECT c.id, c.email, m.total_orders, m.lifetime_spend
+    FROM customers c
+    JOIN customer_metrics m ON m.customer_id = c.id
+    WHERE c.tenant_id = 'tenant_123';
+
+    -- 2. Cycle-Safe Recursive CTE with Depth Fence
+    WITH RECURSIVE org_hierarchy AS (
+      SELECT id, parent_id, name, 1 AS depth
+      FROM departments
+      WHERE tenant_id = 'tenant_123' AND parent_id IS NULL
+      
+      UNION ALL
+      
+      SELECT d.id, d.parent_id, d.name, h.depth + 1
+      FROM departments d
+      JOIN org_hierarchy h ON d.parent_id = h.id
+      WHERE d.tenant_id = 'tenant_123'
+        AND h.depth < 25 -- Depth fence
+    )
+    CYCLE id SET is_cycle USING path
+    SELECT id, parent_id, name, depth, path
+    FROM org_hierarchy
+    WHERE NOT is_cycle;
+    ```
