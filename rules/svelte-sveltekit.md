@@ -5349,4 +5349,108 @@ In SvelteKit administrative consoles and system diagnostics:
   </div>
   ```
 
+- **PostgreSQL B-Tree Deduplication & Posting List Health Card (Svelte 5 Runes)**:
+  - Implement a real-time reactive card tracking B-Tree deduplication efficiency, highlighting indexes suffering from high-entropy candidate search CPU penalties or uncompressed low-cardinality bloat using Svelte 5 `$state` and `$derived`.
+
+  ```svelte
+  <!-- src/lib/components/BTreeDedupHealthCard.svelte -->
+  <script lang="ts">
+    export interface BTreeAuditItem {
+      indexName: string;
+      tableName: string;
+      indexSizeMb: number;
+      cardinalityRatio: number;
+      deduplicationEnabled: boolean;
+      fillfactor: number;
+      status: 'OPTIMAL' | 'HIGH_ENTROPY_CPU_PENALTY' | 'UNCOMPRESSED_LOW_CARDINALITY' | 'SUBOPTIMAL_FILLFACTOR';
+      action: string;
+      recommendedDdl: string;
+    }
+
+    interface Props {
+      items: BTreeAuditItem[];
+    }
+
+    let { items }: Props = $props();
+    let copiedIndex = $state<string | null>(null);
+
+    let actionableCount = $derived(
+      items.filter(i => i.status !== 'OPTIMAL').length
+    );
+
+    async function copyDdl(item: BTreeAuditItem) {
+      if (!item.recommendedDdl) return;
+      await navigator.clipboard.writeText(item.recommendedDdl);
+      copiedIndex = item.indexName;
+      setTimeout(() => {
+        copiedIndex = null;
+      }, 2000);
+    }
+  </script>
+
+  <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 shadow-xs">
+    <div class="flex items-center justify-between border-b border-zinc-100 dark:border-zinc-800 pb-3">
+      <div>
+        <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">B-Tree Deduplication & Posting Lists</h3>
+        <p class="text-xs text-zinc-500 mt-0.5">PostgreSQL 13+ index compression and entropy governor</p>
+      </div>
+      <div>
+        {#if actionableCount > 0}
+          <span class="px-2 py-0.5 rounded-full text-2xs font-medium bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20">
+            {actionableCount} Actionable
+          </span>
+        {:else}
+          <span class="px-2 py-0.5 rounded-full text-2xs font-medium bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
+            Optimal
+          </span>
+        {/if}
+      </div>
+    </div>
+
+    {#if items.length === 0}
+      <div class="py-6 text-center text-xs text-zinc-400">
+        No non-unique B-Tree indexes found or audit pending.
+      </div>
+    {:else}
+      <div class="divide-y divide-zinc-100 dark:divide-zinc-800">
+        {#each items as item (item.indexName)}
+          <div class="py-3 space-y-2">
+            <div class="flex items-center justify-between text-xs font-mono">
+              <span class="font-semibold text-zinc-800 dark:text-zinc-200">{item.indexName} ({item.tableName})</span>
+              <div class="flex items-center gap-2 text-2xs">
+                <span class="text-zinc-500">{item.indexSizeMb.toFixed(1)} MB</span>
+                <span
+                  class="px-1.5 py-0.5 rounded font-mono"
+                  class:bg-rose-500-10={item.status === 'HIGH_ENTROPY_CPU_PENALTY'}
+                  class:text-rose-500={item.status === 'HIGH_ENTROPY_CPU_PENALTY'}
+                  class:bg-amber-500-10={item.status === 'UNCOMPRESSED_LOW_CARDINALITY' || item.status === 'SUBOPTIMAL_FILLFACTOR'}
+                  class:text-amber-500={item.status === 'UNCOMPRESSED_LOW_CARDINALITY' || item.status === 'SUBOPTIMAL_FILLFACTOR'}
+                  class:bg-emerald-500-10={item.status === 'OPTIMAL'}
+                  class:text-emerald-500={item.status === 'OPTIMAL'}
+                >
+                  {item.status}
+                </span>
+              </div>
+            </div>
+
+            {#if item.recommendedDdl}
+              <div class="relative">
+                <pre class="p-2.5 rounded-lg bg-zinc-950 text-zinc-200 font-mono text-2xs overflow-x-auto leading-relaxed">{item.recommendedDdl}</pre>
+                <button
+                  type="button"
+                  onclick={() => copyDdl(item)}
+                  class="absolute top-2 right-2 px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-2xs font-sans transition-colors"
+                >
+                  {copiedIndex === item.indexName ? '✓ Copied' : 'Copy DDL'}
+                </button>
+              </div>
+            {/if}
+          </div>
+        {/each}
+      </div>
+    {/if}
+  </div>
+  ```
+
+
 

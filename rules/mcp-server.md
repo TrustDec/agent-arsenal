@@ -5500,3 +5500,116 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
   }
   ```
 
+- **PostgreSQL B-Tree Index Deduplication & Posting Split Audit Tool**:
+  - Expose an MCP tool `audit_btree_deduplication` that inspects PostgreSQL non-unique B-Tree indexes, computes cardinality ratios from `pg_stats`, checks `deduplicate_items` and `fillfactor` configurations, and outputs actionable online concurrent reindexing recommendations.
+
+  ```typescript
+  // src/tools/audit_btree_deduplication.ts
+  import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+  import { z } from 'zod';
+  import { Pool } from 'pg';
+
+  export function registerBTreeDedupAuditTool(server: McpServer, pool: Pool): void {
+    server.tool(
+      'audit_btree_deduplication',
+      'Audits PostgreSQL B-Tree indexes for deduplication efficiency, high-entropy CPU burn risks, and fillfactor headroom',
+      {
+        schema: z.string().optional().default('public').describe('Database schema name to audit'),
+        minTableRows: z.number().optional().default(5000).describe('Minimum table row count for inclusion'),
+      },
+      async ({ schema, minTableRows }) => {
+        const client = await pool.connect();
+        try {
+          const auditSql = `
+            SELECT
+              c.relname AS index_name,
+              t.relname AS table_name,
+              COALESCE(
+                (SELECT option_value = 'true' OR option_value = 'on'
+                 FROM pg_options_to_table(c.reloptions)
+                 WHERE option_name = 'deduplicate_items'),
+                true
+              ) AS dedup_enabled,
+              COALESCE(
+                (SELECT option_value::int
+                 FROM pg_options_to_table(c.reloptions)
+                 WHERE option_name = 'fillfactor'),
+                100
+              ) AS current_fillfactor,
+              ROUND((pg_relation_size(c.oid)::numeric / 1024 / 1024), 2)::float8 AS index_size_mb,
+              COALESCE(
+                (SELECT ABS(s.n_distinct)::float8 / NULLIF(t.reltuples, 0)::float8
+                 FROM pg_stats s
+                 WHERE s.schemaname = $1 AND s.tablename = t.relname AND s.attname = pg_get_indexdef(ix.indexrelid, 1, true)),
+                1.0
+              ) AS cardinality_ratio
+            FROM pg_index ix
+            JOIN pg_class c ON c.oid = ix.indexrelid
+            JOIN pg_class t ON t.oid = ix.indrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            JOIN pg_am am ON am.oid = c.relam
+            WHERE n.nspname = $1
+              AND am.amname = 'btree'
+              AND NOT ix.indisunique
+              AND t.reltuples >= $2;
+          `;
+
+          const res = await client.query(auditSql, [schema, minTableRows]);
+          const findings = res.rows.map(row => {
+            const cardRatio = Number(row.cardinality_ratio);
+            const dedup = Boolean(row.dedup_enabled);
+            const fillfactor = Number(row.current_fillfactor);
+            const idx = row.index_name;
+
+            let status = 'OPTIMAL';
+            let action = 'No changes required.';
+            let recommendedDdl = '';
+
+            if (cardRatio > 0.10 && dedup) {
+              status = 'HIGH_ENTROPY_CPU_PENALTY';
+              action = 'Disable deduplication to stop useless candidate search loops on writes.';
+              recommendedDdl = `ALTER INDEX "${schema}"."${idx}" SET (deduplicate_items = off); SET lock_timeout = '2s'; REINDEX INDEX CONCURRENTLY "${schema}"."${idx}";`;
+            } else if (cardRatio <= 0.05 && !dedup) {
+              status = 'UNCOMPRESSED_LOW_CARDINALITY';
+              action = 'Enable deduplication to achieve 60%-75% physical storage reduction.';
+              recommendedDdl = `ALTER INDEX "${schema}"."${idx}" SET (deduplicate_items = on, fillfactor = 90); SET lock_timeout = '2s'; REINDEX INDEX CONCURRENTLY "${schema}"."${idx}";`;
+            } else if (dedup && fillfactor >= 100) {
+              status = 'SUBOPTIMAL_FILLFACTOR';
+              action = 'Set fillfactor = 90 to reserve headroom for posting list growth and avoid leaf splits.';
+              recommendedDdl = `ALTER INDEX "${schema}"."${idx}" SET (fillfactor = 90);`;
+            }
+
+            return {
+              indexName: idx,
+              tableName: row.table_name,
+              indexSizeMb: row.index_size_mb,
+              cardinalityRatio: cardRatio,
+              deduplicationEnabled: dedup,
+              fillfactor,
+              status,
+              action,
+              recommendedDdl,
+            };
+          });
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                schema,
+                auditedIndexCount: findings.length,
+                actionableIndexes: findings.filter(f => f.status !== 'OPTIMAL').length,
+                results: findings,
+                productionNotice: 'Always execute REINDEX CONCURRENTLY with SET lock_timeout = 2s outside transaction blocks.',
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
+  }
+  ```
+
+

@@ -7274,4 +7274,156 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **PostgreSQL B-Tree Deduplication & Posting List Split Health Watchdog**:
+  - Implement automated B-tree index deduplication audits and online safe reindexing using `jackc/pgx/v5`.
+  - Disable deduplication on high-entropy unique columns ($K/N > 0.10$) to eliminate insertion candidate scan CPU burn, and enforce `fillfactor = 90` on deduplicated low-cardinality indexes to absorb duplicate bursts without page splits.
+
+  ```go
+  // internal/store/btree_dedup_watchdog.go
+  package store
+
+  import (
+  	"context"
+  	"fmt"
+  	"log/slog"
+  	"time"
+
+  	"github.com/jackc/pgx/v5/pgxpool"
+  )
+
+  type BTreeAuditRecord struct {
+  	IndexName        string  `json:"index_name"`
+  	TableName        string  `json:"table_name"`
+  	DedupEnabled     bool    `json:"dedup_enabled"`
+  	Fillfactor       int     `json:"fillfactor"`
+  	IndexSizeBytes   int64   `json:"index_size_bytes"`
+  	CardinalityRatio float64 `json:"cardinality_ratio"`
+  	ActionNeeded     string  `json:"action_needed"`
+  }
+
+  type BTreeDedupWatchdog struct {
+  	pool   *pgxpool.Pool
+  	logger *slog.Logger
+  }
+
+  func NewBTreeDedupWatchdog(pool *pgxpool.Pool, logger *slog.Logger) *BTreeDedupWatchdog {
+  	if logger == nil {
+  		logger = slog.Default()
+  	}
+  	return &BTreeDedupWatchdog{pool: pool, logger: logger}
+  }
+
+  // AuditDeduplication scans non-unique B-tree indexes and categorizes entropy & split risk.
+  func (w *BTreeDedupWatchdog) AuditDeduplication(ctx context.Context, schema string) ([]BTreeAuditRecord, error) {
+  	query := `
+  		SELECT
+  			c.relname AS index_name,
+  			t.relname AS table_name,
+  			COALESCE(
+  				(SELECT option_value = 'true' OR option_value = 'on'
+  				 FROM pg_options_to_table(c.reloptions)
+  				 WHERE option_name = 'deduplicate_items'),
+  				true
+  			) AS dedup_enabled,
+  			COALESCE(
+  				(SELECT option_value::int
+  				 FROM pg_options_to_table(c.reloptions)
+  				 WHERE option_name = 'fillfactor'),
+  				100
+  			) AS current_fillfactor,
+  			pg_relation_size(c.oid)::bigint AS index_bytes,
+  			COALESCE(
+  				(SELECT ABS(s.n_distinct)::float8 / NULLIF(t.reltuples, 0)::float8
+  				 FROM pg_stats s
+  				 WHERE s.schemaname = $1 AND s.tablename = t.relname AND s.attname = pg_get_indexdef(ix.indexrelid, 1, true)),
+  				1.0
+  			) AS cardinality_ratio
+  		FROM pg_index ix
+  		JOIN pg_class c ON c.oid = ix.indexrelid
+  		JOIN pg_class t ON t.oid = ix.indrelid
+  		JOIN pg_namespace n ON n.oid = t.relnamespace
+  		JOIN pg_am am ON am.oid = c.relam
+  		WHERE n.nspname = $1
+  		  AND am.amname = 'btree'
+  		  AND NOT ix.indisunique
+  		  AND t.reltuples > 5000;
+  	`
+
+  	rows, err := w.pool.Query(ctx, query, schema)
+  	if err != nil {
+  		return nil, fmt.Errorf("dedup audit query failed: %w", err)
+  	}
+  	defer rows.Close()
+
+  	var records []BTreeAuditRecord
+  	for rows.Next() {
+  		var r BTreeAuditRecord
+  		if err := rows.Scan(
+  			&r.IndexName,
+  			&r.TableName,
+  			&r.DedupEnabled,
+  			&r.Fillfactor,
+  			&r.IndexSizeBytes,
+  			&r.CardinalityRatio,
+  		); err != nil {
+  			return nil, fmt.Errorf("scan error: %w", err)
+  		}
+
+  		if r.CardinalityRatio > 0.10 && r.DedupEnabled {
+  			r.ActionNeeded = "DISABLE_DEDUP_HIGH_ENTROPY"
+  		} else if r.CardinalityRatio <= 0.05 && !r.DedupEnabled {
+  			r.ActionNeeded = "ENABLE_DEDUP_COMPRESSION"
+  		} else if r.DedupEnabled && r.Fillfactor >= 100 {
+  			r.ActionNeeded = "REDUCE_FILLFACTOR_90"
+  		} else {
+  			r.ActionNeeded = "OPTIMAL"
+  		}
+  		records = append(records, r)
+  	}
+
+  	return records, rows.Err()
+  }
+
+  // ReindexConcurrently applies options and triggers concurrent rebuild with safety timeouts.
+  func (w *BTreeDedupWatchdog) ReindexConcurrently(ctx context.Context, schema, indexName string, dedup bool, fillfactor int) error {
+  	dedupStr := "off"
+  	if dedup {
+  		dedupStr = "on"
+  	}
+
+  	// 1. Update index options within a transaction guarded by lock_timeout
+  	tx, err := w.pool.Begin(ctx)
+  	if err != nil {
+  		return err
+  	}
+  	defer tx.Rollback(ctx)
+
+  	if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '2s';"); err != nil {
+  		return err
+  	}
+
+  	alterSql := fmt.Sprintf(`ALTER INDEX "%s"."%s" SET (deduplicate_items = %s, fillfactor = %d);`, schema, indexName, dedupStr, fillfactor)
+  	if _, err := tx.Exec(ctx, alterSql); err != nil {
+  		return fmt.Errorf("alter index failed: %w", err)
+  	}
+
+  	if err := tx.Commit(ctx); err != nil {
+  		return err
+  	}
+
+  	// 2. Execute REINDEX CONCURRENTLY outside transaction block
+  	reindexSql := fmt.Sprintf(`REINDEX INDEX CONCURRENTLY "%s"."%s";`, schema, indexName)
+  	w.logger.Info("starting online concurrent reindexing", "index", indexName, "dedup", dedupStr, "fillfactor", fillfactor)
+  	start := time.Now()
+
+  	if _, err := w.pool.Exec(ctx, reindexSql); err != nil {
+  		return fmt.Errorf("reindex concurrently failed: %w", err)
+  	}
+
+  	w.logger.Info("online concurrent reindexing complete", "index", indexName, "duration", time.Since(start))
+  	return nil
+  }
+  ```
+
+
 

@@ -4592,4 +4592,110 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   </template>
   ```
 
+- **PostgreSQL B-Tree Index Deduplication & Posting List Health Card**:
+  - Implement a real-time audit card for monitoring B-Tree deduplication efficiency, highlighting indexes wasting write CPU on high-entropy unique keys, and providing one-click copyable `REINDEX CONCURRENTLY` remediation DDL.
+
+  ```vue
+  <!-- components/database/BTreeDedupHealthCard.vue -->
+  <script setup lang="ts">
+  import { ref, computed } from 'vue';
+
+  export interface BTreeAuditItem {
+    indexName: string;
+    tableName: string;
+    indexSizeMb: number;
+    cardinalityRatio: number;
+    deduplicationEnabled: boolean;
+    fillfactor: number;
+    status: 'OPTIMAL' | 'HIGH_ENTROPY_CPU_PENALTY' | 'UNCOMPRESSED_LOW_CARDINALITY' | 'SUBOPTIMAL_FILLFACTOR';
+    action: string;
+    recommendedDdl: string;
+  }
+
+  const props = defineProps<{
+    items: BTreeAuditItem[];
+    isLoading?: boolean;
+  }>();
+
+  const copiedIndex = ref<string | null>(null);
+
+  const riskCount = computed(() =>
+    props.items.filter(i => i.status !== 'OPTIMAL').length
+  );
+
+  const copyDdl = async (item: BTreeAuditItem) => {
+    if (!item.recommendedDdl) return;
+    await navigator.clipboard.writeText(item.recommendedDdl);
+    copiedIndex.value = item.indexName;
+    setTimeout(() => {
+      copiedIndex.value = null;
+    }, 2000);
+  };
+  </script>
+
+  <template>
+    <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 shadow-xs">
+      <div class="flex items-center justify-between border-b border-zinc-100 dark:border-zinc-800 pb-3">
+        <div>
+          <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">B-Tree Deduplication & Posting Lists</h3>
+          <p class="text-xs text-zinc-500 mt-0.5">PostgreSQL 13+ index compression and entropy governor</p>
+        </div>
+        <div class="flex items-center gap-2">
+          <span
+            v-if="riskCount > 0"
+            class="px-2 py-0.5 rounded-full text-2xs font-medium bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20"
+          >
+            {{ riskCount }} Actionable
+          </span>
+          <span
+            v-else
+            class="px-2 py-0.5 rounded-full text-2xs font-medium bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20"
+          >
+            Optimal
+          </span>
+        </div>
+      </div>
+
+      <div v-if="items.length === 0" class="py-8 text-center text-xs text-zinc-400">
+        No B-Tree indexes found or audit data pending.
+      </div>
+
+      <div v-else class="divide-y divide-zinc-100 dark:divide-zinc-800 mt-3">
+        <div v-for="item in items" :key="item.indexName" class="py-3">
+          <div class="flex items-center justify-between text-xs">
+            <div class="flex items-center gap-2">
+              <span class="font-mono font-semibold text-zinc-800 dark:text-zinc-200">{{ item.indexName }}</span>
+              <span class="text-2xs text-zinc-400 font-mono">({{ item.tableName }})</span>
+            </div>
+            <div class="flex items-center gap-2 text-2xs">
+              <span class="text-zinc-500">{{ item.indexSizeMb.toFixed(1) }} MB</span>
+              <span
+                class="px-1.5 py-0.5 rounded font-mono"
+                :class="{
+                  'bg-rose-500/10 text-rose-500': item.status === 'HIGH_ENTROPY_CPU_PENALTY',
+                  'bg-amber-500/10 text-amber-500': item.status === 'UNCOMPRESSED_LOW_CARDINALITY' || item.status === 'SUBOPTIMAL_FILLFACTOR',
+                  'bg-emerald-500/10 text-emerald-500': item.status === 'OPTIMAL'
+                }"
+              >
+                {{ item.status }}
+              </span>
+            </div>
+          </div>
+
+          <div v-if="item.recommendedDdl" class="mt-2 relative">
+            <pre class="p-2 rounded bg-zinc-950 text-zinc-200 font-mono text-2xs overflow-x-auto">{{ item.recommendedDdl }}</pre>
+            <button
+              @click="copyDdl(item)"
+              class="absolute top-1.5 right-1.5 px-2 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-2xs transition-colors"
+            >
+              {{ copiedIndex === item.indexName ? '✓ Copied' : 'Copy DDL' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </template>
+  ```
+
+
 

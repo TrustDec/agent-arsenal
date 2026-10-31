@@ -3724,6 +3724,22 @@ alwaysApply: false
     - Enforce **Mathematical Cardinality Crossover ($K / N \le 0.05$)**: profile column statistics in `pg_stats` (`n_distinct`); activate loose index scans strictly when distinct keys represent $\le 5\%$ of table size. For high-cardinality columns ($K / N > 0.15$), preserve standard Index Only Scans.
     - Eliminate **Application N+1 Loops**: execute group aggregation and distinct lookups in a single-roundtrip query within PostgreSQL.
 
+- **B-Tree Index Deduplication, Posting List Split Cascades & Leaf Bloat Defense (PostgreSQL 13+)**:
+  - ❌ **Anti-Pattern: Posting List Split Thrash, High-Entropy Candidate Probe Burn & INCLUDE Disqualification**:
+    - Defaulting `deduplicate_items = on` on high-entropy unique keys (UUIDv4, microsecond timestamps, crypto hashes), wasting 8%–15% CPU on every single insert in futile duplicate candidate scans (`_bt_dedup_start_pending()`) with 0% space savings.
+    - Setting default `fillfactor = 100` on deduplicated indexes experiencing high-frequency duplicate inserts, causing posting lists reaching capacity ($M_{\max} \approx 440$ TIDs) to trigger `_bt_split_posting()` which immediately cascades into physical leaf page splits and `buffer_content` latch contention.
+    - Adding volatile, rapidly mutating, or high-entropy non-key columns to `INCLUDE (...)` clauses on deduplicated indexes, disqualifying 100% of rows from deduplication while continuously burning candidate scan CPU cycles.
+    - Allowing dead TIDs from `UPDATE` and `DELETE` operations to remain trapped inside posting lists because index scans cannot mark individual TIDs as `LP_DEAD`, causing index bloat when autovacuum scale factors are uncalibrated.
+    - Reindexing synchronously via `REINDEX TABLE` or `REINDEX DATABASE` without `CONCURRENTLY`, taking `AccessExclusiveLock` and crashing OLTP connection pools.
+  - ✅ **Production Invariant**:
+    - Enforce **Entropy-Aware Deduplication Fencing**: explicitly declare `WITH (deduplicate_items = off)` on non-unique indexes over high-cardinality columns ($K / N > 0.10$, `n_distinct < 0`), eliminating unavailing candidate probe overhead on high-throughput write paths.
+    - Enforce **fillfactor = 90 on Deduplicated Indexes**: set `WITH (deduplicate_items = on, fillfactor = 90)` on low-cardinality status flags, enums, and foreign keys ($K / N \le 0.05$) to provide 10% page headroom for posting list expansion without triggering immediate leaf page splits.
+    - Enforce **INCLUDE Payload Determinism**: never place volatile timestamps or distinct attributes into `INCLUDE` clauses on deduplicated indexes; verify that non-key attributes do not break posting list coalesce eligibility.
+    - Calibrate **Proactive Autovacuum Compaction**: set `autovacuum_vacuum_scale_factor = 0.05` and `autovacuum_vacuum_cost_limit = 2000` on tables with deduplicated indexes to unpack and reclaim dead TIDs from posting lists before capacity limits are hit.
+    - Deploy **Zero-Downtime Concurrent Reindexing**: execute `SET lock_timeout = '2s'; REINDEX INDEX CONCURRENTLY idx_name;` to rebuild legacy or bloated indexes without blocking production transactions.
+    - Automate **amcheck Verification**: execute `SELECT bt_index_parent_check(c.oid, true)` in CI/CD migrations and scheduled maintenance to detect OS collation drift or corrupted posting lists before data corruption impacts queries.
+
+
 
 
 
