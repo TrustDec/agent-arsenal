@@ -265,7 +265,24 @@ Tool outputs are injected directly into LLM working memory. Poorly formatted too
 
 ---
 
-## 8. Quick Diagnostic Checklist
+## 8. Reasoning Token Budgeting, Extended Thinking (Claude 3.7 / o1 / R1) & KV Cache Isolation
+
+Modern reasoning models (Anthropic Claude 3.7 Sonnet, OpenAI o1/o3-mini, DeepSeek-R1) introduce dynamic Test-Time Compute (TTC) via internal chain-of-thought "thinking" tokens. Managing context memory with reasoning models requires strict KV cache isolation:
+
+### Ephemeral Thinking Blocks vs Context History Invariants
+- **Do Not Re-ingest Ephemeral Thinking in Long Turns**: In multi-turn chat loops, internal `<thinking>` / `reasoning_content` blocks represent intermediate scratchpads. Re-injecting tens of thousands of past thinking tokens into subsequent turns inflates token costs, exhausts context windows, and degrades KV cache reuse efficiency.
+- **Anthropic Claude 3.7 Thinking Signature Preservation**: In the Anthropic API, if you preserve thinking blocks in assistant turns to enable continuous reasoning, you MUST include the cryptographically verifiable `signature` field untouched. Stripping or altering thinking text while retaining signatures triggers `400 invalid_request_error`.
+- **Calibrated Thinking Budget Ladder**:
+  - Surgical 2-line Bug Fix / Linter Error: `budget_tokens: 1024` (or disable thinking).
+  - Algorithmic Problem Solving / Concurrency Races: `budget_tokens: 4096 - 8192`.
+  - Architecture Refactoring / Multi-Module Spec Synthesis: `budget_tokens: 16384 - 32768`.
+- **RadixAttention & Multi-Agent Swarm Prefix Sharing**:
+  - In multi-agent swarms (Supervisor, Coder, Reviewer, Tester), align the root system instructions and tool definitions bit-for-bit across all agent personas.
+  - In inference runtimes powered by RadixAttention (vLLM, SGLang), identical root prefixes share the physical GPU KV cache tree across all concurrent agent subprocesses, reducing swarm VRAM consumption by 70–85%.
+
+---
+
+## 9. Quick Diagnostic Checklist
 
 - [ ] Is the prompt prefix (system persona, rules, tool schemas) 100% deterministic and bit-for-bit identical across turns?
 - [ ] Are dynamic timestamps, UUIDs, and system metrics placed strictly at the tail of the prompt or in the uncached user turn?
@@ -274,3 +291,5 @@ Tool outputs are injected directly into LLM working memory. Poorly formatted too
 - [ ] Are high-priority operational rules located at the head (0-10%) and the target user task at the tail (85-100%) to mitigate Lost-in-the-Middle attention decay?
 - [ ] Are tool outputs bounded with line/token ceilings and stripped of ANSI escape codes?
 - [ ] When context exceeds 75% capacity, is the session compacted into a structured 4-part ground-truth checkpoint?
+- [ ] Are reasoning/thinking token budgets calibrated to task complexity, and are swarm agent prefixes unified for RadixAttention sharing?
+
