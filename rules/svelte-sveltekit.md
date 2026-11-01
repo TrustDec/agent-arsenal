@@ -9080,6 +9080,109 @@ When connecting SvelteKit server routes (`+server.ts`, `+page.server.ts`) to Pos
 </div>
 ```
 
+---
+
+### Production Database Storage Tiering & Tablespace Monitor (`DatabaseTablespaceTelemetryCard.svelte`)
+
+In Svelte 5, storage tiering telemetry and ephemeral spill monitors leverage runes (`$state`, `$derived`, `$props`) to achieve fine-grained, zero-overhead DOM updates:
+
+```svelte
+<!-- src/lib/components/database/DatabaseTablespaceTelemetryCard.svelte -->
+<script lang="ts">
+  export interface TablespaceItem {
+    name: string;
+    location: string;
+    sizeBytes: number;
+    relationCount: number;
+    isDefault: boolean;
+  }
+
+  interface Props {
+    tablespaces: TablespaceItem[];
+    tempTablespacesSetting: string;
+    tempSpillBytes: number;
+    onConfigureTemp?: () => void;
+  }
+
+  let { tablespaces, tempTablespacesSetting, tempSpillBytes, onConfigureTemp }: Props = $props();
+
+  // Derived state via Svelte 5 runes
+  let isTempConfigured = $derived(tempTablespacesSetting.trim().length > 0);
+  let isSpillDangerous = $derived(!isTempConfigured && tempSpillBytes > 500 * 1024 * 1024);
+
+  let formattedSpill = $derived.by(() => {
+    const mb = tempSpillBytes / (1024 * 1024);
+    return mb > 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${mb.toFixed(1)} MB`;
+  });
+
+  function formatBytes(bytes: number): string {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return `${(bytes / Math.pow(k, i)).toFixed(2)} ${sizes[i]}`;
+  }
+</script>
+
+<div class="rounded-xl border border-zinc-800 bg-zinc-950 p-5 shadow-sm space-y-4">
+  <div class="flex items-center justify-between">
+    <div class="flex items-center gap-2.5">
+      <div class="h-2.5 w-2.5 rounded-full {isSpillDangerous ? 'bg-rose-500 animate-pulse' : 'bg-emerald-500'}"></div>
+      <h3 class="text-sm font-semibold text-zinc-100">Storage Tiering & Tablespace Topology</h3>
+    </div>
+    <span
+      class="rounded px-2.5 py-0.5 text-xs font-mono font-medium border {isTempConfigured
+        ? 'bg-emerald-950/60 text-emerald-400 border-emerald-800/40'
+        : 'bg-rose-950/60 text-rose-400 border-rose-800/40'}"
+    >
+      {isTempConfigured ? 'TEMP ISOLATED' : 'TEMP UNISOLATED'}
+    </span>
+  </div>
+
+  {#if !isTempConfigured}
+    <div class="rounded-lg border border-rose-900/40 bg-rose-950/20 p-3 flex items-start justify-between gap-3">
+      <div class="space-y-0.5 text-xs">
+        <p class="font-medium text-rose-300">Runaway Query Ephemeral Disk Spill Risk</p>
+        <p class="text-rose-400/80">
+          temp_tablespaces is empty. Sort and hash spills ({formattedSpill}) write to primary transactional storage.
+        </p>
+      </div>
+      {#if onConfigureTemp}
+        <button
+          onclick={onConfigureTemp}
+          class="shrink-0 rounded bg-rose-900/50 px-2.5 py-1 text-xs text-rose-200 hover:bg-rose-800/70 transition font-medium"
+        >
+          Isolate Spills
+        </button>
+      {/if}
+    </div>
+  {/if}
+
+  <div class="space-y-2">
+    <div class="text-xs font-medium text-zinc-400 uppercase tracking-wider">Mounted Tablespaces</div>
+    <div class="divide-y divide-zinc-800/60 rounded-lg border border-zinc-800 bg-zinc-900/40">
+      {#each tablespaces as ts (ts.name)}
+        <div class="flex items-center justify-between p-3 text-xs">
+          <div class="space-y-0.5">
+            <div class="flex items-center gap-2">
+              <span class="font-mono font-semibold text-zinc-200">{ts.name}</span>
+              {#if ts.isDefault}
+                <span class="rounded bg-zinc-800 px-1.5 py-0.2 text-[10px] text-zinc-400">DEFAULT</span>
+              {/if}
+            </div>
+            <div class="font-mono text-[11px] text-zinc-500 truncate max-w-xs">{ts.location}</div>
+          </div>
+          <div class="text-right space-y-0.5">
+            <div class="font-mono font-medium text-zinc-200">{formatBytes(ts.sizeBytes)}</div>
+            <div class="text-[11px] text-zinc-500">{ts.relationCount} relations</div>
+          </div>
+        </div>
+      {/each}
+    </div>
+  </div>
+</div>
+```
+
 
 
 

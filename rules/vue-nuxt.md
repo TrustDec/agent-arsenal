@@ -7982,6 +7982,131 @@ const statusBadgeClass = computed(() => {
 </template>
 ```
 
+---
+
+### Production Database Storage Tiering & Tablespace Real-Time Monitor (`DatabaseTablespaceTelemetryCard.vue`)
+
+In high-throughput enterprise applications, database storage tiering and temporary spillover volumes require real-time observability to prevent sudden disk exhaustion. This component exemplifies modern Vue 3.5 / Nuxt 3 production design:
+
+```vue
+<!-- components/database/DatabaseTablespaceTelemetryCard.vue -->
+<script setup lang="ts">
+import { computed, shallowRef, onMounted, onScopeDispose } from 'vue';
+
+export interface TablespaceTelemetry {
+  name: string;
+  location: string;
+  sizeBytes: number;
+  relationCount: number;
+  isDefault: boolean;
+}
+
+export interface StorageStatus {
+  tempTablespaceConfigured: boolean;
+  tempSpillBytes: number;
+  tablespaces: TablespaceTelemetry[];
+  primaryDiskUsagePercent: number;
+}
+
+const props = defineProps<{
+  storage: StorageStatus;
+  refreshIntervalMs?: number;
+}>();
+
+const emit = defineEmits<{
+  (e: 'configureTempTablespace'): void;
+  (e: 'relocateRelation', payload: { schema: string; table: string; targetTablespace: string }): void;
+}>();
+
+// Ephemeral spill warning calculation
+const isSpillCritical = computed(() => {
+  return !props.storage.tempTablespaceConfigured && props.storage.tempSpillBytes > 500 * 1024 * 1024;
+});
+
+const formattedSpillSize = computed(() => {
+  const mb = props.storage.tempSpillBytes / (1024 * 1024);
+  return mb > 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${mb.toFixed(1)} MB`;
+});
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return `${(bytes / Math.pow(k, i)).toFixed(2)} ${sizes[i]}`;
+}
+</script>
+
+<template>
+  <div class="rounded-xl border border-zinc-800 bg-zinc-950 p-5 shadow-sm space-y-4">
+    <!-- Header -->
+    <div class="flex items-center justify-between">
+      <div class="flex items-center gap-2.5">
+        <div class="h-2.5 w-2.5 rounded-full" :class="isSpillCritical ? 'bg-rose-500 animate-pulse' : 'bg-emerald-500'" />
+        <h3 class="text-sm font-semibold text-zinc-100">Database Storage Tiering & Tablespaces</h3>
+      </div>
+      <span
+        :class="[
+          'rounded px-2.5 py-0.5 text-xs font-mono font-medium border',
+          storage.tempTablespaceConfigured
+            ? 'bg-emerald-950/60 text-emerald-400 border-emerald-800/40'
+            : 'bg-rose-950/60 text-rose-400 border-rose-800/40'
+        ]"
+      >
+        {{ storage.tempTablespaceConfigured ? 'TEMP ISOLATED' : 'TEMP UNISOLATED' }}
+      </span>
+    </div>
+
+    <!-- Storage Risk Alert Banner -->
+    <div
+      v-if="!storage.tempTablespaceConfigured"
+      class="rounded-lg border border-rose-900/40 bg-rose-950/20 p-3 flex items-start justify-between gap-3"
+    >
+      <div class="space-y-0.5 text-xs">
+        <p class="font-medium text-rose-300">Runaway Query Temp File Spill Risk</p>
+        <p class="text-rose-400/80">
+          temp_tablespaces is unset. Queries write {{ formattedSpillSize }} of spills directly to root data disk.
+        </p>
+      </div>
+      <button
+        @click="emit('configureTempTablespace')"
+        class="shrink-0 rounded bg-rose-900/50 px-2.5 py-1 text-xs text-rose-200 hover:bg-rose-800/70 transition font-medium"
+      >
+        Isolate Spills
+      </button>
+    </div>
+
+    <!-- Tablespace Roster -->
+    <div class="space-y-2">
+      <div class="text-xs font-medium text-zinc-400 uppercase tracking-wider">Configured Tablespaces</div>
+      <div class="divide-y divide-zinc-800/60 rounded-lg border border-zinc-800 bg-zinc-900/40">
+        <div
+          v-for="ts in storage.tablespaces"
+          :key="ts.name"
+          class="flex items-center justify-between p-3 text-xs"
+        >
+          <div class="space-y-0.5">
+            <div class="flex items-center gap-2">
+              <span class="font-mono font-semibold text-zinc-200">{{ ts.name }}</span>
+              <span v-if="ts.isDefault" class="rounded bg-zinc-800 px-1.5 py-0.2 text-[10px] text-zinc-400">
+                DEFAULT
+              </span>
+            </div>
+            <div class="font-mono text-[11px] text-zinc-500 truncate max-w-xs">
+              {{ ts.location }}
+            </div>
+          </div>
+          <div class="text-right space-y-0.5">
+            <div class="font-mono font-medium text-zinc-200">{{ formatBytes(ts.sizeBytes) }}</div>
+            <div class="text-[11px] text-zinc-500">{{ ts.relationCount }} relations</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+```
+
 
 
 

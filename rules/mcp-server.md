@@ -9150,6 +9150,109 @@ ALTER TABLE ${args.tableName} ADD COLUMN ${args.columnName}_byte_size BIGINT NOT
       }
     );
 
+    // Tool: Audit PostgreSQL Tablespaces, Storage Tiering & temp_tablespaces Isolation
+    this.server.tool(
+      'database_audit_tablespaces_storage_tiering',
+      'Audits PostgreSQL tablespaces, storage tiering, temp_tablespaces ephemeral spill isolation, temp_file_limit quotas, and unisolated disk spill risk.',
+      {
+        poolName: z.string().default('primary').describe('Target database pool to inspect'),
+      },
+      async ({ poolName }) => {
+        const pool = this.dbPools.get(poolName);
+        if (!pool) {
+          throw new McpError(ErrorCode.InvalidParams, `Database pool '${poolName}' not found`);
+        }
+
+        const client = await pool.connect();
+        try {
+          const violations: Array<{ severity: 'CRITICAL' | 'HIGH' | 'MEDIUM'; category: string; description: string; remediation: string }> = [];
+
+          // 1. Audit temp_tablespaces
+          const tempRes = await client.query<{ setting: string }>("SELECT setting FROM pg_settings WHERE name = 'temp_tablespaces';");
+          const tempSetting = tempRes.rows[0]?.setting?.trim() || '';
+
+          // 2. Audit temp_file_limit
+          const limitRes = await client.query<{ setting: string }>("SELECT setting FROM pg_settings WHERE name = 'temp_file_limit';");
+          const limitSetting = limitRes.rows[0]?.setting || '-1';
+
+          // 3. Audit temp spills from pg_stat_database
+          const spillRes = await client.query<{ datname: string; temp_files: string; temp_bytes: string }>(`
+            SELECT datname, temp_files::text, temp_bytes::text 
+            FROM pg_stat_database 
+            WHERE datname = current_database();
+          `);
+          const spillBytes = parseInt(spillRes.rows[0]?.temp_bytes || '0', 10);
+
+          // 4. Query all tablespaces and relation counts
+          const tsRes = await client.query<{ spcname: string; location: string; size_bytes: string; rel_count: string }>(`
+            SELECT 
+              t.spcname,
+              COALESCE(pg_tablespace_location(t.oid), 'DEFAULT_PGDATA') AS location,
+              pg_tablespace_size(t.spcname)::text AS size_bytes,
+              COUNT(c.oid)::text AS rel_count
+            FROM pg_tablespace t
+            LEFT JOIN pg_class c ON (
+              CASE WHEN c.reltablespace = 0 
+                THEN (SELECT dattablespace FROM pg_database WHERE datname = current_database())
+                ELSE c.reltablespace 
+              END = t.oid
+            )
+            GROUP BY t.spcname, t.oid
+            ORDER BY pg_tablespace_size(t.spcname) DESC;
+          `);
+
+          if (tempSetting === '') {
+            violations.push({
+              severity: 'HIGH',
+              category: 'UNISOLATED_TEMP_TABLESPACES',
+              description: 'temp_tablespaces is unset. Queries exceeding work_mem spill into $PGDATA/base/pgsql_tmp, saturating OLTP transaction storage.',
+              remediation: "ALTER SYSTEM SET temp_tablespaces = 'temp_scratch_tier'; SELECT pg_reload_conf();",
+            });
+          }
+
+          if (limitSetting === '-1') {
+            violations.push({
+              severity: 'CRITICAL',
+              category: 'UNBOUNDED_TEMP_FILE_LIMIT',
+              description: 'temp_file_limit is unlimited (-1). A runaway sort or unindexed join can exhaust 100% of host disk, triggering postmaster panic.',
+              remediation: "ALTER SYSTEM SET temp_file_limit = '10485760'; -- 10GB ceiling per process; SELECT pg_reload_conf();",
+            });
+          }
+
+          if (tempSetting === '' && spillBytes > 500 * 1024 * 1024) {
+            violations.push({
+              severity: 'CRITICAL',
+              category: 'ACTIVE_UNISOLATED_TEMP_SPILLS',
+              description: `Database has accumulated ${(spillBytes / (1024 * 1024)).toFixed(1)} MB of temp spills on the transactional root filesystem.`,
+              remediation: 'Provision a dedicated scratch mount on NVMe/RAM and redirect temp_tablespaces immediately.',
+            });
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                status: violations.length === 0 ? 'HEALTHY' : 'STORAGE_VIOLATIONS_DETECTED',
+                tempTablespaces: tempSetting || 'UNSET',
+                tempFileLimitKb: limitSetting,
+                tempSpillBytes: spillBytes,
+                totalViolations: violations.length,
+                tablespaces: tsRes.rows.map(r => ({
+                  name: r.spcname,
+                  location: r.location,
+                  sizeBytes: parseInt(r.size_bytes, 10),
+                  relationCount: parseInt(r.rel_count, 10),
+                })),
+                violations,
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
+
   }
   ```
 

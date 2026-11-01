@@ -12783,6 +12783,156 @@ func (s *DatabaseRbacSentinel) AuditSchemaDefaultAcls(ctx context.Context, schem
 }
 ```
 
+---
+
+## 22. PostgreSQL Tablespaces, Storage Tiering, temp_tablespaces Isolation & Replica Mount Sentinel
+
+When managing database storage tiers, relational partitions, and ephemeral query spills in Go (`jackc/pgx/v5`):
+
+- **Ephemeral Spill Isolation (`temp_tablespaces`)**:
+  - Assert that `temp_tablespaces` is non-empty during application boot or background health checks. Sort and hash spills exceeding `work_mem` must never write to the default transactional filesystem, preventing OLTP write latency degradation and out-of-disk crashes.
+- **Lock-Bounded Relation Migration**:
+  - When migrating tables or indexes across storage tiers (e.g., hot NVMe to cold storage), wrap operations in an explicit transaction setting `SET LOCAL lock_timeout = '2000ms'`, backing off if locks cannot be acquired immediately.
+- **Replica Mount Directory Pre-Flight Verification**:
+  - In orchestrators or infrastructure runners, verify local host directory existence, ownership (`postgres`), and POSIX `0700` permissions on 100% of physical read replicas before executing `CREATE TABLESPACE` on the primary.
+
+```go
+package tablespace
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// TablespaceMetrics encapsulates health and utilization statistics for a tablespace.
+type TablespaceMetrics struct {
+	Name             string `json:"name"`
+	Location         string `json:"location"`
+	SizeBytes        int64  `json:"size_bytes"`
+	RelationCount    int    `json:"relation_count"`
+	IsDefault        bool   `json:"is_default"`
+	IsTempConfigured bool   `json:"is_temp_configured"`
+}
+
+// StorageTierSentinel audits tablespace isolation, temp spills, and safe migrations.
+type StorageTierSentinel struct {
+	pool *pgxpool.Pool
+}
+
+func NewStorageTierSentinel(pool *pgxpool.Pool) *StorageTierSentinel {
+	return &StorageTierSentinel{pool: pool}
+}
+
+// AuditStorageHealth checks tablespace sizes, temp_tablespaces settings, and database spill volume.
+func (s *StorageTierSentinel) AuditStorageHealth(ctx context.Context) ([]TablespaceMetrics, error) {
+	// 1. Verify temp_tablespaces setting
+	var tempSetting string
+	if err := s.pool.QueryRow(ctx, "SHOW temp_tablespaces;").Scan(&tempSetting); err != nil {
+		return nil, fmt.Errorf("failed to query temp_tablespaces: %w", err)
+	}
+
+	tempIsolated := strings.TrimSpace(tempSetting) != ""
+
+	// 2. Query tablespaces and size distributions
+	query := `
+		SELECT 
+			t.spcname,
+			COALESCE(pg_tablespace_location(t.oid), 'DEFAULT_PGDATA') AS location,
+			pg_tablespace_size(t.spcname) AS size_bytes,
+			COUNT(c.oid) AS relation_count,
+			(t.spcname = 'pg_default') AS is_default
+		FROM pg_tablespace t
+		LEFT JOIN pg_class c ON (
+			CASE WHEN c.reltablespace = 0 
+				THEN (SELECT dattablespace FROM pg_database WHERE datname = current_database())
+				ELSE c.reltablespace 
+			END = t.oid
+		)
+		GROUP BY t.spcname, t.oid
+		ORDER BY size_bytes DESC;
+	`
+
+	rows, err := s.pool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to audit tablespaces: %w", err)
+	}
+	defer rows.Close()
+
+	var metrics []TablespaceMetrics
+	for rows.Next() {
+		var m TablespaceMetrics
+		if err := rows.Scan(&m.Name, &m.Location, &m.SizeBytes, &m.RelationCount, &m.IsDefault); err != nil {
+			return nil, err
+		}
+		m.IsTempConfigured = tempIsolated
+		metrics = append(metrics, m)
+	}
+
+	return metrics, nil
+}
+
+// RelocateRelationBounded relocates a table with lock timeout protection and exponential backoff.
+func (s *StorageTierSentinel) RelocateRelationBounded(
+	ctx context.Context,
+	schema, table, targetTablespace string,
+	maxAttempts int,
+	timeout time.Duration,
+) error {
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err := func() error {
+			tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback(ctx)
+
+			// Enforce lock_timeout to prevent queue blocking
+			lockTimeoutMs := timeout.Milliseconds()
+			if lockTimeoutMs <= 0 {
+				lockTimeoutMs = 2000
+			}
+
+			if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = '%dms';", lockTimeoutMs)); err != nil {
+				return err
+			}
+
+			stmt := fmt.Sprintf("ALTER TABLE %s.%s SET TABLESPACE %s;",
+				pgx.Identifier{schema}.Sanitize(),
+				pgx.Identifier{table}.Sanitize(),
+				pgx.Identifier{targetTablespace}.Sanitize(),
+			)
+
+			if _, err := tx.Exec(ctx, stmt); err != nil {
+				return err
+			}
+
+			return tx.Commit(ctx)
+		}()
+
+		if err == nil {
+			return nil
+		}
+
+		if strings.Contains(err.Error(), "55P03") || strings.Contains(err.Error(), "lock_timeout") {
+			if attempt == maxAttempts {
+				return fmt.Errorf("failed to acquire lock after %d attempts: %w", maxAttempts, err)
+			}
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+			continue
+		}
+
+		return err
+	}
+
+	return fmt.Errorf("exhausted %d retry attempts for tablespace migration", maxAttempts)
+}
+```
+
 
 
 
