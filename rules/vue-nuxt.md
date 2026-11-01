@@ -6670,6 +6670,68 @@ export default defineEventHandler(async (event) => {
 });
 ```
 
+### Vue 3 Composition API & Nuxt 3 Server Route Invariants for Real-Time Lock Tree Observability
+
+In Nuxt 3 administrative dashboards or database diagnostics consoles, rendering live lock dependency trees and providing emergency root-blocker preemption controls requires high UI fidelity and strict safety guards:
+
+1. **`shallowRef` for Lock Trees**: Real-time lock graphs contain recursive trees and arrays of blocked PIDs. Use `shallowRef()` to avoid Vue deep reactivity proxy overhead on high-frequency polling intervals.
+2. **Server-Side Action Fencing**: The preemption server route (`server/api/admin/preempt-root.post.ts`) must strictly verify that the target PID is actually a root blocker ($d^+ = 0, d^- > 0$) before issuing `pg_cancel_backend` or `pg_terminate_backend`, preventing malicious or accidental termination of innocent client connections.
+3. **Structured Visual Badging**: Distinguish Root Blockers (red badge), Intermediate Nodes (orange badge), and Blocked Victims (neutral badge) in the template.
+
+```typescript
+// server/api/admin/lock-trees.get.ts
+import { defineEventHandler, createError } from 'h3';
+import { sql } from 'kysely';
+import { primaryDb } from '~~/server/utils/db';
+
+export interface LockSessionRecord {
+  pid: number;
+  usename: string;
+  appName: string;
+  state: string;
+  waitEventType: string | null;
+  waitEvent: string | null;
+  queryDurationMs: number;
+  stateDurationMs: number;
+  blockingPids: number[];
+  query: string;
+}
+
+export default defineEventHandler(async () => {
+  try {
+    const result = await sql<LockSessionRecord>`
+      SELECT
+        pid,
+        usename,
+        application_name AS "appName",
+        state,
+        wait_event_type AS "waitEventType",
+        wait_event AS "waitEvent",
+        ROUND(EXTRACT(EPOCH FROM (clock_timestamp() - query_start)) * 1000)::bigint AS "queryDurationMs",
+        ROUND(EXTRACT(EPOCH FROM (clock_timestamp() - state_change)) * 1000)::bigint AS "stateDurationMs",
+        pg_blocking_pids(pid) AS "blockingPids",
+        query
+      FROM pg_stat_activity
+      WHERE pid <> pg_backend_pid()
+        AND state IS NOT NULL
+      ORDER BY query_start ASC;
+    `.execute(primaryDb);
+
+    return {
+      success: true,
+      sessions: result.rows,
+      timestamp: new Date().toISOString(),
+    };
+  } catch (err: any) {
+    throw createError({
+      statusCode: 500,
+      statusMessage: `Failed to inspect lock trees: ${err.message}`,
+    });
+  }
+});
+```
+
+
 
 
 

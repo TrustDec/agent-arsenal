@@ -8067,6 +8067,87 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         };
       }
     );
+
+    // Tool: PostgreSQL Lock Tree & Head-of-Line Blocking Root Preemption Sentinel
+    this.server.tool(
+      'audit_lock_trees_and_root_blockers',
+      'Audits PostgreSQL lock trees using pg_blocking_pids(), detects FIFO head-of-line lock convoys, and identifies root blockers for surgical preemption while strictly protecting waiting victims.',
+      {
+        totalBlockedSessions: z.number().nonnegative().describe('Total active sessions currently in wait_event_type = Lock'),
+        maxChainDepth: z.number().nonnegative().describe('Maximum depth of dependency chain in lock DAG'),
+        primaryRootPid: z.number().nullable().describe('PID of primary root blocker (d+ = 0, d- > 0)'),
+        primaryRootState: z.string().nullable().describe('State of primary root blocker (e.g. "idle in transaction", "active")'),
+        primaryRootDurationMs: z.number().nonnegative().describe('Duration in milliseconds of root blocker query or transaction state'),
+        primaryRootBlastRadius: z.number().nonnegative().describe('Count of direct and indirect blocked sessions waiting on primary root'),
+        primaryRootQuerySnippet: z.string().nullable().describe('Truncated query snippet of the root blocker'),
+      },
+      async (args) => {
+        const violations: string[] = [];
+        const recommendations: string[] = [];
+        let recommendedAction: 'NONE' | 'CANCEL_ROOT_BLOCKER' | 'TERMINATE_ROOT_BLOCKER' = 'NONE';
+        let targetPid: number | null = null;
+
+        // Check 1: Severe Lock Convoy
+        if (args.totalBlockedSessions >= 10 || args.primaryRootBlastRadius >= 10) {
+          violations.push(
+            `SEVERE_LOCK_CONVOY: Detected ${args.totalBlockedSessions} sessions blocked on relation/row locks with blast radius ${args.primaryRootBlastRadius}. Connection pool exhaustion imminent.`
+          );
+          recommendations.push('Execute immediate preemption of the root blocker to restore connection pool service rate.');
+        }
+
+        // Check 2: Leaked Idle in Transaction Root Blocker
+        if (args.primaryRootPid && args.primaryRootState === 'idle in transaction' && args.primaryRootBlastRadius >= 2) {
+          violations.push(
+            `IDLE_IN_TRANSACTION_GHOST_BLOCKER: Root blocker PID ${args.primaryRootPid} is 'idle in transaction' holding locks for ${args.primaryRootDurationMs}ms, blocking ${args.primaryRootBlastRadius} downstream sessions.`
+          );
+          recommendations.push(
+            `Issue SELECT pg_terminate_backend(${args.primaryRootPid}); immediately. Do NOT use pg_cancel_backend (has no effect on idle connections). Configure idle_in_transaction_session_timeout = '30s'.`
+          );
+          recommendedAction = 'TERMINATE_ROOT_BLOCKER';
+          targetPid = args.primaryRootPid;
+        } else if (args.primaryRootPid && args.primaryRootState === 'active' && args.primaryRootDurationMs > 5000 && args.primaryRootBlastRadius >= 5) {
+          // Check 3: Active runaway query blocking convoy
+          violations.push(
+            `ACTIVE_QUERY_LOCK_CONVOY: Root blocker PID ${args.primaryRootPid} active for ${args.primaryRootDurationMs}ms, blocking ${args.primaryRootBlastRadius} downstream sessions.`
+          );
+          recommendations.push(
+            `Issue SELECT pg_cancel_backend(${args.primaryRootPid}); to gracefully cancel the query without tearing down connection pool state.`
+          );
+          recommendedAction = 'CANCEL_ROOT_BLOCKER';
+          targetPid = args.primaryRootPid;
+        }
+
+        // Check 4: Deep Multi-Hop Dependency Chain
+        if (args.maxChainDepth >= 3) {
+          violations.push(
+            `DEEP_LOCK_DEPENDENCY_CHAIN: Lock DAG depth is ${args.maxChainDepth} (>= 3). Cascading lock upgrades or nested transaction locks detected.`
+          );
+          recommendations.push('Audit queries for canonical lexicographical lock ordering and eliminate intermediate lock escalation.');
+        }
+
+        // Strict Prohibitions
+        recommendations.push('STRICT INVARIANT: NEVER run SELECT pg_terminate_backend(pid) WHERE wait_event_type = "Lock". Only preempt the root blocker.');
+
+        const isCompliant = violations.length === 0;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              isCompliant,
+              totalBlockedSessions: args.totalBlockedSessions,
+              maxChainDepth: args.maxChainDepth,
+              primaryRootPid: args.primaryRootPid,
+              recommendedAction,
+              targetPid,
+              violations,
+              recommendations,
+              status: isCompliant ? 'certified_lock_trees_clear' : 'lock_convoy_remediation_required',
+            }, null, 2),
+          }],
+        };
+      }
+    );
   }
   ```
 

@@ -10626,5 +10626,226 @@ func (s *VisibilityMapSentinel) ProactiveFreeze(ctx context.Context, table strin
 }
 ```
 
+### Lock Tree Inspection, Root Blocker Resolution & Head-of-Line Blocking Invariants in Go
+
+In Go services running high-concurrency transactional pipelines with `jackc/pgx/v5`, un-timed DDL statements, lock upgrades, or leaked `idle in transaction` connections can trigger catastrophic FIFO lock convoys. Because PostgreSQL blocks incoming reads behind waiting exclusive locks, connection pools exhaust within seconds.
+
+Always enforce two critical invariants in Go persistence architectures:
+
+1. **Transaction-Scoped Lock Timeout with Exponential Jitter Retry (`55P03`)**: Wrap all schema changes, row locking, and batch updates in explicit `SET LOCAL lock_timeout` boundaries.
+2. **Autonomous Lock Convoy Sentinel & Root Blocker Preemption**: Detect lock trees using recursive CTEs over `pg_blocking_pids()`, identifying root blockers ($d^+ = 0, d^- > 0$) and preempting them without touching waiting victims.
+
+```go
+package storage
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math/rand"
+	"time"
+
+	"github.com/jackc/pgerrcode"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// LockBlockerReport models the root blocker causing downstream lock convoys
+type LockBlockerReport struct {
+	PID             int32     `json:"pid"`
+	Username        string    `json:"username"`
+	AppName         string    `json:"app_name"`
+	State           string    `json:"state"`
+	WaitEventType   string    `json:"wait_event_type"`
+	WaitEvent       string    `json:"wait_event"`
+	QueryDurationMs int64     `json:"query_duration_ms"`
+	StateDurationMs int64     `json:"state_duration_ms"`
+	DirectWaiters   int       `json:"direct_waiters"`
+	QuerySnippet    string    `json:"query_snippet"`
+}
+
+// ResilientLockRunner executes critical operations under strict lock_timeout with jittered retry
+func ResilientLockRunner(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	lockTimeout time.Duration,
+	stmtTimeout time.Duration,
+	maxAttempts int,
+	fn func(tx pgx.Tx) error,
+) error {
+	var lastErr error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+			// Enforce strict lock timeout to prevent queueing head-of-line lock convoys
+			lockTimeoutSQL := fmt.Sprintf("SET LOCAL lock_timeout = '%dms'", lockTimeout.Milliseconds())
+			if _, execErr := tx.Exec(ctx, lockTimeoutSQL); execErr != nil {
+				return fmt.Errorf("configure lock_timeout: %w", execErr)
+			}
+
+			stmtTimeoutSQL := fmt.Sprintf("SET LOCAL statement_timeout = '%dms'", stmtTimeout.Milliseconds())
+			if _, execErr := tx.Exec(ctx, stmtTimeoutSQL); execErr != nil {
+				return fmt.Errorf("configure statement_timeout: %w", execErr)
+			}
+
+			return fn(tx)
+		})
+
+		if err == nil {
+			return nil
+		}
+
+		lastErr = err
+
+		// Detect PostgreSQL 55P03 (lock_not_available)
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.LockNotAvailable {
+			if attempt < maxAttempts {
+				jitter := time.Duration(rand.Intn(300)) * time.Millisecond
+				sleepDuration := time.Duration(1<<attempt)*150*time.Millisecond + jitter
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(sleepDuration):
+					continue
+				}
+			}
+		}
+
+		// Non-recoverable error
+		return err
+	}
+
+	return fmt.Errorf("exhausted %d attempts under lock_timeout: %w", maxAttempts, lastErr)
+}
+
+// AutonomousLockConvoySentinel inspects pg_blocking_pids and preempts root blockers
+type AutonomousLockConvoySentinel struct {
+	pool    *pgxpool.Pool
+	logger  *slog.Logger
+	trigger int // Threshold of waiting victims to trigger remediation
+}
+
+func NewAutonomousLockConvoySentinel(pool *pgxpool.Pool, logger *slog.Logger, trigger int) *AutonomousLockConvoySentinel {
+	return &AutonomousLockConvoySentinel{
+		pool:    pool,
+		logger:  logger,
+		trigger: trigger,
+	}
+}
+
+// InspectAndPreempt scans for lock convoys and safely neutralizes ONLY the root blocker
+func (s *AutonomousLockConvoySentinel) InspectAndPreempt(ctx context.Context) (*LockBlockerReport, error) {
+	// Query leverages pg_blocking_pids() to find the root node with most direct waiters
+	const query = `
+		WITH RECURSIVE lock_snapshot AS (
+			SELECT
+				pid,
+				usename,
+				application_name,
+				state,
+				COALESCE(wait_event_type, 'None') AS wait_event_type,
+				COALESCE(wait_event, 'None') AS wait_event,
+				ROUND(EXTRACT(EPOCH FROM (clock_timestamp() - query_start)) * 1000)::bigint AS query_duration_ms,
+				ROUND(EXTRACT(EPOCH FROM (clock_timestamp() - state_change)) * 1000)::bigint AS state_duration_ms,
+				pg_blocking_pids(pid) AS blocking_pids,
+				LEFT(query, 160) AS query_snippet
+			FROM pg_stat_activity
+			WHERE pid <> pg_backend_pid()
+				AND state IS NOT NULL
+		),
+		root_nodes AS (
+			SELECT
+				ls.pid,
+				ls.usename,
+				ls.application_name,
+				ls.state,
+				ls.wait_event_type,
+				ls.wait_event,
+				ls.query_duration_ms,
+				ls.state_duration_ms,
+				ls.query_snippet,
+				(
+					SELECT COUNT(*)
+					FROM lock_snapshot waiter
+					WHERE ls.pid = ANY(waiter.blocking_pids)
+				) AS direct_waiters
+			FROM lock_snapshot ls
+			WHERE cardinality(ls.blocking_pids) = 0
+		)
+		SELECT
+			pid,
+			usename,
+			application_name,
+			state,
+			wait_event_type,
+			wait_event,
+			query_duration_ms,
+			state_duration_ms,
+			direct_waiters,
+			query_snippet
+		FROM root_nodes
+		WHERE direct_waiters >= $1
+		ORDER BY direct_waiters DESC, state_duration_ms DESC
+		LIMIT 1;
+	`
+
+	var report LockBlockerReport
+	err := s.pool.QueryRow(ctx, query, s.trigger).Scan(
+		&report.PID,
+		&report.Username,
+		&report.AppName,
+		&report.State,
+		&report.WaitEventType,
+		&report.WaitEvent,
+		&report.QueryDurationMs,
+		&report.StateDurationMs,
+		&report.DirectWaiters,
+		&report.QuerySnippet,
+	)
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil // No lock convoy active
+		}
+		return nil, fmt.Errorf("inspect lock tree: %w", err)
+	}
+
+	s.logger.WarnContext(ctx, "CRITICAL: Lock convoy detected. Root blocker identified",
+		"root_pid", report.PID,
+		"state", report.State,
+		"direct_waiters", report.DirectWaiters,
+		"duration_ms", report.StateDurationMs,
+		"query", report.QuerySnippet,
+	)
+
+	// Surgical Preemption:
+	// If the root blocker is 'idle in transaction', pg_cancel_backend() has no effect
+	// because no active query is executing. We MUST issue pg_terminate_backend().
+	if report.State == "idle in transaction" {
+		s.logger.InfoContext(ctx, "Severing leaked idle-in-transaction root connection", "pid", report.PID)
+		var terminated bool
+		err = s.pool.QueryRow(ctx, "SELECT pg_terminate_backend($1)", report.PID).Scan(&terminated)
+		if err != nil {
+			return &report, fmt.Errorf("terminate idle root blocker %d: %w", report.PID, err)
+		}
+		return &report, nil
+	}
+
+	// For active queries, attempt non-destructive query cancellation first (SIGINT)
+	s.logger.InfoContext(ctx, "Issuing graceful query cancellation to root blocker", "pid", report.PID)
+	var cancelled bool
+	err = s.pool.QueryRow(ctx, "SELECT pg_cancel_backend($1)", report.PID).Scan(&cancelled)
+	if err != nil {
+		return &report, fmt.Errorf("cancel active root blocker %d: %w", report.PID, err)
+	}
+
+	return &report, nil
+}
+```
+
+
 
 

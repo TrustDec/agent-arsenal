@@ -7537,6 +7537,96 @@ In SvelteKit 2 applications rendering administrative dashboards or database heal
 </div>
 ```
 
+### Svelte 5 Runes & Streaming SSR Load Discipline for Database Lock Tree Telemetry
+
+In SvelteKit 2 administrative consoles, displaying dynamic lock dependency trees requires careful reactivity management using Svelte 5 Runes (`$state`, `$derived`) and zero-leak state boundaries:
+
+1. **Pure Component-Scoped Runes**: Never keep global mutable lock caches; initialize state cleanly inside the component function scope.
+2. **Derived DAG Computation**: Extract root blockers and waiting victims cleanly with `$derived` without executing side effects.
+3. **Safe Preemption UI Actions**: Provide clear confirmation modals before issuing cancellation or termination requests to prevent unintended operational disruptions.
+
+```svelte
+<!-- src/routes/admin/lock-trees/+page.svelte -->
+<script lang="ts">
+  import type { PageData } from './$types';
+
+  interface LockSession {
+    pid: number;
+    usename: string;
+    appName: string;
+    state: string;
+    queryDurationMs: number;
+    stateDurationMs: number;
+    blockingPids: number[];
+    query: string;
+  }
+
+  let { data }: { data: PageData } = $props();
+
+  let sessions = $derived(data.sessions as LockSession[]);
+
+  // Derived: Identify root blockers (sessions blocking others, not blocked themselves)
+  let rootBlockers = $derived.by(() => {
+    const blockerPids = new Set<number>();
+    for (const s of sessions) {
+      for (const bp of s.blockingPids) {
+        blockerPids.add(bp);
+      }
+    }
+
+    return sessions.filter((s) => blockerPids.has(s.pid) && s.blockingPids.length === 0);
+  });
+
+  // Derived: Victims actively blocked waiting on locks
+  let waitingVictims = $derived(
+    sessions.filter((s) => s.blockingPids.length > 0)
+  );
+</script>
+
+<div class="p-6 max-w-6xl mx-auto space-y-6">
+  <div class="flex items-center justify-between">
+    <div>
+      <h1 class="text-2xl font-bold tracking-tight">Database Lock Dependency Trees</h1>
+      <p class="text-sm text-slate-500">Live inspection of PostgreSQL heavyweight lock queues via pg_blocking_pids()</p>
+    </div>
+    <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold {waitingVictims.length > 5 ? 'bg-red-100 text-red-800' : 'bg-green-100 text-green-800'}">
+      {waitingVictims.length} Blocked Session(s)
+    </span>
+  </div>
+
+  {#if rootBlockers.length > 0}
+    <div class="bg-amber-50 border-l-4 border-amber-500 p-4 rounded text-amber-900 space-y-2">
+      <h3 class="font-bold">Active Root Blockers Detected ({rootBlockers.length})</h3>
+      <p class="text-sm">These sessions anchor the lock tree. Neutralize the root blocker to drain the lock convoy.</p>
+      <div class="space-y-2">
+        {#each rootBlockers as root (root.pid)}
+          <div class="bg-white p-3 rounded border flex items-center justify-between shadow-sm">
+            <div>
+              <span class="font-mono font-bold text-sm">PID {root.pid}</span>
+              <span class="ml-2 text-xs px-2 py-0.5 rounded {root.state === 'idle in transaction' ? 'bg-red-100 text-red-700 font-semibold' : 'bg-slate-100 text-slate-700'}">
+                {root.state}
+              </span>
+              <p class="text-xs text-slate-600 font-mono mt-1 truncate max-w-xl">{root.query}</p>
+            </div>
+            <button
+              class="px-3 py-1.5 bg-rose-600 text-white rounded text-xs font-semibold hover:bg-rose-700 transition"
+              onclick={() => alert(`Preempt root PID ${root.pid}`)}
+            >
+              {root.state === 'idle in transaction' ? 'Terminate Leaked Connection' : 'Cancel Query'}
+            </button>
+          </div>
+        {/each}
+      </div>
+    </div>
+  {:else}
+    <div class="bg-slate-50 border border-slate-200 p-6 rounded-lg text-center text-slate-600">
+      <p class="text-sm">Zero lock convoys detected. All relation locks are flowing smoothly.</p>
+    </div>
+  {/if}
+</div>
+```
+
+
 
 
 

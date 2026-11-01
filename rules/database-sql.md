@@ -4094,6 +4094,14 @@ alwaysApply: false
       - Enforce **Proactive Freezing Parameter Calibration**: configure `ALTER TABLE <hot_table> SET (autovacuum_freeze_min_age = 10000000, autovacuum_freeze_table_age = 50000000)` so routine autovacuum passes freeze tuples early, setting `VISIBILITYMAP_ALL_FROZEN` to enable complete page skipping during subsequent vacuum cycles.
       - Enforce **Visibility Map Health & Corruption Monitoring**: continuously audit `SELECT all_visible, all_frozen, relpages FROM pg_class c JOIN LATERAL pg_visibility_map_summary(c.oid) ON true` and verify corruption-free state using `pg_check_visible(regclass)` and `pg_check_frozen(regclass)`.
       - Enforce **Vacuum Truncation Fencing on OLTP Tables**: configure `ALTER TABLE <hot_table> SET (vacuum_truncate = false)` to prevent end-of-vacuum `ACCESS EXCLUSIVE` lock convoys across heap and VM forks during peak traffic.
+  - **Lock Tree Hierarchy, Head-of-Line Blocking Convoys & Root Blocker Preemption Invariants**:
+    - ❌ **Anti-Pattern**: Executing schema migrations (`ALTER TABLE`, `CREATE INDEX` without `CONCURRENTLY`) or multi-row lock upgrades without explicit `SET LOCAL lock_timeout`. When an exclusive lock request queues behind an active query, PostgreSQL's strict FIFO lock queue blocks all subsequent shared reads (`SELECT`), creating a catastrophic lock convoy that exhausts connection pools in $< 3$ seconds ($T_{\text{exhaust}} = (c - N_{\text{active}})/\lambda$). Remediating lock incidents by blindly terminating waiting queries (`WHERE wait_event_type = 'Lock'`), which kills innocent connection pool sockets while leaving the true blocker untouched. Permitting application backends to perform external network I/O inside uncommitted transactions, anchoring `idle in transaction` lock trees at 0% CPU for hours.
+    - ✅ **Production Invariant**:
+      - Enforce **Strict Multi-Tier Timeout Fencing**: wrap 100% of DDL migrations and write transactions in `SET LOCAL lock_timeout = '2000ms'` and `SET LOCAL statement_timeout = '5000ms'`, backing off with exponential jitter upon `55P03` errors.
+      - Enforce **Recursive Lock DAG Traversal**: unwind blocker-waiter trees via recursive CTEs over `pg_blocking_pids(pid)` to isolate the unique root blocker PID ($d^+ = 0, d^- > 0$) and its blast radius.
+      - Enforce **Surgical Root Preemption Protocol**: issue `pg_cancel_backend(root_pid)` for long-running active queries, escalating to `pg_terminate_backend(root_pid)` exclusively for leaked `idle in transaction` sockets. Never terminate waiting victim backends.
+      - Enforce **Global Idle-In-Transaction Fencing**: configure `ALTER SYSTEM SET idle_in_transaction_session_timeout = '30s'` (or `'10s'` in transaction poolers) to sever leaked client sockets automatically.
+
 
 
 
