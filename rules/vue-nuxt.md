@@ -7060,6 +7060,53 @@ export function useAgentResourcePoller<T>(options: PollerOptions<T>) {
     error,
   };
 }
+
+/**
+ * useHashIndexAuditor (Vue 3.5 Composable)
+ * Telemetry and audit composable for PostgreSQL Hash indexes with automatic abort cleanup.
+ */
+export function useHashIndexAuditor(indexName: MaybeRefOrGetter<string>) {
+  const data = ref<{
+    indexName: string;
+    primaryPages: number;
+    overflowPages: number;
+    overflowRatio: number;
+    needsReindex: boolean;
+  } | null>(null);
+
+  const isAuditing = ref(false);
+  const error = ref<Error | null>(null);
+
+  watchEffect(async () => {
+    const target = toValue(indexName);
+    if (!target) return;
+
+    const controller = new AbortController();
+    onWatcherCleanup(() => controller.abort());
+
+    isAuditing.value = true;
+    try {
+      const res = await fetch(`/api/indexes/hash/audit?name=${encodeURIComponent(target)}`, {
+        signal: controller.signal,
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      data.value = await res.json();
+      error.value = null;
+    } catch (err: any) {
+      if (err.name !== 'AbortError') {
+        error.value = err;
+      }
+    } finally {
+      isAuditing.value = false;
+    }
+  });
+
+  return {
+    data,
+    isAuditing,
+    error,
+  };
+}
 ```
 
 

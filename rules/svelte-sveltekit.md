@@ -8047,6 +8047,141 @@ In Svelte 5, runes completely replace legacy `let` / `$:` reactive declarations.
 </div>
 ```
 
+### 11.13 Svelte 5 Runes: Deterministic Token & Hash Entity Lookup Inspector
+
+When displaying high-frequency token lookups, cryptographic hashes, or database index inspection telemetry, enforce strict Apple/Vercel aesthetic taste: deep Slate/Zinc surfaces, 1px micro-borders, optical kerning, accessible focus rings, and tactile interactive feedback.
+
+```svelte
+<!-- src/lib/components/HashLookupInspector.svelte -->
+<script lang="ts">
+  interface HashIndexMetrics {
+    indexName: string;
+    primaryPages: number;
+    overflowPages: number;
+    overflowRatio: number;
+    needsReindex: boolean;
+  }
+
+  let {
+    targetIndex = 'idx_tokens_hash',
+    onReindexRequest,
+  }: {
+    targetIndex?: string;
+    onReindexRequest?: (indexName: string) => Promise<void>;
+  } = $props();
+
+  let queryToken = $state('');
+  let isAuditing = $state(false);
+  let isReindexing = $state(false);
+  let auditData = $state<HashIndexMetrics | null>(null);
+  let errorMessage = $state<string | null>(null);
+
+  // Optical status badge styling derived from metrics
+  let statusBadge = $derived.by(() => {
+    if (!auditData) return { text: 'UNCHECKED', color: 'bg-zinc-800 text-zinc-400 border-zinc-700' };
+    if (auditData.needsReindex) {
+      return { text: 'OVERFLOW DEGRADED', color: 'bg-rose-500/10 text-rose-400 border-rose-500/20' };
+    }
+    return { text: 'O(1) OPTIMAL', color: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' };
+  });
+
+  const handleAudit = async () => {
+    isAuditing = true;
+    errorMessage = null;
+    try {
+      const res = await fetch(`/api/indexes/hash/audit?name=${encodeURIComponent(targetIndex)}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      auditData = (await res.json()) as HashIndexMetrics;
+    } catch (err: any) {
+      errorMessage = err.message || 'Audit failed';
+    } finally {
+      isAuditing = false;
+    }
+  };
+
+  const handleTriggerReindex = async () => {
+    if (!onReindexRequest) return;
+    isReindexing = true;
+    try {
+      await onReindexRequest(targetIndex);
+      await handleAudit(); // Refresh metrics after reindexing
+    } catch (err: any) {
+      errorMessage = err.message || 'Reindex request failed';
+    } finally {
+      isReindexing = false;
+    }
+  };
+</script>
+
+<div class="rounded-xl border border-zinc-800/80 bg-zinc-950 p-5 shadow-2xl backdrop-blur-xl">
+  <!-- Header Bar -->
+  <div class="flex items-center justify-between border-b border-zinc-800/60 pb-3">
+    <div class="flex items-center gap-2.5">
+      <div class="h-2 w-2 rounded-full bg-indigo-500 shadow-[0_0_8px_rgba(99,102,241,0.5)]"></div>
+      <span class="font-mono text-xs font-medium tracking-tight text-zinc-200">
+        POSTGRESQL HASH INDEX SENTINEL
+      </span>
+    </div>
+    <span class="inline-flex items-center rounded-md border px-2 py-0.5 font-mono text-[10px] font-semibold tracking-wider {statusBadge.color}">
+      {statusBadge.text}
+    </span>
+  </div>
+
+  <!-- Metric Overview Grid -->
+  {#if auditData}
+    <div class="mt-4 grid grid-cols-3 gap-3">
+      <div class="rounded-lg border border-zinc-800/50 bg-zinc-900/40 p-3">
+        <span class="block font-mono text-[10px] uppercase text-zinc-500">Primary Buckets</span>
+        <span class="mt-1 font-mono text-lg font-semibold text-zinc-100">{auditData.primaryPages}</span>
+      </div>
+      <div class="rounded-lg border border-zinc-800/50 bg-zinc-900/40 p-3">
+        <span class="block font-mono text-[10px] uppercase text-zinc-500">Overflow Pages</span>
+        <span class="mt-1 font-mono text-lg font-semibold {auditData.overflowPages > 0 ? 'text-amber-400' : 'text-zinc-100'}">
+          {auditData.overflowPages}
+        </span>
+      </div>
+      <div class="rounded-lg border border-zinc-800/50 bg-zinc-900/40 p-3">
+        <span class="block font-mono text-[10px] uppercase text-zinc-500">Overflow Ratio</span>
+        <span class="mt-1 font-mono text-lg font-semibold {auditData.needsReindex ? 'text-rose-400' : 'text-emerald-400'}">
+          {(auditData.overflowRatio * 100).toFixed(1)}%
+        </span>
+      </div>
+    </div>
+  {/if}
+
+  <!-- Action Controls -->
+  <div class="mt-4 flex items-center justify-between gap-3">
+    <button
+      onclick={handleAudit}
+      disabled={isAuditing}
+      class="inline-flex items-center gap-1.5 rounded-lg border border-zinc-700/80 bg-zinc-800/50 px-3 py-1.5 font-mono text-xs font-medium text-zinc-200 transition-all hover:bg-zinc-700/50 active:scale-[0.98] disabled:opacity-50"
+    >
+      {#if isAuditing}
+        <span class="h-3 w-3 animate-spin rounded-full border-2 border-zinc-400 border-t-transparent"></span>
+      {/if}
+      Audit Index
+    </button>
+
+    {#if auditData?.needsReindex}
+      <button
+        onclick={handleTriggerReindex}
+        disabled={isReindexing}
+        class="inline-flex items-center gap-1.5 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-1.5 font-mono text-xs font-medium text-rose-300 transition-all hover:bg-rose-500/20 active:scale-[0.98] disabled:opacity-50"
+      >
+        {#if isReindexing}
+          <span class="h-3 w-3 animate-spin rounded-full border-2 border-rose-400 border-t-transparent"></span>
+        {/if}
+        Reindex Concurrently
+      </button>
+    {/if}
+  </div>
+
+  {#if errorMessage}
+    <p class="mt-3 font-mono text-xs text-rose-400">{errorMessage}</p>
+  {/if}
+</div>
+```
+
 
 
 

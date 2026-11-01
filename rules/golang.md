@@ -11524,6 +11524,225 @@ func (w *GINMaintenanceWorker) cleanIndex(ctx context.Context, target GINMainten
 }
 ```
 
+### 13.11 PostgreSQL Hash Index Overflow Telemetry, Health Sentinels & Concurrent Reindexing (`pgx/v5`)
+
+When utilizing PostgreSQL Hash Indexes (`USING hash`) for $O(1)$ equality lookups across long key domains (UUIDs, cryptographic hashes, session tokens $\ge 32\text{ bytes}$), autonomous Go services must monitor index health to prevent deep overflow page chains from degrading lookups into linear sequential reads.
+
+```go
+package store
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// HashIndexStats represents diagnostic telemetry for a PostgreSQL hash index.
+type HashIndexStats struct {
+	IndexName     string  `json:"index_name"`
+	TableName     string  `json:"table_name"`
+	TotalPages    int64   `json:"total_pages"`
+	PrimaryPages  int64   `json:"primary_pages"`
+	OverflowPages int64   `json:"overflow_pages"`
+	OverflowRatio float64 `json:"overflow_ratio"`
+	NeedsReindex  bool    `json:"needs_reindex"`
+}
+
+// HashIndexSentinel continuously audits hash indexes and executes concurrent reindexing
+// when overflow page chains exceed safety thresholds.
+type HashIndexSentinel struct {
+	pool           *pgxpool.Pool
+	logger         *slog.Logger
+	overflowLimit  float64       // e.g. 0.15 (15% overflow pages)
+	checkInterval  time.Duration // e.g. 1 hour
+	reindexTimeout time.Duration // e.g. 10 minutes
+}
+
+func NewHashIndexSentinel(
+	pool *pgxpool.Pool,
+	logger *slog.Logger,
+	overflowLimit float64,
+	checkInterval time.Duration,
+) *HashIndexSentinel {
+	if overflowLimit <= 0 || overflowLimit > 0.50 {
+		overflowLimit = 0.15
+	}
+	if checkInterval <= 0 {
+		checkInterval = 1 * time.Hour
+	}
+	return &HashIndexSentinel{
+		pool:           pool,
+		logger:         logger,
+		overflowLimit:  overflowLimit,
+		checkInterval:  checkInterval,
+		reindexTimeout: 10 * time.Minute,
+	}
+}
+
+// Start runs the periodic audit loop until context is canceled.
+func (s *HashIndexSentinel) Start(ctx context.Context, indexNames []string) {
+	ticker := time.NewTicker(s.checkInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			s.logger.Info("stopping hash index sentinel")
+			return
+		case <-ticker.C:
+			for _, idx := range indexNames {
+				if err := s.auditAndRemediate(ctx, idx); err != nil {
+					s.logger.ErrorContext(ctx, "failed to audit hash index",
+						"index", idx,
+						"error", err,
+					)
+				}
+			}
+		}
+	}
+}
+
+func (s *HashIndexSentinel) auditAndRemediate(ctx context.Context, indexName string) error {
+	stats, err := s.Inspect(ctx, indexName)
+	if err != nil {
+		return fmt.Errorf("inspecting hash index %q: %w", indexName, err)
+	}
+
+	s.logger.InfoContext(ctx, "hash index health check",
+		"index", stats.IndexName,
+		"table", stats.TableName,
+		"total_pages", stats.TotalPages,
+		"primary_pages", stats.PrimaryPages,
+		"overflow_pages", stats.OverflowPages,
+		"overflow_ratio", fmt.Sprintf("%.2f%%", stats.OverflowRatio*100),
+		"needs_reindex", stats.NeedsReindex,
+	)
+
+	if !stats.NeedsReindex {
+		return nil
+	}
+
+	return s.ReindexConcurrently(ctx, stats.IndexName)
+}
+
+// Inspect queries pg_class and relation sizing to calculate overflow ratio.
+func (s *HashIndexSentinel) Inspect(ctx context.Context, indexName string) (*HashIndexStats, error) {
+	query := `
+		SELECT 
+			i.relname AS index_name,
+			c.relname AS table_name,
+			i.relpages AS total_pages
+		FROM pg_class i
+		JOIN pg_am am ON am.oid = i.relam
+		JOIN pg_index x ON x.indexrelid = i.oid
+		JOIN pg_class c ON c.oid = x.indrelid
+		WHERE i.relname = $1 AND am.amname = 'hash';
+	`
+
+	var stats HashIndexStats
+	err := s.pool.QueryRow(ctx, query, indexName).Scan(
+		&stats.IndexName,
+		&stats.TableName,
+		&stats.TotalPages,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query hash index metadata: %w", err)
+	}
+
+	// Try pageinspect if available; otherwise estimate from metapage size bounds
+	// Primary buckets in hash indexes are powers of two: 2^N.
+	// We query hash_metapage_info if the extension is present:
+	var primaryPages int64
+	err = s.pool.QueryRow(ctx, `
+		SELECT (max_bucket + 1)::bigint 
+		FROM hash_metapage_info(get_raw_page($1, 0));
+	`, indexName).Scan(&primaryPages)
+	if err != nil {
+		// Fallback: estimate primary pages as the largest power of 2 <= totalPages
+		primaryPages = estimatePrimaryPages(stats.TotalPages)
+	}
+
+	stats.PrimaryPages = primaryPages
+	stats.OverflowPages = stats.TotalPages - primaryPages - 1 // Subtract block 0 metapage
+	if stats.OverflowPages < 0 {
+		stats.OverflowPages = 0
+	}
+
+	if stats.TotalPages > 0 {
+		stats.OverflowRatio = float64(stats.OverflowPages) / float64(stats.TotalPages)
+	}
+	stats.NeedsReindex = stats.OverflowRatio > s.overflowLimit
+
+	return &stats, nil
+}
+
+func estimatePrimaryPages(totalPages int64) int64 {
+	if totalPages <= 2 {
+		return 1
+	}
+	p := int64(1)
+	for p*2 < totalPages {
+		p *= 2
+	}
+	return p
+}
+
+// ReindexConcurrently executes an online non-blocking REINDEX INDEX CONCURRENTLY
+// protected by transaction-scoped advisory locking and strict lock timeouts.
+func (s *HashIndexSentinel) ReindexConcurrently(ctx context.Context, indexName string) error {
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquiring connection for reindex: %w", err)
+	}
+	defer conn.Release()
+
+	// 1. Acquire transaction-scoped advisory lock using hashtext of index name
+	var acquired bool
+	err = conn.QueryRow(ctx, "SELECT pg_try_advisory_lock(hashtext($1));", indexName).Scan(&acquired)
+	if err != nil {
+		return fmt.Errorf("advisory lock check: %w", err)
+	}
+	if !acquired {
+		s.logger.WarnContext(ctx, "reindex skipped: advisory lock already held", "index", indexName)
+		return nil
+	}
+	defer func() {
+		_, _ = conn.Exec(context.Background(), "SELECT pg_advisory_unlock(hashtext($1));", indexName)
+	}()
+
+	// 2. Set strict lock timeout to eliminate lock convoys
+	reindexCtx, cancel := context.WithTimeout(ctx, s.reindexTimeout)
+	defer cancel()
+
+	_, err = conn.Exec(reindexCtx, "SET lock_timeout = '2000ms';")
+	if err != nil {
+		return fmt.Errorf("setting lock_timeout: %w", err)
+	}
+
+	// 3. Execute REINDEX CONCURRENTLY (cannot execute inside transaction block)
+	s.logger.InfoContext(ctx, "starting REINDEX INDEX CONCURRENTLY", "index", indexName)
+	start := time.Now()
+	
+	sanitizedIndex := pgx.Identifier{indexName}.Sanitize()
+	_, err = conn.Exec(reindexCtx, fmt.Sprintf("REINDEX INDEX CONCURRENTLY %s;", sanitizedIndex))
+	if err != nil {
+		return fmt.Errorf("reindex concurrently failed: %w", err)
+	}
+
+	s.logger.InfoContext(ctx, "REINDEX INDEX CONCURRENTLY completed successfully",
+		"index", indexName,
+		"duration_ms", time.Since(start).Milliseconds(),
+	)
+
+	return nil
+}
+```
+
+
 
 
 

@@ -8410,6 +8410,99 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
       }
     );
   }
+
+  /**
+   * Tool: inspect_hash_index_eligibility
+   * Evaluates if a column qualifies for a PostgreSQL Hash Index (USING hash),
+   * audits against SQLSTATE 0A000 uniqueness errors, and validates single-column equality.
+   */
+  public registerHashIndexInspectorTool(): void {
+    this.server.registerTool(
+      {
+        name: 'inspect_hash_index_eligibility',
+        description: 'Audits column eligibility for PostgreSQL Hash index (USING hash), checks uniqueness invariants (SQLSTATE 0A000), single-column limits, and non-sargable query operator risks.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            tableName: { type: 'string', description: 'Target database table name' },
+            columnName: { type: 'string', description: 'Target column name' },
+            columnType: { type: 'string', description: 'Data type (e.g., text, uuid, varchar)' },
+            avgByteLength: { type: 'number', description: 'Average byte length of indexed column' },
+            isUnique: { type: 'boolean', description: 'Whether the index must enforce uniqueness' },
+            isPrimaryKey: { type: 'boolean', description: 'Whether this column is the primary key' },
+            isMultiColumn: { type: 'boolean', description: 'Whether multiple columns are indexed together' },
+            queryOperators: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Query operators applied to this column in application queries (e.g. ["="], ["<", ">"])',
+            },
+          },
+          required: ['tableName', 'columnName', 'isUnique', 'isMultiColumn', 'queryOperators'],
+        },
+      },
+      async (args: {
+        tableName: string;
+        columnName: string;
+        columnType?: string;
+        avgByteLength?: number;
+        isUnique: boolean;
+        isPrimaryKey?: boolean;
+        isMultiColumn: boolean;
+        queryOperators: string[];
+      }, _signal?: AbortSignal) => {
+        const violations: string[] = [];
+        let recommendedMethod: 'hash' | 'btree' = 'hash';
+
+        if (args.isUnique || args.isPrimaryKey) {
+          violations.push(
+            'SQLSTATE 0A000: PostgreSQL access method "hash" strictly does NOT support UNIQUE or PRIMARY KEY constraints. Use B-Tree.'
+          );
+          recommendedMethod = 'btree';
+        }
+
+        if (args.isMultiColumn) {
+          violations.push(
+            'PostgreSQL Hash indexes do not support multi-column composite indexing. Must index exactly one column.'
+          );
+          recommendedMethod = 'btree';
+        }
+
+        const unsupportedOps = args.queryOperators.filter(
+          (op) => op !== '=' && op !== 'IS NULL' && op !== 'IS NOT NULL'
+        );
+        if (unsupportedOps.length > 0) {
+          violations.push(
+            `Non-sargable operators [${unsupportedOps.join(', ')}] detected. Hash indexes support ONLY equality ("="). Range queries will cause full table Seq Scans.`
+          );
+          recommendedMethod = 'btree';
+        }
+
+        const avgLen = args.avgByteLength || 32;
+        if (avgLen < 32 && violations.length === 0) {
+          recommendedMethod = 'btree';
+        }
+
+        const safeDDL = recommendedMethod === 'hash'
+          ? `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_${args.tableName}_${args.columnName}_hash ON ${args.tableName} USING hash (${args.columnName}) WITH (fillfactor = 75);`
+          : `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_${args.tableName}_${args.columnName}_btree ON ${args.tableName} (${args.columnName});`;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              tableName: args.tableName,
+              columnName: args.columnName,
+              recommendedMethod,
+              violations,
+              isEligibleForHash: violations.length === 0 && recommendedMethod === 'hash',
+              recommendedDDL: safeDDL,
+              status: violations.length === 0 ? 'qualification_passed' : 'qualification_rejected',
+            }, null, 2),
+          }],
+        };
+      }
+    );
+  }
   ```
 
 
