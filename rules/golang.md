@@ -11076,6 +11076,271 @@ func (s *WALArchiverSentinel) ShouldThrottleWriteTraffic() bool {
 }
 ```
 
+### Logical Replication Conflict Sentinel, Worker Crash-Loop Prevention & Skip LSN Invariants in Go
+
+In PostgreSQL logical replication topologies (`CREATE SUBSCRIPTION`), apply worker processes execute row-level DML operations locally on the subscriber. If an incoming transaction encounters a constraint violation (`insert_exists`, unique index conflict) or a missing target tuple (`update_missing`, `delete_missing`), the single-threaded worker process terminates with `ERROR`. Postmaster automatically restarts it after 5 seconds, only for the worker to re-fetch the exact same commit LSN from the publisher replication slot and crash again in an infinite loop. While the subscriber crash-loops, the publisher's `confirmed_flush_lsn` remains frozen, preventing WAL segment recycling and threatening cluster-wide disk exhaustion.
+
+Always enforce three core production invariants in Go services interacting with or monitoring logical replication:
+
+1. **Active Error Telemetry & Circuit Breaking**: Continuously monitor `pg_stat_subscription_errors` (in PostgreSQL 15+) and `pg_stat_subscription` to detect worker crash loops before replication lag compounds.
+2. **Pre-Flight Verified Skip LSN Execution**: When an audited conflict cannot be resolved by local data patching, execute `ALTER SUBSCRIPTION ... SKIP (lsn = '<target_lsn>')` strictly after asserting that the target LSN exactly matches the active `last_error_lsn` in the catalog.
+3. **Publisher Slot Headroom Verification**: Verify that the publisher cluster configures `max_slot_wal_keep_size` to ensure that prolonged subscriber downtime cannot exhaust primary WAL storage.
+
+```go
+package replication
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// SubWorkerStatus reflects the live state of a logical subscription worker.
+type SubWorkerStatus struct {
+	SubName            string
+	WorkerPID          int
+	ReceivedLSN        string
+	LastMsgReceiptTime time.Time
+	LatestEndLSN       string
+	LatestEndTime      time.Time
+}
+
+// ReplicationConflictRecord models an active error from pg_stat_subscription_errors.
+type ReplicationConflictRecord struct {
+	SubName      string
+	Command      string
+	ErrorCode    string
+	ErrorMessage string
+	ErrorLSN     string
+	ErrorCount   int64
+	ErrorTime    time.Time
+}
+
+// ReplicationHealthVerdict provides actionable diagnostics for autonomous agents and SREs.
+type ReplicationHealthVerdict struct {
+	IsHealthy       bool
+	Severity        string // "HEALTHY", "WARNING", "CRITICAL_CONFLICT"
+	ActiveConflict  *ReplicationConflictRecord
+	WorkerStatus    *SubWorkerStatus
+	Diagnostics     []string
+	RemediationHint string
+}
+
+// LogicalReplicationSentinel guards subscriber health and provides safe conflict resolution.
+type LogicalReplicationSentinel struct {
+	pool            *pgxpool.Pool
+	subName         string
+	maxAllowedLag   time.Duration
+	logger          *slog.Logger
+	mu              sync.Mutex
+	lastEvaluatedAt time.Time
+}
+
+// NewLogicalReplicationSentinel initializes a production sentinel for PostgreSQL 15+.
+func NewLogicalReplicationSentinel(
+	pool *pgxpool.Pool,
+	subName string,
+	maxAllowedLag time.Duration,
+	logger *slog.Logger,
+) *LogicalReplicationSentinel {
+	if maxAllowedLag <= 0 {
+		maxAllowedLag = 60 * time.Second
+	}
+	return &LogicalReplicationSentinel{
+		pool:          pool,
+		subName:       subName,
+		maxAllowedLag: maxAllowedLag,
+		logger:        logger,
+	}
+}
+
+// AuditSubscription inspects worker status and pg_stat_subscription_errors.
+func (s *LogicalReplicationSentinel) AuditSubscription(ctx context.Context) (*ReplicationHealthVerdict, error) {
+	verdict := &ReplicationHealthVerdict{
+		IsHealthy:       true,
+		Severity:        "HEALTHY",
+		Diagnostics:     make([]string, 0),
+		RemediationHint: "Replication operating normally.",
+	}
+
+	// 1. Check for active errors in pg_stat_subscription_errors (PG 15+)
+	errQuery := `
+		SELECT subname, COALESCE(command, ''), COALESCE(last_error_code, ''),
+		       COALESCE(last_error_message, ''), COALESCE(last_error_lsn::text, ''),
+		       last_error_count, last_error_time
+		FROM pg_stat_subscription_errors
+		WHERE subname = $1 AND last_error_count > 0
+		ORDER BY last_error_time DESC
+		LIMIT 1;
+	`
+	var conflict ReplicationConflictRecord
+	var errTime sql.NullTime
+
+	err := s.pool.QueryRow(ctx, errQuery, s.subName).Scan(
+		&conflict.SubName,
+		&conflict.Command,
+		&conflict.ErrorCode,
+		&conflict.ErrorMessage,
+		&conflict.ErrorLSN,
+		&conflict.ErrorCount,
+		&errTime,
+	)
+
+	if err == nil && conflict.ErrorLSN != "" {
+		if errTime.Valid {
+			conflict.ErrorTime = errTime.Time
+		}
+		verdict.IsHealthy = false
+		verdict.Severity = "CRITICAL_CONFLICT"
+		verdict.ActiveConflict = &conflict
+		verdict.Diagnostics = append(verdict.Diagnostics,
+			fmt.Sprintf("Active conflict detected on LSN %s: [%s] %s (occurred %d times)",
+				conflict.ErrorLSN, conflict.ErrorCode, conflict.ErrorMessage, conflict.ErrorCount))
+		verdict.RemediationHint = fmt.Sprintf(
+			"Verify conflict causal impact. If benign, execute SafeSkipLSN(ctx, %q, reason) to advance past LSN %s.",
+			conflict.ErrorLSN, conflict.ErrorLSN)
+		return verdict, nil
+	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		s.logger.WarnContext(ctx, "failed to query pg_stat_subscription_errors", "error", err)
+	}
+
+	// 2. Check worker status in pg_stat_subscription
+	statQuery := `
+		SELECT COALESCE(pid, 0), COALESCE(received_lsn::text, ''),
+		       last_msg_receipt_time, COALESCE(latest_end_lsn::text, ''), latest_end_time
+		FROM pg_stat_subscription
+		WHERE subname = $1;
+	`
+	var worker SubWorkerStatus
+	var receiptTime, endTime sql.NullTime
+
+	err = s.pool.QueryRow(ctx, statQuery, s.subName).Scan(
+		&worker.WorkerPID,
+		&worker.ReceivedLSN,
+		&receiptTime,
+		&worker.LatestEndLSN,
+		&endTime,
+	)
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			verdict.IsHealthy = false
+			verdict.Severity = "WARNING"
+			verdict.Diagnostics = append(verdict.Diagnostics, "Subscription not found or disabled in pg_stat_subscription.")
+			verdict.RemediationHint = "Verify subscription status with SELECT subname, subenabled FROM pg_subscription;"
+			return verdict, nil
+		}
+		return nil, fmt.Errorf("failed to query pg_stat_subscription: %w", err)
+	}
+
+	worker.SubName = s.subName
+	if receiptTime.Valid {
+		worker.LastMsgReceiptTime = receiptTime.Time
+	}
+	if endTime.Valid {
+		worker.LatestEndTime = endTime.Time
+	}
+	verdict.WorkerStatus = &worker
+
+	// 3. Worker PID check
+	if worker.WorkerPID == 0 {
+		verdict.IsHealthy = false
+		verdict.Severity = "WARNING"
+		verdict.Diagnostics = append(verdict.Diagnostics, "Apply worker is not running (PID is 0/null).")
+		verdict.RemediationHint = "Check postgresql server logs or verify if subscription was explicitly disabled."
+		return verdict, nil
+	}
+
+	// 4. Lag evaluation
+	if !worker.LastMsgReceiptTime.IsZero() {
+		lag := time.Since(worker.LastMsgReceiptTime)
+		if lag > s.maxAllowedLag {
+			verdict.IsHealthy = false
+			verdict.Severity = "WARNING"
+			verdict.Diagnostics = append(verdict.Diagnostics,
+				fmt.Sprintf("Subscription lag (%s) exceeded threshold (%s)", lag.Round(time.Second), s.maxAllowedLag))
+			verdict.RemediationHint = "Check subscriber table indexes or publisher write throughput."
+		}
+	}
+
+	return verdict, nil
+}
+
+// SafeSkipLSN executes ALTER SUBSCRIPTION ... SKIP (lsn = ...) with strict validation and audit logging.
+func (s *LogicalReplicationSentinel) SafeSkipLSN(ctx context.Context, targetLSN, operatorReason string) error {
+	if targetLSN == "" || operatorReason == "" {
+		return errors.New("targetLSN and operatorReason must not be empty")
+	}
+
+	// 1. Audit current conflict to ensure target LSN matches active failure
+	verdict, err := s.AuditSubscription(ctx)
+	if err != nil {
+		return fmt.Errorf("audit failed prior to skip: %w", err)
+	}
+	if verdict.ActiveConflict == nil || verdict.ActiveConflict.ErrorLSN != targetLSN {
+		return fmt.Errorf("safety violation: target LSN %s does not match active error LSN (active: %v)",
+			targetLSN, verdict.ActiveConflict)
+	}
+
+	s.logger.InfoContext(ctx, "executing verified logical replication skip",
+		"subname", s.subName,
+		"target_lsn", targetLSN,
+		"reason", operatorReason,
+	)
+
+	// Note: In PostgreSQL, ALTER SUBSCRIPTION cannot run inside a multi-statement transaction block.
+	// Step A: Disable subscription to halt worker restart race
+	disableCmd := fmt.Sprintf("ALTER SUBSCRIPTION %s DISABLE;", s.subName)
+	if _, err := s.pool.Exec(ctx, disableCmd); err != nil {
+		return fmt.Errorf("failed to disable subscription: %w", err)
+	}
+
+	// Step B: Apply the skip LSN
+	skipCmd := fmt.Sprintf("ALTER SUBSCRIPTION %s SKIP (lsn = '%s');", s.subName, targetLSN)
+	if _, err := s.pool.Exec(ctx, skipCmd); err != nil {
+		// Attempt to re-enable before returning error
+		_, _ = s.pool.Exec(ctx, fmt.Sprintf("ALTER SUBSCRIPTION %s ENABLE;", s.subName))
+		return fmt.Errorf("failed to set skip LSN: %w", err)
+	}
+
+	// Step C: Record audit entry in subscriber database
+	auditSQL := `
+		CREATE TABLE IF NOT EXISTS _agent_replication_skip_audit (
+			id BIGSERIAL PRIMARY KEY,
+			subname TEXT NOT NULL,
+			skipped_lsn TEXT NOT NULL,
+			error_code TEXT,
+			error_message TEXT,
+			reason TEXT NOT NULL,
+			executed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+		INSERT INTO _agent_replication_skip_audit (subname, skipped_lsn, error_code, error_message, reason)
+		VALUES ($1, $2, $3, $4, $5);
+	`
+	if _, err := s.pool.Exec(ctx, auditSQL,
+		s.subName, targetLSN, verdict.ActiveConflict.ErrorCode, verdict.ActiveConflict.ErrorMessage, operatorReason); err != nil {
+		s.logger.WarnContext(ctx, "failed to record skip audit row", "error", err)
+	}
+
+	// Step D: Re-enable subscription
+	enableCmd := fmt.Sprintf("ALTER SUBSCRIPTION %s ENABLE;", s.subName)
+	if _, err := s.pool.Exec(ctx, enableCmd); err != nil {
+		return fmt.Errorf("failed to re-enable subscription: %w", err)
+	}
+
+	s.logger.InfoContext(ctx, "successfully skipped LSN and re-enabled subscription",
+		"subname", s.subName, "skipped_lsn", targetLSN)
+	return nil
+}
+```
+
+
 
 
 

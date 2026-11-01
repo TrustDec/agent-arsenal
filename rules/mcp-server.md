@@ -8234,6 +8234,107 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         };
       }
     );
+
+    // Tool: PostgreSQL Logical Replication Conflict Auditor & Skip LSN Guard
+    this.server.tool(
+      'audit_logical_replication_conflicts',
+      'Audits PostgreSQL logical replication subscription health, detects apply worker crash-loop conditions via pg_stat_subscription_errors, fences publisher slot WAL accumulation risks, and generates audited ALTER SUBSCRIPTION ... SKIP (lsn) remediation instructions.',
+      {
+        subscriptionName: z.string().describe('Name of the logical replication subscription'),
+        errorCount: z.number().nonnegative().describe('Error count from pg_stat_subscription_errors (0 if healthy)'),
+        lastErrorCode: z.string().nullable().describe('PostgreSQL SQLSTATE code of the latest replication conflict'),
+        lastErrorMessage: z.string().nullable().describe('Detailed error message from pg_stat_subscription_errors'),
+        lastErrorLsn: z.string().nullable().describe('Commit LSN of the failing transaction causing the conflict'),
+        lastErrorTime: z.string().nullable().describe('ISO timestamp of the most recent apply failure'),
+        publisherSlotLagBytes: z.number().nonnegative().describe('Replication lag in bytes tracked at publisher slot'),
+        publisherMaxSlotWalKeepSizeMB: z.number().describe('Publisher setting for max_slot_wal_keep_size in MB (-1 if unbounded)'),
+        disableOnError: z.boolean().describe('True if subscription was created/altered with disable_on_error = true'),
+        hasUnindexedSubscriberTables: z.boolean().describe('True if any subscribed table lacks PK or REPLICA IDENTITY index'),
+        isBiDirectional: z.boolean().describe('True if node participates in multi-master or bi-directional replication'),
+        originNoneConfigured: z.boolean().describe('True if subscription specifies origin = none (PG 16+)'),
+      },
+      async (args) => {
+        const violations: string[] = [];
+        const recommendations: string[] = [];
+        let severity: 'OK' | 'WARNING' | 'CRITICAL' | 'EMERGENCY' = 'OK';
+        let recommendedSkipSql: string | null = null;
+
+        // Check 1: Apply Worker Crash Loop
+        if (args.errorCount > 0) {
+          if (!args.disableOnError) {
+            severity = 'CRITICAL';
+            violations.push(
+              `WORKER CRASH-LOOP: Subscription ${args.subscriptionName} has failed ${args.errorCount} times on LSN ${args.lastErrorLsn} without disable_on_error. Postmaster restarts worker every 5s, freezing replication.`
+            );
+            recommendations.push(
+              `Execute: ALTER SUBSCRIPTION ${args.subscriptionName} SET (disable_on_error = true); to stop the fork/crash loop.`
+            );
+          } else {
+            severity = 'WARNING';
+            violations.push(
+              `SUBSCRIPTION PAUSED ON ERROR: Worker halted cleanly due to conflict on LSN ${args.lastErrorLsn} (${args.lastErrorCode}: ${args.lastErrorMessage}).`
+            );
+          }
+
+          if (args.lastErrorLsn) {
+            recommendedSkipSql = `ALTER SUBSCRIPTION ${args.subscriptionName} SKIP (lsn = '${args.lastErrorLsn}'); ALTER SUBSCRIPTION ${args.subscriptionName} ENABLE;`;
+            recommendations.push(
+              `After auditing causal data consistency, execute verified skip: ${recommendedSkipSql}`
+            );
+          }
+        }
+
+        // Check 2: Publisher Slot WAL Disk Exhaustion Risk
+        if (args.publisherSlotLagBytes > 5 * 1024 * 1024 * 1024 && args.publisherMaxSlotWalKeepSizeMB <= 0) {
+          severity = 'EMERGENCY';
+          violations.push(
+            `UNBOUNDED PUBLISHER DISK RISK: Slot lag is ${Math.round(args.publisherSlotLagBytes / (1024 * 1024))}MB and publisher max_slot_wal_keep_size is unlimited (-1). Publisher WAL will accumulate until 100% disk exhaustion crashes the primary cluster!`
+          );
+          recommendations.push(
+            `On publisher execute immediately: ALTER SYSTEM SET max_slot_wal_keep_size = '50GB'; SELECT pg_reload_conf();`
+          );
+        }
+
+        // Check 3: Bi-Directional Infinite Echo Loop Trap
+        if (args.isBiDirectional && !args.originNoneConfigured) {
+          severity = severity === 'EMERGENCY' ? 'EMERGENCY' : 'CRITICAL';
+          violations.push(
+            `CIRCULAR REPLICATION HAZARD: Bi-directional replication topology detected without origin = none. Applied remote changes will be republished locally, triggering permanent ping-pong collisions.`
+          );
+          recommendations.push(
+            `In PostgreSQL 16+, alter subscription: ALTER SUBSCRIPTION ${args.subscriptionName} SET (origin = none);`
+          );
+        }
+
+        // Check 4: Missing Subscriber Table Indexing (REPLICA IDENTITY Full Scan)
+        if (args.hasUnindexedSubscriberTables) {
+          violations.push(
+            `FULL TABLE SCAN PENALTY: One or more subscribed tables lack Primary Keys or Unique Indexes. UPDATE/DELETE replay degrades to sequential table scans, causing 100% CPU lockup.`
+          );
+          recommendations.push(
+            `Add Primary Key or configure REPLICA IDENTITY USING INDEX on all subscribed tables on the subscriber.`
+          );
+        }
+
+        const isCompliant = violations.length === 0;
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              isCompliant,
+              severity,
+              subscriptionName: args.subscriptionName,
+              errorCount: args.errorCount,
+              lastErrorLsn: args.lastErrorLsn,
+              recommendedSkipSql,
+              violations,
+              recommendations,
+              status: isCompliant ? 'certified_logical_replication_healthy' : 'replication_remediation_required',
+            }, null, 2),
+          }],
+        };
+      }
+    );
   }
   ```
 

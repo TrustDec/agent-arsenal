@@ -6808,6 +6808,185 @@ export default defineEventHandler(async (event): Promise<ArchiverStatusPayload> 
 });
 ```
 
+### Vue 3 Composition API & Nuxt 3 Server Route Invariants for Real-Time Logical Replication Conflict Observability
+
+In Nuxt 3 mission-critical database operations dashboards, surfacing PostgreSQL logical replication subscription health, active worker conflicts, and audited skip LSN actions requires strict decoupling of Nitro server endpoints and client composables:
+
+1. **Nitro Server Route with Schema Safeguards**: The endpoint (`server/api/admin/replication/conflicts.get.ts`) queries `pg_stat_subscription_errors` and calculates byte lag via `pg_wal_lsn_diff`, handling PostgreSQL version variations (e.g. `disable_on_error` support in PG 15+).
+2. **`shallowRef` Reactivity for High-Frequency Polling**: When polling subscription status every 5 seconds, use `shallowRef` to prevent Vue's deep proxy traversal on large metadata objects.
+3. **Audited Skip Execution Action**: The skip action route enforces operator identity, mandatory rationale documentation, and atomic pre-flight conflict validation before invoking `ALTER SUBSCRIPTION ... SKIP (lsn = ...)`.
+
+```typescript
+// server/api/admin/replication/conflicts.get.ts
+import { defineEventHandler, createError } from 'h3';
+import { sql } from 'kysely';
+import { subscriberDb } from '~~/server/utils/db';
+
+export interface SubscriptionConflictPayload {
+  subname: string;
+  workerPid: number | null;
+  errorCount: number;
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
+  lastErrorLsn: string | null;
+  lastErrorTime: string | null;
+  disableOnError: boolean;
+  status: 'HEALTHY' | 'CRASH_LOOPING' | 'PAUSED_ON_ERROR' | 'UNINDEXED_RISK';
+}
+
+export default defineEventHandler(async (): Promise<SubscriptionConflictPayload[]> => {
+  try {
+    const results = await sql<{
+      subname: string;
+      pid: number | null;
+      last_error_code: string | null;
+      last_error_message: string | null;
+      last_error_lsn: string | null;
+      last_error_time: Date | null;
+      last_error_count: string | null;
+      subdisableonerr: boolean | null;
+    }>`
+      SELECT
+        s.subname,
+        stat.pid,
+        err.last_error_code,
+        err.last_error_message,
+        err.last_error_lsn::text,
+        err.last_error_time,
+        err.last_error_count,
+        COALESCE(s.subdisableonerr, false) AS subdisableonerr
+      FROM pg_subscription s
+      LEFT JOIN pg_stat_subscription stat ON stat.subid = s.oid
+      LEFT JOIN pg_stat_subscription_errors err ON err.subid = s.oid;
+    `.execute(subscriberDb);
+
+    return results.rows.map((row) => {
+      const errorCount = parseInt(row.last_error_count || '0', 10);
+      let status: SubscriptionConflictPayload['status'] = 'HEALTHY';
+
+      if (errorCount > 0) {
+        status = row.subdisableonerr ? 'PAUSED_ON_ERROR' : 'CRASH_LOOPING';
+      }
+
+      return {
+        subname: row.subname,
+        workerPid: row.pid,
+        errorCount,
+        lastErrorCode: row.last_error_code,
+        lastErrorMessage: row.last_error_message,
+        lastErrorLsn: row.last_error_lsn,
+        lastErrorTime: row.last_error_time ? row.last_error_time.toISOString() : null,
+        disableOnError: Boolean(row.subdisableonerr),
+        status,
+      };
+    });
+  } catch (err: any) {
+    throw createError({
+      statusCode: 500,
+      statusMessage: `Failed to query subscription errors: ${err.message}`,
+    });
+  }
+});
+```
+
+```vue
+<!-- components/admin/ReplicationConflictSentinel.vue -->
+<script setup lang="ts">
+import { shallowRef, computed, onMounted, onUnmounted } from 'vue';
+
+interface SubscriptionRecord {
+  subname: string;
+  workerPid: number | null;
+  errorCount: number;
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
+  lastErrorLsn: string | null;
+  lastErrorTime: string | null;
+  disableOnError: boolean;
+  status: 'HEALTHY' | 'CRASH_LOOPING' | 'PAUSED_ON_ERROR' | 'UNINDEXED_RISK';
+}
+
+const subscriptions = shallowRef<SubscriptionRecord[]>([]);
+const isPolling = shallowRef(false);
+let timer: ReturnType<typeof setInterval> | null = null;
+
+const hasCrashLoop = computed(() =>
+  subscriptions.value.some((s) => s.status === 'CRASH_LOOPING')
+);
+
+async function refreshData() {
+  try {
+    const data = await $fetch<SubscriptionRecord[]>('/api/admin/replication/conflicts');
+    subscriptions.value = data;
+  } catch (err) {
+    console.error('Failed to fetch replication conflicts', err);
+  }
+}
+
+onMounted(() => {
+  refreshData();
+  timer = setInterval(refreshData, 5000);
+});
+
+onUnmounted(() => {
+  if (timer) clearInterval(timer);
+});
+</script>
+
+<template>
+  <div class="rounded-xl border border-slate-200 bg-white p-5 shadow-sm space-y-4">
+    <div class="flex items-center justify-between">
+      <div>
+        <h2 class="text-base font-semibold text-slate-900">Logical Replication Sentinel</h2>
+        <p class="text-xs text-slate-500">Live subscription worker health and conflict alerts</p>
+      </div>
+      <div>
+        <span
+          v-if="hasCrashLoop"
+          class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-rose-50 text-rose-700 border border-rose-200 animate-pulse"
+        >
+          ● Crash Loop Active
+        </span>
+        <span
+          v-else
+          class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200"
+        >
+          ● All Workers Healthy
+        </span>
+      </div>
+    </div>
+
+    <div class="divide-y divide-slate-100">
+      <div
+        v-for="sub in subscriptions"
+        :key="sub.subname"
+        class="py-3 flex items-center justify-between"
+      >
+        <div>
+          <span class="font-mono font-medium text-xs text-slate-800">{{ sub.subname }}</span>
+          <p v-if="sub.errorCount > 0" class="text-xs text-rose-600 mt-0.5">
+            Error on LSN <span class="font-mono font-semibold">{{ sub.lastErrorLsn }}</span>:
+            {{ sub.lastErrorMessage }} ({{ sub.errorCount }} retries)
+          </p>
+        </div>
+        <div class="text-right text-xs">
+          <span
+            :class="{
+              'text-rose-600 font-bold': sub.status === 'CRASH_LOOPING',
+              'text-amber-600 font-medium': sub.status === 'PAUSED_ON_ERROR',
+              'text-emerald-600': sub.status === 'HEALTHY',
+            }"
+          >
+            {{ sub.status }}
+          </span>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+```
+
+
 
 
 

@@ -7738,6 +7738,211 @@ In SvelteKit 2 administrative consoles, displaying real-time WAL archiver health
 </div>
 ```
 
+### Svelte 5 Runes & Streaming SSR Load Discipline for Database Logical Replication Conflicts & Subscription Telemetry
+
+In SvelteKit 2 mission-critical database operations dashboards, rendering real-time PostgreSQL logical replication subscription telemetry, detecting apply worker crash loops via `pg_stat_subscription_errors`, and safely triggering audited `ALTER SUBSCRIPTION ... SKIP (lsn)` actions requires strict reactive boundaries using Svelte 5 Runes (`$state`, `$derived`):
+
+1. **Reactive Subscription Health State**: Manage active errors, worker PID status, and replication lag with `$state` without memory leaks.
+2. **Derived Severity & Conflict Badges**: Compute status levels (`healthy`, `paused`, `crash_looping`, `critical_lag`) via `$derived`.
+3. **Audited Skip LSN Modal State**: Ensure destructive skip operations require verified operator confirmation and generate machine-auditable change requests.
+
+```svelte
+<!-- src/routes/admin/replication/+page.svelte -->
+<script lang="ts">
+  import type { PageData } from './$types';
+
+  interface SubscriptionError {
+    subname: string;
+    tableName: string | null;
+    errorCode: string | null;
+    errorMessage: string | null;
+    errorLsn: string;
+    errorCount: number;
+    errorTime: string;
+  }
+
+  interface SubscriptionMetric {
+    subname: string;
+    enabled: boolean;
+    workerPid: number | null;
+    receivedLsn: string | null;
+    lagSeconds: number;
+    activeConflict: SubscriptionError | null;
+    disableOnError: boolean;
+  }
+
+  let { data }: { data: PageData } = $props();
+
+  let subscriptions = $state<SubscriptionMetric[]>(data.subscriptions);
+  let selectedSkipConflict = $state<SubscriptionError | null>(null);
+  let skipReason = $state('');
+  let isSubmitting = $state(false);
+
+  // Derived: Count of active conflicts across all subscriptions
+  let totalConflicts = $derived(() => {
+    return subscriptions.filter(s => s.activeConflict !== null).length;
+  });
+
+  // Derived: Worst status across the fleet
+  let fleetStatus = $derived(() => {
+    if (subscriptions.some(s => s.activeConflict && !s.disableOnError)) return 'critical_crash_loop';
+    if (subscriptions.some(s => s.activeConflict)) return 'paused_on_conflict';
+    if (subscriptions.some(s => s.lagSeconds > 300)) return 'lagging';
+    return 'healthy';
+  });
+
+  async function handleExecuteSkip(conflict: SubscriptionError) {
+    if (!skipReason.trim()) return;
+    isSubmitting = true;
+    try {
+      const res = await fetch(`/api/admin/replication/${conflict.subname}/skip`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lsn: conflict.errorLsn, reason: skipReason })
+      });
+      if (res.ok) {
+        // Optimistically clear the active conflict
+        const target = subscriptions.find(s => s.subname === conflict.subname);
+        if (target) target.activeConflict = null;
+        selectedSkipConflict = null;
+        skipReason = '';
+      }
+    } finally {
+      isSubmitting = false;
+    }
+  }
+</script>
+
+<div class="space-y-6 max-w-6xl mx-auto p-6">
+  <!-- Header with Fleet Health Badge -->
+  <div class="flex items-center justify-between border-b pb-4">
+    <div>
+      <h1 class="text-2xl font-bold tracking-tight text-slate-900">Logical Replication Fleet</h1>
+      <p class="text-sm text-slate-500 mt-1">Real-time subscription status, apply worker telemetry, and conflict mitigation.</p>
+    </div>
+    <div>
+      {#if fleetStatus() === 'healthy'}
+        <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
+          ● All Subscriptions Normal
+        </span>
+      {:else if fleetStatus() === 'paused_on_conflict'}
+        <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-amber-50 text-amber-700 border border-amber-200">
+          ▲ Conflict Paused (disable_on_error)
+        </span>
+      {:else}
+        <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-rose-50 text-rose-700 border border-rose-200 animate-pulse">
+          ✖ Apply Worker Crash Loop Detected
+        </span>
+      {/if}
+    </div>
+  </div>
+
+  <!-- Subscriptions Table -->
+  <div class="border border-slate-200 rounded-xl overflow-hidden bg-white shadow-sm">
+    <table class="min-w-full divide-y divide-slate-200 text-sm">
+      <thead class="bg-slate-50 text-slate-600 font-medium">
+        <tr>
+          <th class="py-3 px-4 text-left">Subscription</th>
+          <th class="py-3 px-4 text-left">Worker PID</th>
+          <th class="py-3 px-4 text-left">Received LSN</th>
+          <th class="py-3 px-4 text-left">Replication Lag</th>
+          <th class="py-3 px-4 text-left">Status</th>
+          <th class="py-3 px-4 text-right">Actions</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-slate-100">
+        {#each subscriptions as sub (sub.subname)}
+          <tr class={sub.activeConflict ? 'bg-rose-50/40' : 'hover:bg-slate-50/50'}>
+            <td class="py-3 px-4 font-mono font-semibold text-slate-900">{sub.subname}</td>
+            <td class="py-3 px-4 font-mono text-slate-600">
+              {sub.workerPid ? sub.workerPid : 'None (Halted)'}
+            </td>
+            <td class="py-3 px-4 font-mono text-xs text-slate-500">{sub.receivedLsn || 'N/A'}</td>
+            <td class="py-3 px-4">
+              <span class={sub.lagSeconds > 60 ? 'text-rose-600 font-bold' : 'text-slate-600'}>
+                {sub.lagSeconds}s
+              </span>
+            </td>
+            <td class="py-3 px-4">
+              {#if sub.activeConflict}
+                <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-rose-100 text-rose-800">
+                  Conflict on LSN {sub.activeConflict.errorLsn} ({sub.activeConflict.errorCount} retries)
+                </span>
+              {:else if !sub.workerPid}
+                <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-slate-100 text-slate-700">
+                  Worker Stopped
+                </span>
+              {:else}
+                <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-emerald-100 text-emerald-800">
+                  Active Replicating
+                </span>
+              {/if}
+            </td>
+            <td class="py-3 px-4 text-right">
+              {#if sub.activeConflict}
+                <button
+                  type="button"
+                  onclick={() => { selectedSkipConflict = sub.activeConflict; }}
+                  class="px-2.5 py-1 text-xs font-medium rounded-md bg-rose-600 text-white hover:bg-rose-700 focus:outline-none focus:ring-2 focus:ring-rose-500"
+                >
+                  Resolve / Skip LSN
+                </button>
+              {/if}
+            </td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Verified Skip LSN Modal -->
+  {#if selectedSkipConflict}
+    <div class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+      <div class="bg-white rounded-2xl shadow-xl max-w-lg w-full p-6 space-y-4 border border-slate-200">
+        <h3 class="text-lg font-bold text-slate-900">Surgical Skip LSN Confirmation</h3>
+        <div class="bg-slate-50 p-3 rounded-lg text-xs font-mono space-y-1 border border-slate-200">
+          <p><span class="text-slate-400">Subscription:</span> {selectedSkipConflict.subname}</p>
+          <p><span class="text-slate-400">Failing LSN:</span> {selectedSkipConflict.errorLsn}</p>
+          <p><span class="text-slate-400">Error Code:</span> {selectedSkipConflict.errorCode}</p>
+          <p><span class="text-slate-400">Error Msg:</span> {selectedSkipConflict.errorMessage}</p>
+        </div>
+        <p class="text-xs text-rose-600 font-medium">
+          ⚠️ Skipping an LSN will advance the subscription past this commit without applying its local changes. Ensure data parity is manually reconciled.
+        </p>
+        <div>
+          <label for="reason" class="block text-xs font-semibold text-slate-700 mb-1">Audit Reason (Required)</label>
+          <input
+            id="reason"
+            type="text"
+            bind:value={skipReason}
+            placeholder="e.g. Duplicate row inserted manually in disaster recovery exercise"
+            class="w-full text-xs border border-slate-300 rounded-lg p-2 focus:ring-2 focus:ring-slate-900 focus:outline-none"
+          />
+        </div>
+        <div class="flex justify-end space-x-2 pt-2">
+          <button
+            type="button"
+            onclick={() => { selectedSkipConflict = null; skipReason = ''; }}
+            class="px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            disabled={!skipReason.trim() || isSubmitting}
+            onclick={() => selectedSkipConflict && handleExecuteSkip(selectedSkipConflict)}
+            class="px-3 py-1.5 text-xs font-medium rounded-lg bg-rose-600 text-white hover:bg-rose-700 disabled:opacity-50"
+          >
+            {isSubmitting ? 'Executing Skip...' : 'Execute ALTER SUBSCRIPTION SKIP'}
+          </button>
+        </div>
+      </div>
+    </div>
+  {/if}
+</div>
+```
+
+
 
 
 
