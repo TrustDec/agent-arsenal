@@ -13343,14 +13343,145 @@ func (e *SafeTenantExecutor) MigrateFleetConcurrently(
 	return errList
 }
 ```
+
+### 13.26 PostgreSQL Major Version Upgrade Cutover Resilience, Pool Reconnection & Invalidation Discipline (`pgx/v5`)
+When operating Go services against PostgreSQL clusters undergoing major version upgrades (`pg_upgrade`):
+- **Server Version Shift Detection**: Use `BeforeAcquire` hooks to inspect `conn.PgConn().ParameterStatus("server_version")`. When the major version jumps (e.g., 15 $\to$ 17), immediately issue `conn.DeallocateAll(ctx)` to invalidate pre-compiled plans and prevent cached plan mismatch crashes (`SQLSTATE 0A000`).
+- **Decorrelated Jitter Cutover Backoff**: Intercept PostgreSQL shutdown error codes (`57P01: admin_shutdown`, `57P02: crash_shutdown`, `57P03: cannot_connect_now`) and apply full decorrelated exponential jitter retry: $\tau_k = \text{Uniform}(0, \min(T_{\text{max}}, 2^k \cdot T_{\text{base}}))$, preventing client reconnection thundering herds from overwhelming the newly upgraded postmaster.
+- **Connection Pool Recycling**: Configure `MaxConnLifetime = 15 * time.Minute` and `HealthCheckPeriod = 2 * time.Second` to cycle out stale pre-upgrade TCP sockets without dropping in-flight user transactions.
+
+```go
+package cutover
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math/rand"
+	"sync/atomic"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// CutoverResilientPool wraps pgxpool.Pool to guarantee continuous availability
+// across PostgreSQL major version upgrades and pg_upgrade maintenance cutovers.
+type CutoverResilientPool struct {
+	pool        *pgxpool.Pool
+	logger      *slog.Logger
+	lastVersion atomic.Int32
+}
+
+func NewCutoverResilientPool(ctx context.Context, connString string, logger *slog.Logger) (*CutoverResilientPool, error) {
+	cfg, err := pgxpool.ParseConfig(connString)
+	if err != nil {
+		return nil, fmt.Errorf("cutover: failed to parse pool config: %w", err)
+	}
+
+	// Mandatory TLS & channel binding invariants
+	cfg.ConnConfig.RuntimeParams["sslmode"] = "verify-full"
+	cfg.ConnConfig.RuntimeParams["channel_binding"] = "require"
+
+	cfg.HealthCheckPeriod = 1 * time.Second
+	cfg.MaxConnLifetime = 15 * time.Minute
+	cfg.MaxConnIdleTime = 2 * time.Minute
+
+	p := &CutoverResilientPool{
+		logger: logger,
+	}
+
+	// BeforeAcquire hook: detect post-pg_upgrade major version jump and flush statement plans
+	cfg.BeforeAcquire = func(ctx context.Context, conn *pgx.Conn) bool {
+		serverVer := conn.PgConn().ParameterStatus("server_version")
+		var major int
+		_, _ = fmt.Sscanf(serverVer, "%d", &major)
+
+		prev := p.lastVersion.Load()
+		if prev != 0 && int32(major) != prev {
+			p.logger.WarnContext(ctx, "database major version shift detected during cutover",
+				slog.Int("previous_major", int(prev)),
+				slog.Int("new_major", major),
+			)
+			// Purge prepared statements on connection to prevent binary descriptor drift
+			_ = conn.DeallocateAll(ctx)
+		}
+		if major > 0 {
+			p.lastVersion.Store(int32(major))
+		}
+		return true
+	}
+
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("cutover: failed to init pool: %w", err)
+	}
+	p.pool = pool
+
+	return p, nil
+}
+
+// ExecuteWithCutoverRetry executes a transactional callback with decorrelated jitter retry
+// designed specifically for transient pg_ctl stop / pg_upgrade cutover windows.
+func (p *CutoverResilientPool) ExecuteWithCutoverRetry(
+	ctx context.Context,
+	maxAttempts int,
+	baseBackoff time.Duration,
+	fn func(ctx context.Context, tx pgx.Tx) error,
+) error {
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		err := pgx.BeginTxFunc(ctx, p.pool, pgx.TxOptions{
+			IsoLevel: pgx.ReadCommitted,
+		}, fn)
+
+		if err == nil {
+			return nil
+		}
+
+		lastErr = err
+
+		// 57P01: admin_shutdown, 57P02: crash_shutdown, 57P03: cannot_connect_now
+		var pgErr *pgconn.PgError
+		isShutdown := errors.As(err, &pgErr) && (pgErr.Code == "57P01" || pgErr.Code == "57P02" || pgErr.Code == "57P03")
+
+		if !isShutdown && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+
+		if attempt < maxAttempts-1 {
+			maxSleep := baseBackoff * (1 << attempt)
+			if maxSleep > 8*time.Second {
+				maxSleep = 8 * time.Second
+			}
+			jitter := time.Duration(rand.Int63n(int64(maxSleep)))
+			p.logger.InfoContext(ctx, "pg_upgrade cutover in progress; backing off connection retry",
+				slog.Int("attempt", attempt+1),
+				slog.Duration("backoff", jitter),
+				slog.String("error", err.Error()),
+			)
+			select {
+			case <-time.After(jitter):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+
+	return fmt.Errorf("cutover retry failed after %d attempts: %w", maxAttempts, lastErr)
+}
+
+func (p *CutoverResilientPool) Close() {
+	if p.pool != nil {
+		p.pool.Close()
+	}
+}
 ```
-
-
-
-
-
-
-
-
-
-
