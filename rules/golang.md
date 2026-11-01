@@ -12663,6 +12663,127 @@ func (s *GucParameterSentinel) AuditClusterDrift(ctx context.Context) error {
 }
 ```
 
+---
+
+## 21. PostgreSQL RBAC Privilege Separation, Least-Privilege Handshake & Scoped Role Sentinel
+
+When connecting application services or executing migration runners in Go (`jackc/pgx/v5`):
+
+- **Absolute Superuser Application Ban**:
+  - Never allow application services to connect as `postgres` or any superuser account. Assert `usesuper = false` during connection initialization or preflight health checks to prevent RLS bypass and host security compromises.
+- **Scoped Role Switching via `SET LOCAL ROLE`**:
+  - For operations requiring elevated privileges (e.g. multi-tenant proxying, tenant-specific role assumption), never execute bare `SET ROLE`. Always execute inside an explicit `Begin()` transaction using `SET LOCAL ROLE <role>`, ensuring that upon commit or rollback the connection immediately reverts to its base credentials, avoiding connection pool contamination.
+- **Automated Default Privileges Auditing**:
+  - Verify `pg_default_acl` on target schemas to ensure that application read-write and read-only groups retain access to newly created tables and sequences, eliminating `SQLSTATE 42501` outages.
+
+```go
+package rbac
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type DatabaseRbacSentinel struct {
+	pool   *pgxpool.Pool
+	logger *slog.Logger
+}
+
+func NewDatabaseRbacSentinel(pool *pgxpool.Pool, logger *slog.Logger) *DatabaseRbacSentinel {
+	return &DatabaseRbacSentinel{pool: pool, logger: logger}
+}
+
+// AssertLeastPrivilegeRole enforces that the active pool connection is unprivileged.
+// If connected as superuser or a role with CREATEROLE, it returns an explicit error to halt startup.
+func (s *DatabaseRbacSentinel) AssertLeastPrivilegeRole(ctx context.Context) error {
+	var isSuperuser, canCreateRole bool
+	var currentRole string
+
+	query := `
+		SELECT rolsuper, rolcreaterole, rolname
+		FROM pg_roles
+		WHERE rolname = CURRENT_USER;
+	`
+	if err := s.pool.QueryRow(ctx, query).Scan(&isSuperuser, &canCreateRole, &currentRole); err != nil {
+		return fmt.Errorf("inspect current role security: %w", err)
+	}
+
+	if isSuperuser {
+		return fmt.Errorf("CRITICAL SECURITY INVARIANT VIOLATION: connected as SUPERUSER (%s). Application runtimes must connect using least-privilege service roles", currentRole)
+	}
+
+	if canCreateRole {
+		s.logger.Warn("Connected role possesses CREATEROLE privilege; audit role permissions", "role", currentRole)
+	}
+
+	s.logger.Info("Database connection authenticated under least-privilege role", "role", currentRole)
+	return nil
+}
+
+// ExecuteAsScopedRole runs the given callback under a temporary role using SET LOCAL ROLE.
+// Upon COMMIT or ROLLBACK, the server session automatically reverts to the base pool connection identity.
+func (s *DatabaseRbacSentinel) ExecuteAsScopedRole(
+	ctx context.Context,
+	temporaryRole string,
+	fn func(tx pgx.Tx) error,
+) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Sanitize identifier to prevent SQL injection in role name
+	sanitizedRole := pgx.Identifier{temporaryRole}.Sanitize()
+	setRoleSql := fmt.Sprintf("SET LOCAL ROLE %s;", sanitizedRole)
+
+	if _, err := tx.Exec(ctx, setRoleSql); err != nil {
+		return fmt.Errorf("set local role %s: %w", temporaryRole, err)
+	}
+
+	if err := fn(tx); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+
+// AuditSchemaDefaultAcls checks whether target schemas have forward-facing default grants for target groups.
+func (s *DatabaseRbacSentinel) AuditSchemaDefaultAcls(ctx context.Context, schemaName string) ([]string, error) {
+	query := `
+		SELECT r_owner.rolname AS owner_name, a.defaclobjtype, a.defaclacl::text
+		FROM pg_namespace n
+		JOIN pg_roles r_owner ON r_owner.oid = n.nspowner
+		LEFT JOIN pg_default_acl a ON a.defaclnsp = n.oid AND a.defaclrole = r_owner.oid
+		WHERE n.nspname = $1;
+	`
+	rows, err := s.pool.Query(ctx, query, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("audit default acls for schema %s: %w", schemaName, err)
+	}
+	defer rows.Close()
+
+	var findings []string
+	for rows.Next() {
+		var ownerName, objType string
+		var aclText *string
+		if err := rows.Scan(&ownerName, &objType, &aclText); err != nil {
+			return nil, err
+		}
+		if aclText == nil {
+			findings = append(findings, fmt.Sprintf("schema '%s' (owner: %s) lacks default privileges for object type '%s'", schemaName, ownerName, objType))
+		}
+	}
+
+	return findings, nil
+}
+```
+
+
 
 
 

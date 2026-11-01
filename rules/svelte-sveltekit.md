@@ -8975,6 +8975,112 @@ When building database administration dashboards in Svelte 5, monitor GUC parame
 </div>
 ```
 
+---
+
+## 20. Database RBAC Privilege Separation & Least-Privilege Role Sentinel (Svelte 5 Runes)
+
+When connecting SvelteKit server routes (`+server.ts`, `+page.server.ts`) to PostgreSQL databases or rendering administrative RBAC telemetry:
+
+- **Absolute Prohibition on Superuser Connection Strings**: Never embed superuser database credentials in `$env/dynamic/private` or `.env`. Application routes must strictly authenticate using unprivileged service roles (`app_readwrite` or `app_readonly`) to ensure Row-Level Security policies are strictly enforced and host operations are physically prohibited.
+- **Dynamic Role Verification in Server Hooks**: In `hooks.server.ts`, assert at boot time that `rolsuper = false` on the active connection pool, failing fast if elevated credentials were inadvertently supplied.
+- **Svelte 5 Reactive RBAC Status Sentinel**: Use Svelte 5 `$state` and `$derived` to monitor and visualize role privilege blast radius, unhardened `SECURITY DEFINER` functions, and `ALTER DEFAULT PRIVILEGES` gaps.
+
+```svelte
+<!-- src/lib/components/DatabaseRbacSentinel.svelte (Svelte 5 Runes) -->
+<script lang="ts">
+  interface RoleAuditViolation {
+    severity: 'CRITICAL' | 'HIGH' | 'MEDIUM';
+    category: string;
+    description: string;
+    remediationSql: string;
+  }
+
+  interface RoleSecurityReport {
+    roleName: string;
+    isSuperuser: boolean;
+    connectionLimit: number;
+    blastRadiusScore: number;
+    violations: RoleAuditViolation[];
+  }
+
+  interface Props {
+    report: RoleSecurityReport;
+    onRemediate?: (sql: string) => void;
+  }
+
+  let { report, onRemediate }: Props = $props();
+
+  // Svelte 5 Derived State: Risk classification
+  let isCriticalRisk = $derived(report.isSuperuser || report.blastRadiusScore > 1000);
+  let statusBadgeClass = $derived(
+    isCriticalRisk
+      ? 'bg-rose-950/60 text-rose-400 border-rose-800/40'
+      : report.violations.length > 0
+      ? 'bg-amber-950/60 text-amber-400 border-amber-800/40'
+      : 'bg-emerald-950/60 text-emerald-400 border-emerald-800/40'
+  );
+</script>
+
+<div class="rounded-xl border border-zinc-800 bg-zinc-950 p-4 shadow-sm space-y-3">
+  <div class="flex items-center justify-between">
+    <div class="flex items-center gap-2">
+      <span class="font-mono text-sm font-semibold text-zinc-100">{report.roleName}</span>
+      <span class="rounded px-2 py-0.5 text-xs font-medium border {statusBadgeClass}">
+        {isCriticalRisk ? 'CRITICAL RISK' : report.violations.length > 0 ? 'NEEDS HARDENING' : 'LEAST PRIVILEGE'}
+      </span>
+    </div>
+    <div class="text-xs font-mono text-zinc-400">
+      Blast Radius Score: <span class="font-semibold text-zinc-200">{report.blastRadiusScore}</span>
+    </div>
+  </div>
+
+  <div class="grid grid-cols-2 gap-2 text-xs">
+    <div class="rounded bg-zinc-900/60 p-2 border border-zinc-800/60">
+      <span class="text-zinc-500">Superuser:</span>
+      <span class="ml-1 font-mono font-medium {report.isSuperuser ? 'text-rose-400' : 'text-emerald-400'}">
+        {report.isSuperuser ? 'YES (VIOLATION)' : 'NO'}
+      </span>
+    </div>
+    <div class="rounded bg-zinc-900/60 p-2 border border-zinc-800/60">
+      <span class="text-zinc-500">Conn Limit:</span>
+      <span class="ml-1 font-mono font-medium text-zinc-200">
+        {report.connectionLimit === -1 ? 'UNBOUNDED (-1)' : report.connectionLimit}
+      </span>
+    </div>
+  </div>
+
+  {#if report.violations.length > 0}
+    <div class="space-y-2 pt-2 border-t border-zinc-800/80">
+      <h4 class="text-xs font-medium text-zinc-400 uppercase tracking-wider">Security Violations</h4>
+      {#each report.violations as violation}
+        <div class="rounded bg-rose-950/30 p-2.5 border border-rose-900/40 flex items-start justify-between gap-3">
+          <div class="space-y-1">
+            <div class="flex items-center gap-1.5">
+              <span class="rounded bg-rose-900/60 px-1.5 py-0.2 text-[10px] text-rose-300 font-semibold">
+                {violation.category}
+              </span>
+            </div>
+            <p class="text-xs text-zinc-300">{violation.description}</p>
+            <code class="block font-mono text-[11px] text-rose-300 bg-black/40 px-2 py-1 rounded">
+              {violation.remediationSql}
+            </code>
+          </div>
+          {#if onRemediate}
+            <button
+              onclick={() => onRemediate(violation.remediationSql)}
+              class="shrink-0 rounded bg-rose-900/40 px-2.5 py-1 text-xs text-rose-200 hover:bg-rose-800/60 transition"
+            >
+              Remediate
+            </button>
+          {/if}
+        </div>
+      {/each}
+    </div>
+  {/if}
+</div>
+```
+
+
 
 
 

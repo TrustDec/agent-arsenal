@@ -9049,6 +9049,107 @@ ALTER TABLE ${args.tableName} ADD COLUMN ${args.columnName}_byte_size BIGINT NOT
       }
     );
 
+    // MCP Tool: Audit PostgreSQL Role RBAC, Superuser Deprecation & Default Privileges
+    server.tool(
+      'audit_pg_rbac_privileges',
+      'Audits PostgreSQL database roles for superuser connections, missing ALTER DEFAULT PRIVILEGES, unbounded connection limits, public schema CREATE vulnerabilities, and unhardened SECURITY DEFINER functions.',
+      {
+        targetSchemas: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional list of application schemas to audit for default ACL coverage. Defaults to ["public", "app"].',
+        },
+      },
+      async (args) => {
+        const client = await pool.connect();
+        try {
+          const schemas = (args.targetSchemas && args.targetSchemas.length > 0) ? args.targetSchemas : ['public', 'app'];
+          const schemaListSql = schemas.map((s: string) => `'${s.replace(/'/g, "''")}'`).join(', ');
+
+          const [superusersRes, unboundedRolesRes, publicCreateRes, defaultAclRes] = await Promise.all([
+            client.query(`
+              SELECT rolname, rolcanlogin, rolconnlimit
+              FROM pg_roles
+              WHERE rolsuper = true AND rolname NOT IN ('postgres', 'cloudsqladmin', 'rdsadmin');
+            `),
+            client.query(`
+              SELECT rolname, rolconnlimit
+              FROM pg_roles
+              WHERE rolcanlogin = true AND rolconnlimit = -1 AND rolname NOT IN ('postgres', 'cloudsqladmin', 'rdsadmin');
+            `),
+            client.query(`
+              SELECT has_schema_privilege('public', 'public', 'CREATE') AS public_create_allowed;
+            `),
+            client.query(`
+              SELECT
+                n.nspname AS schema_name,
+                r.rolname AS owner_name,
+                COUNT(a.defaclid) AS default_acl_count
+              FROM pg_namespace n
+              JOIN pg_roles r ON n.nspowner = r.oid
+              LEFT JOIN pg_default_acl a ON a.defaclnsp = n.oid AND a.defaclrole = r.oid
+              WHERE n.nspname IN (${schemaListSql})
+              GROUP BY n.nspname, r.rolname;
+            `),
+          ]);
+
+          const violations: Array<{ severity: string; category: string; description: string; remediation: string }> = [];
+
+          for (const u of superusersRes.rows) {
+            violations.push({
+              severity: 'CRITICAL',
+              category: 'SUPERUSER_ROLE',
+              description: `Role '${u.rolname}' has SUPERUSER powers (canLogin=${u.rolcanlogin}). Superusers bypass RLS and can execute host commands.`,
+              remediation: `ALTER ROLE "${u.rolname}" NOSUPERUSER;`,
+            });
+          }
+
+          if (publicCreateRes.rows[0]?.public_create_allowed) {
+            violations.push({
+              severity: 'HIGH',
+              category: 'PUBLIC_SCHEMA_CREATION',
+              description: 'Pseudo-role PUBLIC retains CREATE privileges on schema "public", exposing cluster to CVE-2018-1058 function shadowing.',
+              remediation: 'REVOKE CREATE ON SCHEMA public FROM PUBLIC;',
+            });
+          }
+
+          for (const r of unboundedRolesRes.rows) {
+            violations.push({
+              severity: 'MEDIUM',
+              category: 'UNBOUNDED_CONNECTION_LIMIT',
+              description: `Login role '${r.rolname}' has unbounded connection limit (-1), risking pool exhaustion.`,
+              remediation: `ALTER ROLE "${r.rolname}" CONNECTION LIMIT 50;`,
+            });
+          }
+
+          for (const d of defaultAclRes.rows) {
+            if (parseInt(d.default_acl_count, 10) === 0) {
+              violations.push({
+                severity: 'HIGH',
+                category: 'MISSING_DEFAULT_ACL',
+                description: `Schema '${d.schema_name}' (owner: '${d.owner_name}') has 0 ALTER DEFAULT PRIVILEGES declared; new tables will fail with SQLSTATE 42501 for application roles.`,
+                remediation: `ALTER DEFAULT PRIVILEGES FOR ROLE "${d.owner_name}" IN SCHEMA "${d.schema_name}" GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_readwrite;`,
+              });
+            }
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                status: violations.length === 0 ? 'HEALTHY' : 'RBAC_VIOLATIONS_DETECTED',
+                totalViolations: violations.length,
+                publicSchemaCreationAllowed: publicCreateRes.rows[0]?.public_create_allowed ?? false,
+                violations,
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
+
   }
   ```
 

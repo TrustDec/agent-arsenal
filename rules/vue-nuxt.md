@@ -7876,6 +7876,113 @@ const filteredParameters = computed(() => {
 </template>
 ```
 
+---
+
+## 20. Database RBAC Privilege Separation & Least-Privilege Role Sentinel (Vue 3.5 / Nuxt 3)
+
+When connecting Nuxt 3 Nitro server routes (`server/api/`, `server/middleware/`) to PostgreSQL persistence layers:
+
+- **Strict Environment Credential Separation**: Never provide superuser connection strings (`postgres://postgres:...`) in Nuxt `runtimeConfig` or environment variables. Production application handlers must connect using unprivileged service roles (`app_readwrite` or `app_readonly`) to ensure Row-Level Security (RLS) policies are physically enforced and server filesystem execution is impossible.
+- **Nitro Server Middleware Role Verification**: In `server/middleware/rbac-check.ts`, execute a pre-flight probe ensuring `rolsuper = false` on database pool startup, failing closed on misconfigured admin credentials.
+- **Vue 3.5 Composition API RBAC Dashboard Component**: Provide real-time introspection into database role blast radius scores, default privilege coverage, and unpinned `SECURITY DEFINER` routines.
+
+```vue
+<!-- components/DatabaseRbacSentinel.vue -->
+<script setup lang="ts">
+import { computed } from 'vue';
+
+export interface RoleAuditViolation {
+  severity: 'CRITICAL' | 'HIGH' | 'MEDIUM';
+  category: string;
+  description: string;
+  remediationSql: string;
+}
+
+export interface RoleSecurityReport {
+  roleName: string;
+  isSuperuser: boolean;
+  connectionLimit: number;
+  blastRadiusScore: number;
+  violations: RoleAuditViolation[];
+}
+
+const props = defineProps<{
+  report: RoleSecurityReport;
+}>();
+
+const emit = defineEmits<{
+  (e: 'remediate', sql: string): void;
+}>();
+
+const isCritical = computed(() => props.report.isSuperuser || props.report.blastRadiusScore > 1000);
+
+const statusBadgeClass = computed(() => {
+  if (isCritical.value) return 'bg-rose-950/60 text-rose-400 border-rose-800/40';
+  if (props.report.violations.length > 0) return 'bg-amber-950/60 text-amber-400 border-amber-800/40';
+  return 'bg-emerald-950/60 text-emerald-400 border-emerald-800/40';
+});
+</script>
+
+<template>
+  <div class="rounded-xl border border-zinc-800 bg-zinc-950 p-4 shadow-sm space-y-3">
+    <div class="flex items-center justify-between">
+      <div class="flex items-center gap-2">
+        <span class="font-mono text-sm font-semibold text-zinc-100">{{ report.roleName }}</span>
+        <span :class="['rounded px-2 py-0.5 text-xs font-medium border', statusBadgeClass]">
+          {{ isCritical ? 'CRITICAL RISK' : report.violations.length > 0 ? 'NEEDS HARDENING' : 'LEAST PRIVILEGE' }}
+        </span>
+      </div>
+      <div class="text-xs font-mono text-zinc-400">
+        Blast Radius Score: <span class="font-semibold text-zinc-200">{{ report.blastRadiusScore }}</span>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-2 gap-2 text-xs">
+      <div class="rounded bg-zinc-900/60 p-2 border border-zinc-800/60">
+        <span class="text-zinc-500">Superuser:</span>
+        <span :class="['ml-1 font-mono font-medium', report.isSuperuser ? 'text-rose-400' : 'text-emerald-400']">
+          {{ report.isSuperuser ? 'YES (VIOLATION)' : 'NO' }}
+        </span>
+      </div>
+      <div class="rounded bg-zinc-900/60 p-2 border border-zinc-800/60">
+        <span class="text-zinc-500">Conn Limit:</span>
+        <span class="ml-1 font-mono font-medium text-zinc-200">
+          {{ report.connectionLimit === -1 ? 'UNBOUNDED (-1)' : report.connectionLimit }}
+        </span>
+      </div>
+    </div>
+
+    <div v-if="report.violations.length > 0" class="space-y-2 pt-2 border-t border-zinc-800/80">
+      <h4 class="text-xs font-medium text-zinc-400 uppercase tracking-wider">Security Violations</h4>
+      <div
+        v-for="violation in report.violations"
+        :key="violation.category"
+        class="rounded bg-rose-950/30 p-2.5 border border-rose-900/40 flex items-start justify-between gap-3"
+      >
+        <div class="space-y-1">
+          <div class="flex items-center gap-1.5">
+            <span class="rounded bg-rose-900/60 px-1.5 py-0.2 text-[10px] text-rose-300 font-semibold">
+              {{ violation.category }}
+            </span>
+          </div>
+          <p class="text-xs text-zinc-300">{{ violation.description }}</p>
+          <code class="block font-mono text-[11px] text-rose-300 bg-black/40 px-2 py-1 rounded">
+            {{ violation.remediationSql }}
+          </code>
+        </div>
+        <button
+          @click="emit('remediate', violation.remediationSql)"
+          class="shrink-0 rounded bg-rose-900/40 px-2.5 py-1 text-xs text-rose-200 hover:bg-rose-800/60 transition"
+        >
+          Remediate
+        </button>
+      </div>
+    </div>
+  </div>
+</template>
+```
+
+
 
 
 
