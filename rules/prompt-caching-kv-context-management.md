@@ -307,3 +307,7 @@ In agent CLI environments such as Claude Code, Cursor, and Pi, hierarchical cont
 - **Bounded Tool Discovery Over Dumps**: Never issue commands that emit unbounded terminal output (`find .`, `ls -laR`, `cat package-lock.json`). Always pipe through head/tail or use targeted file search tools (`rg --files`, `rg -n "pattern" -g "!node_modules"`).
 - **Compaction Checkpoint Triggers**: When session turns reach 25 turns or token usage exceeds 60% of window capacity, initiate an explicit memory checkpoint into `.agents/memory/ACTIVE_CONTEXT.md`, summarizing verified ground truth and immediate next actions before discarding raw bash observations.
 
+### 3. Multi-Tenant Tool Context Virtualization & Schema Partitioning
+- **Virtual Tool Catalogs for Massive Fleets**: In multi-tenant systems with hundreds of database schemas or entities, exposing complete JSON schemas upfront exhausts the LLM context window ($O(N \times S_{\text{schema}})$) and invalidates prompt caches across tenants.
+- **Two-Tier JIT Tool Hydration**: Register lightweight ambient meta-tools that dynamically hydrate tenant-specific schemas on demand, ensuring root instructions and base tool definitions remain bit-for-bit immutable across all tenant executions for maximal KV cache prefix reuse.
+

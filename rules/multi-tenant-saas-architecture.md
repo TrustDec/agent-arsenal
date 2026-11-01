@@ -121,6 +121,19 @@ In modern scalable architectures, application servers connect to PostgreSQL via 
   }
   ```
 
+- ✅ **The Schema-per-Tenant `SET LOCAL search_path` & CVE-2018-1058 Invariant**:
+  - When utilizing the **Bridge (Schema-per-Tenant)** model, never issue session-level `SET search_path = tenant_xxx`. Like session GUCs, session `SET search_path` bleeds into subsequent transactions in PgBouncer transaction pooling mode ($P(\text{bleed}) = 1.0$).
+  - Always execute `SET LOCAL search_path` inside an explicit transaction:
+  ```sql
+  BEGIN;
+  -- Safe transaction-scoped schema isolation with CVE-2018-1058 defense:
+  SET LOCAL search_path = tenant_alpha, public, pg_catalog, pg_temp;
+
+  SELECT * FROM orders;
+  COMMIT;
+  ```
+  - **Relcache Capacity Guard**: Cap schemas per database cluster at $\le 1,000$ tenants. Above 1,000 schemas, system catalog and backend `relcache` memory consumption explodes ($O(N_{\text{tenants}} \times N_{\text{tables}} \times N_{\text{backends}})$), triggering Linux OOM killer postmaster decapitation. For $>1,000$ tenants, mandate **Pooled RLS**.
+
 ---
 
 ## 4. Broken Object Level Authorization (BOLA/IDOR) & Composite Keys

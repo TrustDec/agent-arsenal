@@ -9379,6 +9379,106 @@ ALTER TABLE ${args.tableName} ADD COLUMN ${args.columnName}_byte_size BIGINT NOT
       }
     );
 
+    // -------------------------------------------------------------------------
+    // Tool: audit_multi_tenant_schemas
+    // Audits multi-tenant schema-per-tenant catalog scale, relcache bloat risks,
+    // and CVE-2018-1058 privilege escalation vulnerabilities.
+    // -------------------------------------------------------------------------
+    server.registerTool(
+      'audit_multi_tenant_schemas',
+      {
+        description: 'Audits multi-tenant schema-per-tenant architecture, calculates catalog relation scale, projects backend relcache memory bloat, and checks for CVE-2018-1058 search_path vulnerabilities.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            schemaPrefix: {
+              type: 'string',
+              description: 'Schema prefix pattern (default: "tenant_%")',
+              default: 'tenant_%',
+            },
+            backendConnections: {
+              type: 'number',
+              description: 'Estimated concurrent connection pool size for relcache projection (default: 50)',
+              default: 50,
+            },
+          },
+        },
+      },
+      async (args: any) => {
+        const schemaPrefix = args?.schemaPrefix || 'tenant_%';
+        const backendConnections = Number(args?.backendConnections) || 50;
+        const client = await pool.connect();
+
+        try {
+          // 1. Count tenant schemas
+          const schemaRes = await client.query(
+            `SELECT count(*)::int AS count FROM pg_namespace WHERE nspname LIKE $1`,
+            [schemaPrefix]
+          );
+          const tenantSchemaCount = schemaRes.rows[0].count;
+
+          // 2. Count total relations across tenant schemas
+          const relRes = await client.query(
+            `SELECT count(*)::int AS count 
+             FROM pg_class c 
+             JOIN pg_namespace n ON n.oid = c.relnamespace 
+             WHERE n.nspname LIKE $1`,
+            [schemaPrefix]
+          );
+          const tenantRelationCount = relRes.rows[0].count;
+
+          // 3. Relcache memory estimation: ~3.5KB per relation descriptor
+          const kbPerRelation = 3.5;
+          const mbPerBackend = (tenantRelationCount * kbPerRelation) / 1024;
+          const totalRelcacheGb = (mbPerBackend * backendConnections) / 1024;
+
+          // 4. Check public schema create permissions (CVE-2018-1058 defense)
+          const publicRes = await client.query(`
+            SELECT has_schema_privilege('public', 'public', 'CREATE') AS public_create_allowed;
+          `);
+          const publicCreateAllowed = publicRes.rows[0]?.public_create_allowed ?? false;
+
+          const violations: Array<{ severity: string; category: string; description: string; remediation: string }> = [];
+
+          if (publicCreateAllowed) {
+            violations.push({
+              severity: 'HIGH',
+              category: 'CVE_2018_1058_PUBLIC_CREATE_EXPOSURE',
+              description: 'PUBLIC role has CREATE privilege on the public schema. Untrusted users can inject Trojan functions or operators to hijack administrative queries.',
+              remediation: 'Execute: REVOKE CREATE ON SCHEMA public FROM PUBLIC;',
+            });
+          }
+
+          if (tenantSchemaCount > 1000 || tenantRelationCount > 50000) {
+            violations.push({
+              severity: 'WARNING',
+              category: 'CATALOG_RELCACHE_SCALE_WALL',
+              description: `Tenant schemas (${tenantSchemaCount}) or relations (${tenantRelationCount}) exceed safe schema-per-tenant thresholds. Relcache memory per backend is ~${mbPerBackend.toFixed(1)} MB (${totalRelcacheGb.toFixed(1)} GB across ${backendConnections} connections).`,
+              remediation: 'Plan architecture transition to PostgreSQL Row-Level Security (RLS) or Database-per-Tenant (Silo).',
+            });
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                status: violations.length === 0 ? 'HEALTHY' : 'WARNINGS_DETECTED',
+                tenantSchemaCount,
+                tenantRelationCount,
+                estimatedMbPerBackend: Math.round(mbPerBackend * 10) / 10,
+                projectedRelcacheGb: Math.round(totalRelcacheGb * 10) / 10,
+                publicCreateAllowed,
+                crossoverRecommendation: tenantSchemaCount > 1000 ? 'ROW_LEVEL_SECURITY' : 'SCHEMA_PER_TENANT',
+                violations,
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
+
   }
   ```
 

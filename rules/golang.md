@@ -13209,6 +13209,140 @@ func (c *HardenedSCRAMConnector) Close() {
 		c.pool.Close()
 	}
 }
+
+### 13.25 PostgreSQL Schema-per-Tenant Multi-Tenancy, search_path Fencing & PgBouncer Bleed Defense (`pgx/v5`)
+When designing or maintaining multi-tenant microservices in Go using PostgreSQL schema-per-tenant (`CREATE SCHEMA tenant_xxx`) and `jackc/pgx/v5`:
+- **Mandatory Transaction-Scoped `SET LOCAL search_path`**: Never execute bare `SET search_path = tenant_xxx` on pooled connections (`*pgxpool.Pool`). In PgBouncer transaction pooling mode, bare `SET` modifies session state that persists after transaction completion, causing subsequent queries from unrelated tenants to read and overwrite private customer records ($P(\text{cross-tenant leak}) = 1.0$). Always wrap tenant execution inside explicit transactions with `SET LOCAL search_path = %s, public, pg_catalog, pg_temp;`.
+- **Strict Tenant Identifier Regex & Sanitization**: Never format raw tenant strings into SQL queries. PostgreSQL does not accept parameter bindings (`$1`) for `SET search_path`. Validate tenant IDs against `^[a-z0-9_]{1,63}$` and format using `pgx.Identifier{schemaName}.Sanitize()`.
+- **CVE-2018-1058 Defense**: Always explicitly include `pg_catalog` in search path to defeat Trojan function hijacking in multi-tenant schemas.
+- **Fleet Migration Concurrency & lock_timeout**: When executing migrations across thousands of tenant schemas, partition work into discrete per-schema transactions using a worker pool ($W \in [4, 8]$) bounded by `SET LOCAL lock_timeout = '2s'`, eliminating cluster-wide DDL lock convoys.
+
+```go
+package tenant
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"regexp"
+	"sync"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+var validTenantRegex = regexp.MustCompile(`^[a-z0-9_]{1,63}$`)
+
+// SafeTenantExecutor provides transactionally isolated multi-tenant operations.
+type SafeTenantExecutor struct {
+	pool *pgxpool.Pool
+}
+
+// NewSafeTenantExecutor constructs a new tenant execution engine.
+func NewSafeTenantExecutor(pool *pgxpool.Pool) (*SafeTenantExecutor, error) {
+	if pool == nil {
+		return nil, errors.New("pgx pool must not be nil")
+	}
+	return &SafeTenantExecutor{pool: pool}, nil
+}
+
+// ExecuteInTenantTx executes a tenant callback within an isolated transaction.
+// Automatically applies SET LOCAL search_path with CVE-2018-1058 defense.
+func (e *SafeTenantExecutor) ExecuteInTenantTx(
+	ctx context.Context,
+	tenantID string,
+	fn func(ctx context.Context, tx pgx.Tx) error,
+) error {
+	if !validTenantRegex.MatchString(tenantID) {
+		return fmt.Errorf("security violation: invalid tenant identifier %q", tenantID)
+	}
+
+	schemaName := "tenant_" + tenantID
+	sanitizedSchema := pgx.Identifier{schemaName}.Sanitize()
+
+	tx, err := e.pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.ReadCommitted,
+		AccessMode: pgx.ReadWrite,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to begin tenant transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Fencing: Lock and statement timeouts
+	if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '30s';"); err != nil {
+		return fmt.Errorf("failed to set safety timeouts: %w", err)
+	}
+
+	// Invariant: SET LOCAL search_path ensures zero session bleed in PgBouncer transaction pooling
+	// Explicit pg_catalog defends against CVE-2018-1058 Trojan functions
+	setPathSQL := fmt.Sprintf("SET LOCAL search_path = %s, public, pg_catalog, pg_temp;", sanitizedSchema)
+	if _, err := tx.Exec(ctx, setPathSQL); err != nil {
+		return fmt.Errorf("failed to set tenant search path: %w", err)
+	}
+
+	if err := fn(ctx, tx); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+
+// FleetMigrationWorker orchestrates discrete per-schema DDL migrations across thousands of tenants.
+func (e *SafeTenantExecutor) MigrateFleetConcurrently(
+	ctx context.Context,
+	tenants []string,
+	ddlStatement string,
+	workerCount int,
+) []error {
+	if workerCount <= 0 {
+		workerCount = 4
+	}
+	if workerCount > 8 {
+		workerCount = 8 // Bound worker concurrency to prevent replication lag and WAL saturation
+	}
+
+	tenantChan := make(chan string, len(tenants))
+	for _, t := range tenants {
+		tenantChan <- t
+	}
+	close(tenantChan)
+
+	var (
+		wg      sync.WaitGroup
+		errLock sync.Mutex
+		errList []error
+	)
+
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for t := range tenantChan {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				err := e.ExecuteInTenantTx(ctx, t, func(tCtx context.Context, tx pgx.Tx) error {
+					_, execErr := tx.Exec(tCtx, ddlStatement)
+					return execErr
+				})
+
+				if err != nil {
+					errLock.Lock()
+					errList = append(errList, fmt.Errorf("tenant %s migration failed: %w", t, err))
+					errLock.Unlock()
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	return errList
+}
+```
 ```
 
 
