@@ -10471,4 +10471,160 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+### Visibility Map (VM) Health Inspection & Index-Only Scan Heap Fetch Verification Invariants
+
+In Go services executing high-frequency read lookups or batch processing against PostgreSQL, unmodeled row updates clear the Visibility Map's `VISIBILITYMAP_ALL_VISIBLE` bits, silently degrading supposed Index-Only Scans into random I/O heap fetches that saturate `shared_buffers` and spike p99 latency by 50x–100x. Additionally, neglecting `VISIBILITYMAP_ALL_FROZEN` prevents autovacuum from skipping pages during anti-wraparound freeze cycles.
+
+Always implement autonomous Visibility Map telemetry and query plan assertions in Go persistence layers:
+
+```go
+package storage
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// TableVMMetrics tracks Visibility Map coverage and freeze status
+type TableVMMetrics struct {
+	TableName       string  `json:"table_name"`
+	TotalPages      int64   `json:"total_pages"`
+	AllVisiblePages int64   `json:"all_visible_pages"`
+	AllFrozenPages  int64   `json:"all_frozen_pages"`
+	AllVisiblePct   float64 `json:"all_visible_pct"`
+	AllFrozenPct    float64 `json:"all_frozen_pct"`
+	OldestXIDAge    int64   `json:"oldest_xid_age"`
+}
+
+type planNodeJSON struct {
+	NodeType    string         `json:"Node Type"`
+	HeapFetches *int64         `json:"Heap Fetches,omitempty"`
+	Plans       []planNodeJSON `json:"Plans,omitempty"`
+}
+
+type explainRootJSON struct {
+	Plan planNodeJSON `json:"Plan"`
+}
+
+// VisibilityMapSentinel monitors VM health and asserts Index-Only Scan fidelity
+type VisibilityMapSentinel struct {
+	pool *pgxpool.Pool
+}
+
+func NewVisibilityMapSentinel(pool *pgxpool.Pool) (*VisibilityMapSentinel, error) {
+	if pool == nil {
+		return nil, errors.New("pgx pool cannot be nil")
+	}
+	return &VisibilityMapSentinel{pool: pool}, nil
+}
+
+// AuditTableVisibility retrieves physical VM fork metrics
+func (s *VisibilityMapSentinel) AuditTableVisibility(ctx context.Context, table string) (*TableVMMetrics, error) {
+	query := `
+		SELECT 
+			c.relname,
+			c.relpages::bigint,
+			v.all_visible::bigint,
+			v.all_frozen::bigint,
+			COALESCE(ROUND((100.0 * v.all_visible / NULLIF(c.relpages, 0))::numeric, 2), 0.0)::float8,
+			COALESCE(ROUND((100.0 * v.all_frozen / NULLIF(c.relpages, 0))::numeric, 2), 0.0)::float8,
+			age(c.relfrozenxid)::bigint
+		FROM pg_class c
+		JOIN LATERAL pg_visibility_map_summary(c.oid) v ON true
+		WHERE c.relname = $1 AND c.relnamespace = 'public'::regnamespace;
+	`
+	var m TableVMMetrics
+	err := s.pool.QueryRow(ctx, query, table).Scan(
+		&m.TableName,
+		&m.TotalPages,
+		&m.AllVisiblePages,
+		&m.AllFrozenPages,
+		&m.AllVisiblePct,
+		&m.AllFrozenPct,
+		&m.OldestXIDAge,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("audit table visibility (%s): %w", table, err)
+	}
+	return &m, nil
+}
+
+// AssertIndexOnlyScan executes EXPLAIN (ANALYZE, BUFFERS) and verifies zero heap fetches
+func (s *VisibilityMapSentinel) AssertIndexOnlyScan(ctx context.Context, query string, args ...any) error {
+	explainSQL := fmt.Sprintf("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) %s", query)
+	var rawJSON []byte
+	if err := s.pool.QueryRow(ctx, explainSQL, args...).Scan(&rawJSON); err != nil {
+		return fmt.Errorf("explain query failed: %w", err)
+	}
+
+	var root []explainRootJSON
+	if err := json.Unmarshal(rawJSON, &root); err != nil {
+		return fmt.Errorf("unmarshal explain output: %w", err)
+	}
+	if len(root) == 0 {
+		return errors.New("empty explain plan returned")
+	}
+
+	var foundIOS bool
+	var totalHeapFetches int64
+
+	var walk func(node *planNodeJSON)
+	walk = func(node *planNodeJSON) {
+		if node.NodeType == "Index Only Scan" {
+			foundIOS = true
+			if node.HeapFetches != nil {
+				totalHeapFetches += *node.HeapFetches
+			}
+		}
+		for i := range node.Plans {
+			walk(&node.Plans[i])
+		}
+	}
+	walk(&root[0].Plan)
+
+	if !foundIOS {
+		return fmt.Errorf("query did not execute as an Index-Only Scan (root: %s)", root[0].Plan.NodeType)
+	}
+	if totalHeapFetches > 0 {
+		return fmt.Errorf("index-only scan degraded: encountered %d heap fetches (visibility map invalidation)", totalHeapFetches)
+	}
+
+	return nil
+}
+
+// ProactiveFreeze executes a non-blocking VACUUM FREEZE when frozen percentage drops below target
+func (s *VisibilityMapSentinel) ProactiveFreeze(ctx context.Context, table string, minFrozenPct float64) error {
+	metrics, err := s.AuditTableVisibility(ctx, table)
+	if err != nil {
+		return err
+	}
+	if metrics.AllFrozenPct >= minFrozenPct {
+		return nil // Table is sufficiently frozen
+	}
+
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire conn for freeze: %w", err)
+	}
+	defer conn.Release()
+
+	ctxTimeout, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	defer cancel()
+
+	vacuumSQL := fmt.Sprintf("VACUUM (FREEZE, ANALYZE) %s;", pgx.Identifier{table}.Sanitize())
+	if _, err := conn.Exec(ctxTimeout, vacuumSQL); err != nil {
+		return fmt.Errorf("proactive vacuum freeze (%s): %w", table, err)
+	}
+
+	return nil
+}
+```
+
+
 

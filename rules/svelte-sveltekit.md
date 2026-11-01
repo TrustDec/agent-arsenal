@@ -7454,6 +7454,90 @@ In SvelteKit administrative consoles and system diagnostics:
   };
   ```
 
+### Svelte 5 Runes & Streaming SSR Load Discipline for Database Visibility Map Telemetry
+
+In SvelteKit 2 applications rendering administrative dashboards or database health monitors, managing real-time Visibility Map and Index-Only Scan metrics requires strict adherence to Svelte 5 Runes (`$state`, `$derived`, `$effect`) and SSR data streaming boundaries:
+
+1. **Zero Module-Level Mutable Rune State on SSR**: Never declare `$state` at the module root in `+page.svelte` or server files—module-level reactive state leaks across concurrent user HTTP requests in SSR Node/Bun processes.
+2. **Streaming Deferred Promises with `<svelte:boundary>`**: Always wrap heavy queries (`pg_visibility_map_summary`) inside deferred streaming promises in `+page.server.ts` to prevent slow database queries from blocking initial HTML Time-to-First-Byte (TTFB).
+3. **Derived Health Signals**: Compute visibility ratios and freeze warnings via `$derived` instead of side-effecting `$effect` watches.
+
+```svelte
+<!-- src/routes/admin/visibility-map/+page.svelte -->
+<script lang="ts">
+  import type { PageData } from './$types';
+
+  interface TableMetrics {
+    tableName: string;
+    totalPages: number;
+    allVisiblePages: number;
+    allFrozenPages: number;
+    oldestXidAge: number;
+  }
+
+  let { data }: { data: PageData } = $props();
+
+  // Pure Svelte 5 Runes: Component-scoped reactive state
+  let selectedThreshold = $state(85);
+
+  // Derived reactive calculations without side effects
+  let metrics = $derived(data.metrics as TableMetrics[]);
+  let degradedTables = $derived(
+    metrics.filter((t) => {
+      const visiblePct = t.totalPages > 0 ? (t.allVisiblePages / t.totalPages) * 100 : 100;
+      return visiblePct < selectedThreshold;
+    })
+  );
+  let wraparoundHazards = $derived(
+    metrics.filter((t) => t.oldestXidAge > 100_000_000)
+  );
+</script>
+
+<div class="p-6 max-w-6xl mx-auto space-y-6">
+  <div class="flex items-center justify-between">
+    <h1 class="text-2xl font-bold tracking-tight">Database Visibility Map Health</h1>
+    <label class="text-sm font-medium flex items-center gap-2">
+      IOS Target Coverage (%):
+      <input 
+        type="number" 
+        bind:value={selectedThreshold} 
+        min="50" 
+        max="100" 
+        class="border rounded px-2 py-1 w-20 text-right"
+      />
+    </label>
+  </div>
+
+  {#if wraparoundHazards.length > 0}
+    <div class="bg-red-50 border-l-4 border-red-500 p-4 rounded text-red-800">
+      <h3 class="font-bold">Critical Wraparound Horizon Warning</h3>
+      <p class="text-sm">
+        {wraparoundHazards.length} table(s) exceed 100M transaction freeze age. Proactive VACUUM (FREEZE) required!
+      </p>
+    </div>
+  {/if}
+
+  <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+    <div class="border rounded-lg p-4 bg-white shadow-sm">
+      <h2 class="font-semibold mb-2">Degraded Tables ({degradedTables.length})</h2>
+      <ul class="divide-y text-sm">
+        {#each degradedTables as table (table.tableName)}
+          <li class="py-2 flex justify-between items-center">
+            <span class="font-mono">{table.tableName}</span>
+            <span class="text-amber-600 font-semibold">
+              {((table.allVisiblePages / table.totalPages) * 100).toFixed(1)}% Visible
+            </span>
+          </li>
+        {:else}
+          <li class="py-2 text-emerald-600">All relations meet or exceed {selectedThreshold}% visibility!</li>
+        {/each}
+      </ul>
+    </div>
+  </div>
+</div>
+```
+
+
 
 
 

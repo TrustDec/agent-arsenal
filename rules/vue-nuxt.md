@@ -6612,6 +6612,65 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   });
   ```
 
+### Vue 3 Composition API & Nuxt 3 Server Route Invariants for Visibility Map Observability
+
+In Nuxt 3 administrative interfaces or monitoring panels, handling database storage internals requires clean separation between server-side execution and client-side reactive rendering:
+
+1. **`shallowRef` for Large Tabular Datasets**: Avoid wrapping large collections of database relation metrics in deep `ref()`—deep reactivity adds recursive proxy overhead across thousands of table objects. Use `shallowRef()` for tabular observability records.
+2. **`useAsyncData` Deduplication & Key Stability**: Always pass explicit unique keys to `useAsyncData` (`useAsyncData('db-visibility-metrics', () => ...)`) to prevent hydration mismatch and duplicate server-side query execution.
+3. **h3 Server Event Safety**: Validate incoming table parameters with strict regular expressions (`/^[a-zA-Z0-9_]+$/`) and enforce bounded `SET statement_timeout` before issuing maintenance vacuum commands.
+
+```typescript
+// server/api/admin/visibility-map.get.ts
+import { defineEventHandler, getQuery, createError } from 'h3';
+import { sql } from 'kysely';
+import { primaryDb } from '~~/server/utils/db';
+
+export default defineEventHandler(async (event) => {
+  const query = getQuery(event);
+  const minPages = Number(query.minPages ?? 100);
+
+  try {
+    const result = await sql<{
+      tableName: string;
+      totalPages: number;
+      allVisiblePages: number;
+      allFrozenPages: number;
+      allVisiblePct: number;
+      allFrozenPct: number;
+      oldestXidAge: number;
+    }>`
+      SELECT 
+        c.relname AS "tableName",
+        c.relpages::bigint AS "totalPages",
+        v.all_visible::bigint AS "allVisiblePages",
+        v.all_frozen::bigint AS "allFrozenPages",
+        COALESCE(ROUND((100.0 * v.all_visible / NULLIF(c.relpages, 0))::numeric, 2), 0.0)::float AS "allVisiblePct",
+        COALESCE(ROUND((100.0 * v.all_frozen / NULLIF(c.relpages, 0))::numeric, 2), 0.0)::float AS "allFrozenPct",
+        age(c.relfrozenxid)::bigint AS "oldestXidAge"
+      FROM pg_class c
+      JOIN LATERAL pg_visibility_map_summary(c.oid) v ON true
+      WHERE c.relkind = 'r' 
+        AND c.relnamespace = 'public'::regnamespace
+        AND c.relpages >= ${minPages}
+      ORDER BY c.relpages DESC;
+    `.execute(primaryDb);
+
+    return {
+      success: true,
+      tables: result.rows,
+      timestamp: new Date().toISOString(),
+    };
+  } catch (err: any) {
+    throw createError({
+      statusCode: 500,
+      statusMessage: `Failed to retrieve Visibility Map summary: ${err.message}`,
+    });
+  }
+});
+```
+
+
 
 
 

@@ -4087,6 +4087,13 @@ alwaysApply: false
       - Enforce **SLRU Cache Telemetry Watchdogs**: continuously monitor `SELECT blks_hit, blks_read FROM pg_stat_slru WHERE name = 'clog'` and alert when `hit_ratio < 0.99`.
       - Enforce **OldestXmin Horizon Protection**: configure `ALTER SYSTEM SET idle_in_transaction_session_timeout = '15m'` and alert when `SELECT max(age(backend_xmin)) FROM pg_stat_activity` exceeds 1,000,000 transactions.
       - Enforce **Subtransaction SLRU Protection**: ban loops containing `SAVEPOINT` or `begin_nested()` to eliminate $O(\text{depth})$ multi-hop lookups across `pg_subtrans` and `pg_xact`.
+  - **Visibility Map (VM), All-Visible vs All-Frozen Bits & Vacuum Freezing Invariants**:
+    - ❌ **Anti-Pattern**: Scattering single-row updates across large tables without batching or clustering, clearing `VISIBILITYMAP_ALL_VISIBLE` across hundreds of thousands of heap pages and causing high-frequency Index-Only Scans to degrade into catastrophic random I/O heap fetches (`Heap Fetches > 0`). Leaving default `vacuum_freeze_min_age = 50,000,000` on high-write relations, preventing autovacuum passes from setting `VISIBILITYMAP_ALL_FROZEN` on static blocks—such that when aggressive anti-wraparound vacuuming triggers (`vacuum_freeze_table_age`), the engine is unable to skip clean blocks and must sequentially read entire terabyte relations from disk, pegging NVMe bandwidth and stalling client transactions. Permitting end-of-vacuum relation truncation on lock-sensitive OLTP tables, which grabs `ACCESS EXCLUSIVE` locks on both heap and `_vm` forks and blocks incoming read queries.
+    - ✅ **Production Invariant**:
+      - Enforce **Index-Only Scan Zero-Heap-Fetch Fidelity**: continuously audit critical read query plans via `EXPLAIN (ANALYZE, BUFFERS)` to assert `Node Type: Index Only Scan` and `Heap Fetches: 0`.
+      - Enforce **Proactive Freezing Parameter Calibration**: configure `ALTER TABLE <hot_table> SET (autovacuum_freeze_min_age = 10000000, autovacuum_freeze_table_age = 50000000)` so routine autovacuum passes freeze tuples early, setting `VISIBILITYMAP_ALL_FROZEN` to enable complete page skipping during subsequent vacuum cycles.
+      - Enforce **Visibility Map Health & Corruption Monitoring**: continuously audit `SELECT all_visible, all_frozen, relpages FROM pg_class c JOIN LATERAL pg_visibility_map_summary(c.oid) ON true` and verify corruption-free state using `pg_check_visible(regclass)` and `pg_check_frozen(regclass)`.
+      - Enforce **Vacuum Truncation Fencing on OLTP Tables**: configure `ALTER TABLE <hot_table> SET (vacuum_truncate = false)` to prevent end-of-vacuum `ACCESS EXCLUSIVE` lock convoys across heap and VM forks during peak traffic.
 
 
 

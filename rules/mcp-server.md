@@ -7996,6 +7996,77 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         };
       }
     );
+
+    // Tool: PostgreSQL Visibility Map (VM) & Index-Only Scan Fidelity Sentinel
+    this.server.tool(
+      'audit_visibility_map_ios_fidelity',
+      'Audits table Visibility Map coverage (all_visible, all_frozen) and verifies Index-Only Scan heap fetch fidelity to prevent random I/O degradation and anti-wraparound freeze storms.',
+      {
+        tableName: z.string().describe('Target relation name to audit in PostgreSQL public schema'),
+        totalPages: z.number().nonnegative().describe('Total physical 8KB heap pages in relation (pg_class.relpages)'),
+        allVisiblePages: z.number().nonnegative().describe('Pages marked VISIBILITYMAP_ALL_VISIBLE'),
+        allFrozenPages: z.number().nonnegative().describe('Pages marked VISIBILITYMAP_ALL_FROZEN'),
+        observedHeapFetches: z.number().nonnegative().default(0).describe('Heap Fetches observed in EXPLAIN (ANALYZE, BUFFERS) for index-only scans'),
+        oldestXidAge: z.number().nonnegative().describe('Current age(relfrozenxid) transaction horizon'),
+        isMissionCriticalIOS: z.boolean().default(true).describe('Whether the endpoint strictly relies on Index-Only Scan latency'),
+      },
+      async (args) => {
+        const violations: string[] = [];
+        const recommendations: string[] = [];
+
+        const visiblePct = args.totalPages > 0 ? (args.allVisiblePages / args.totalPages) * 100 : 100;
+        const frozenPct = args.totalPages > 0 ? (args.allFrozenPages / args.totalPages) * 100 : 100;
+
+        // Check 1: Index-Only Scan degradation
+        if (args.isMissionCriticalIOS && args.observedHeapFetches > 0) {
+          violations.push(
+            `IOS_HEAP_FETCH_DEGRADATION: Observed ${args.observedHeapFetches} heap fetches during presumed Index-Only Scan on ${args.tableName}. Visibility Map bits cleared by write churn.`
+          );
+          recommendations.push(`Run VACUUM (ANALYZE) ${args.tableName}; to restore ALL_VISIBLE bits, or vertically partition high-churn columns.`);
+        }
+
+        // Check 2: Low all_visible coverage on large relation
+        if (args.totalPages > 1000 && visiblePct < 85.0) {
+          violations.push(
+            `LOW_VISIBILITY_COVERAGE: Table ${args.tableName} has only ${visiblePct.toFixed(1)}% all_visible pages (< 85% threshold). Index-only scans will degrade into random disk reads.`
+          );
+          recommendations.push(`Tune autovacuum_vacuum_scale_factor = 0.05 and autovacuum_vacuum_cost_limit = 3000 for ${args.tableName}.`);
+        }
+
+        // Check 3: Missing all_frozen bits & aggressive vacuum vulnerability
+        if (args.totalPages > 5000 && frozenPct < 50.0 && args.oldestXidAge > 40000000) {
+          violations.push(
+            `AGGRESSIVE_FREEZE_VULNERABILITY: Table ${args.tableName} has only ${frozenPct.toFixed(1)}% frozen pages and XID age ${args.oldestXidAge.toLocaleString()}. Next anti-wraparound vacuum cannot skip pages and will scan the entire heap.`
+          );
+          recommendations.push(`Configure autovacuum_freeze_min_age = 10000000 and run scheduled off-peak VACUUM (FREEZE) ${args.tableName};.`);
+        }
+
+        // Check 4: Anti-wraparound freeze horizon emergency
+        if (args.oldestXidAge > 120000000) {
+          violations.push(
+            `CRITICAL_WRAPAROUND_HORIZON: Table ${args.tableName} XID age is ${args.oldestXidAge.toLocaleString()} (> 120M). Urgent freeze required before emergency autovacuum lockout.`
+          );
+          recommendations.push(`Immediately schedule VACUUM (FREEZE, ANALYZE) ${args.tableName}; with statement_timeout = 0.`);
+        }
+
+        const isCompliant = violations.length === 0;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              isCompliant,
+              tableName: args.tableName,
+              visiblePct: Number(visiblePct.toFixed(2)),
+              frozenPct: Number(frozenPct.toFixed(2)),
+              violations,
+              recommendations,
+              status: isCompliant ? 'certified_visibility_map_healthy' : 'visibility_map_hazards_detected',
+            }, null, 2),
+          }],
+        };
+      }
+    );
   }
   ```
 
