@@ -9836,3 +9836,95 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **UNLOGGED Tables, Ephemeral Bulk Staging & Primary Routing Invariants (`jackc/pgx/v5`)**:
+  - ❌ **Anti-Pattern: Standby Replica 0-Row Mirage & Temp Table Catalog Bloat**:
+    - Querying `UNLOGGED` tables on read replicas or replica connection pools, returning 0 rows because WAL bypasses standbys.
+    - Executing dynamic `CREATE TEMP TABLE` inside HTTP API handlers or background workers, flooding `pg_catalog` with millions of dead tuples and overflowing `temp_buffers`.
+  - ✅ **Production Invariant**:
+    - Pre-create permanent `UNLOGGED` relations during migrations with explicit `batch_id UUID` columns.
+    - Assert primary writer connection (`SHOW transaction_read_only` == `off`) before staging data.
+    - Use `pgx.CopyFrom` for streaming zero-allocation binary ingestion into unlogged relations.
+  ```go
+  // INVARIANT: High-throughput unlogged bulk staging engine in Go with pgx/v5.
+  // Pre-created UNLOGGED tables eliminate system catalog churn, while primary
+  // writer assertions prevent 0-row read replica query disasters.
+  type BulkStagingWorker struct {
+    primaryPool *pgxpool.Pool
+  }
+
+  func NewBulkStagingWorker(primaryPool *pgxpool.Pool) (*BulkStagingWorker, error) {
+    if primaryPool == nil {
+      return nil, errors.New("primaryPool must not be nil")
+    }
+    return &BulkStagingWorker{primaryPool: primaryPool}, nil
+  }
+
+  func (w *BulkStagingWorker) StageAndPromote(
+    ctx context.Context,
+    batchID uuid.UUID,
+    rawPayloads [][]byte,
+  ) (int64, error) {
+    conn, err := w.primaryPool.Acquire(ctx)
+    if err != nil {
+      return 0, fmt.Errorf("acquire primary connection: %w", err)
+    }
+    defer conn.Release()
+
+    // INVARIANT 1: Topology Fencing. Verify primary node; standbys have empty _init forks.
+    var isReadOnly bool
+    if err := conn.QueryRow(ctx, "SHOW transaction_read_only").Scan(&isReadOnly); err != nil {
+      return 0, fmt.Errorf("verify node topology: %w", err)
+    }
+    if isReadOnly {
+      return 0, errors.New("UNLOGGED operations forbidden on read replicas; standbys have 0 rows")
+    }
+
+    // INVARIANT 2: Zero-allocation CopyFrom into pre-created UNLOGGED staging table
+    rows := make([][]any, len(rawPayloads))
+    now := time.Now().UTC()
+    for i, payload := range rawPayloads {
+      rows[i] = []any{batchID, i, payload, now}
+    }
+
+    stagedCount, err := conn.CopyFrom(
+      ctx,
+      pgx.Identifier{"staging_unlogged_events"},
+      []string{"batch_id", "row_index", "payload", "created_at"},
+      pgx.CopyFromRows(rows),
+    )
+    if err != nil {
+      return 0, fmt.Errorf("copy to unlogged table: %w", err)
+    }
+
+    // INVARIANT 3: Atomic promotion from unlogged staging to durable logged table
+    tx, err := conn.Begin(ctx)
+    if err != nil {
+      return 0, fmt.Errorf("begin promotion tx: %w", err)
+    }
+    defer tx.Rollback(context.WithoutCancel(ctx))
+
+    if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '2000ms'"); err != nil {
+      return 0, fmt.Errorf("set lock timeout: %w", err)
+    }
+
+    _, err = tx.Exec(ctx, `
+      INSERT INTO permanent_events (id, batch_id, payload, created_at)
+      SELECT gen_random_uuid(), batch_id, payload, created_at
+      FROM staging_unlogged_events
+      WHERE batch_id = $1
+      ON CONFLICT DO NOTHING
+    `, batchID)
+    if err != nil {
+      return 0, fmt.Errorf("promote staged rows: %w", err)
+    }
+
+    // INVARIANT 4: Clean up batch immediately to prevent unlogged table bloat
+    _, err = tx.Exec(ctx, "DELETE FROM staging_unlogged_events WHERE batch_id = $1", batchID)
+    if err != nil {
+      return 0, fmt.Errorf("purge unlogged batch: %w", err)
+    }
+
+    return stagedCount, tx.Commit(ctx)
+  }
+  ```
+

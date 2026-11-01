@@ -7545,6 +7545,88 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         };
       }
     );
+
+    // Tool: audit_unlogged_tables_and_temp_buffers
+    server.tool(
+      'audit_unlogged_tables_and_temp_buffers',
+      'Audits PostgreSQL UNLOGGED tables, temporary table usage, replica query routing, autovacuum parameters, and foreign key cross-boundary constraints to eliminate 0-row standby traps, crash truncation data loss, and catalog bloat.',
+      {
+        ddlOrQuery: z.string().describe('SQL DDL or query statement to inspect for unlogged table and temp table invariants'),
+        targetNodeRole: z.enum(['primary', 'replica', 'unknown']).optional().default('unknown').describe('The database node topology where this query or table is accessed'),
+        dataReconstructible: z.boolean().optional().default(false).describe('Whether data stored in the unlogged table can be deterministically reconstructed if wiped by crash recovery'),
+      },
+      async (args) => {
+        const violations: string[] = [];
+        const recommendations: string[] = [];
+
+        const sql = args.ddlOrQuery.trim();
+
+        // Check 1: Replica routing trap
+        const isUnlogged = /CREATE\s+UNLOGGED\s+TABLE/i.test(sql) || /FROM\s+([a-zA-Z0-9_.]*staging[a-zA-Z0-9_.]*|staging_[a-zA-Z0-9_]+)/i.test(sql);
+        if (args.targetNodeRole === 'replica' && isUnlogged) {
+          violations.push(
+            'REPLICA_UNLOGGED_ZERO_ROWS: Querying or creating UNLOGGED tables on a read replica. Standbys do not receive unlogged WAL and have empty _init forks, returning 0 rows.'
+          );
+          recommendations.push(
+            'Route all queries referencing UNLOGGED tables strictly to the primary writer node (target_session_attrs=read-write).'
+          );
+        }
+
+        // Check 2: Dynamic CREATE TEMP TABLE in OLTP paths
+        if (/CREATE\s+(TEMP|TEMPORARY)\s+TABLE/i.test(sql)) {
+          violations.push(
+            'TEMP_TABLE_CATALOG_BLOAT: Found dynamic "CREATE TEMP TABLE". In production OLTP, this floods pg_class and pg_attribute with dead catalog tuples and risks temp_buffers heap bloat.'
+          );
+          recommendations.push(
+            'Pre-create permanent UNLOGGED tables with composite keys (batch_id UUID, row_index) during migrations.'
+          );
+        }
+
+        // Check 3: Foreign Key Cross-Boundary Violation (SQLSTATE 42809)
+        if (/CREATE\s+UNLOGGED\s+TABLE/i.test(sql) && /REFERENCES\s+[a-zA-Z0-9_.]+/i.test(sql)) {
+          violations.push(
+            'CROSS_BOUNDARY_FOREIGN_KEY: UNLOGGED table declares a FOREIGN KEY REFERENCES constraint. PostgreSQL strictly forbids foreign keys between unlogged and logged tables (SQLSTATE 42809).'
+          );
+          recommendations.push(
+            'Remove the foreign key constraint. Enforce referential invariants logically in application code via batch IDs.'
+          );
+        }
+
+        // Check 4: Non-reconstructible data in UNLOGGED table
+        if (/CREATE\s+UNLOGGED\s+TABLE/i.test(sql) && !args.dataReconstructible) {
+          violations.push(
+            'CRASH_TRUNCATION_DATA_LOSS_RISK: Table declared UNLOGGED but data is not marked as reconstructible. Postmaster crash recovery automatically overwrites the main fork with an empty _init fork, causing 100% data loss.'
+          );
+          recommendations.push(
+            'Only store ephemeral, reconstructible data (CSV upload staging, embedding scratchpads, rate limiters) in UNLOGGED tables. Use standard logged tables for durable business entities.'
+          );
+        }
+
+        // Check 5: Missing autovacuum tuning on UNLOGGED table
+        if (/CREATE\s+UNLOGGED\s+TABLE/i.test(sql) && !/autovacuum_vacuum_scale_factor/i.test(sql)) {
+          violations.push(
+            'UNLOGGED_AUTOVACUUM_NEGLECT: UNLOGGED table created without aggressive autovacuum tuning. High-velocity unlogged tables suffer severe MVCC dead tuple bloat under default 20% scale factor.'
+          );
+          recommendations.push(
+            'Append "WITH (autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_threshold = 100)" to table DDL.'
+          );
+        }
+
+        const isCompliant = violations.length === 0;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              isCompliant,
+              violations,
+              recommendations,
+              status: isCompliant ? 'certified_unlogged_table_compliant' : 'unlogged_table_violations_detected',
+            }, null, 2),
+          }],
+        };
+      }
+    );
   }
   ```
 

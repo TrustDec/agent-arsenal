@@ -7022,6 +7022,53 @@ In SvelteKit administrative consoles and system diagnostics:
   };
   ```
 
+- **UNLOGGED AI Scratchpad & Ephemeral Tool Call Buffering (`+page.server.ts`)**:
+  - ❌ **Anti-Pattern: Dynamic Temporary Tables or Standby Queries in Server Actions**:
+    - Creating temporary tables in SvelteKit form actions, causing memory leaks and catalog lockups across node instances.
+    - Routing unlogged scratchpad reads to standby read replicas, reading empty state (0 rows).
+  - ✅ **Production Invariant**:
+    - Use pre-created `UNLOGGED` scratchpad tables with `session_id` and TTL expiration.
+    - Always query on primary writer pool; clean up session scratchpad on task completion.
+  ```typescript
+  // src/routes/agent/scratchpad/+page.server.ts
+  import type { Actions } from './$types';
+  import { fail } from '@sveltejs/kit';
+  import { primaryDb } from '$lib/server/db';
+  import { sql } from 'kysely';
+
+  export const actions: Actions = {
+    bufferToolCall: async ({ request }) => {
+      const data = await request.formData();
+      const sessionId = data.get('sessionId')?.toString();
+      const stepIndex = Number(data.get('stepIndex'));
+      const toolPayload = data.get('payload')?.toString();
+
+      if (!sessionId || isNaN(stepIndex) || !toolPayload) {
+        return fail(400, { message: 'Missing required scratchpad parameters' });
+      }
+
+      try {
+        // INVARIANT 1: UNLOGGED table staging_agent_scratchpad bypasses WAL fsync,
+        // allowing ultra-fast sub-millisecond reasoning step logging.
+        // INVARIANT 2: Primary pool routing guarantees write consistency.
+        await primaryDb
+          .insertInto('staging_agent_scratchpad')
+          .values({
+            session_id: sessionId,
+            step_index: stepIndex,
+            tool_payload: toolPayload,
+            created_at: new Date(),
+          })
+          .execute();
+
+        return { success: true };
+      } catch (err: any) {
+        return fail(500, { message: 'Scratchpad write failed: ' + err.message });
+      }
+    },
+  };
+  ```
+
 
 
 

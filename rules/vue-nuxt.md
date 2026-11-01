@@ -6306,6 +6306,67 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   });
   ```
 
+- **UNLOGGED Staging & Ephemeral Ingestion Route Invariants (Nuxt 3 / Nitro)**:
+  - ❌ **Anti-Pattern: Dynamic TEMP Table in Server Routes & Read Replica Querying**:
+    - Issuing `CREATE TEMP TABLE` inside Nitro route handlers, thrashing database system catalogs and leaking connections under PgBouncer transaction pooling.
+    - Routing unlogged staging reads to replica connection pools, returning empty data (0 rows).
+  - ✅ **Production Invariant**:
+    - Pre-create permanent `UNLOGGED` tables with `batch_id UUID`. Route exclusively to primary writer database.
+    - Insert batch in chunks, validate or transform, promote to permanent table, and purge staged batch in one transaction.
+  ```typescript
+  // server/api/import/bulk-csv.post.ts
+  import { primaryDb } from '~/server/utils/db';
+  import { sql } from 'kysely';
+  import { v4 as uuidv4 } from 'uuid';
+
+  export default defineEventHandler(async (event) => {
+    const { rows } = await readBody<{ rows: Array<Record<string, unknown>> }>(event);
+    if (!rows?.length) {
+      throw createError({ statusCode: 400, message: 'No rows provided' });
+    }
+
+    const batchId = uuidv4();
+
+    // INVARIANT 1: Pre-created UNLOGGED table eliminates catalog churn (zero CREATE TEMP TABLE)
+    // INVARIANT 2: Routed strictly to primary writer (primaryDb)
+    await primaryDb.transaction().execute(async (tx) => {
+      await sql`SET LOCAL lock_timeout = '2000ms'`.execute(tx);
+
+      // Stage items in chunks of 500
+      for (let i = 0; i < rows.length; i += 500) {
+        const slice = rows.slice(i, i + 500).map((r, idx) => ({
+          batch_id: batchId,
+          row_index: i + idx,
+          raw_data: JSON.stringify(r),
+          created_at: new Date(),
+        }));
+        await tx.insertInto('staging_unlogged_imports').values(slice).execute();
+      }
+
+      // Atomically promote valid records to permanent logged table
+      await sql`
+        INSERT INTO customers (id, email, metadata, created_at)
+        SELECT 
+          gen_random_uuid(),
+          raw_data->>'email',
+          raw_data,
+          NOW()
+        FROM staging_unlogged_imports
+        WHERE batch_id = ${batchId}
+        ON CONFLICT (email) DO NOTHING
+      `.execute(tx);
+
+      // Clean up batch to prevent unlogged MVCC table bloat
+      await tx
+        .deleteFrom('staging_unlogged_imports')
+        .where('batch_id', '=', batchId)
+        .execute();
+    });
+
+    return { success: true, batchId, processed: rows.length };
+  });
+  ```
+
 
 
 

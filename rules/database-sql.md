@@ -4040,6 +4040,14 @@ alwaysApply: false
     - Enforce **Standby Quorum Matching**: always configure quorum replication (`synchronous_standby_names = 'ANY M (node1, node2, node3)'`) with statement timeout ladders to eliminate cluster paralysis.
     - Enforce **Group Commit Tuning**: on high-concurrency systems, configure `commit_delay = 20-50` and `commit_siblings >= 5` to coalesce hundreds of concurrent transaction commits into single physical storage flush barriers.
     - Enforce **Transaction-Scoped SET LOCAL**: always execute durability overrides using `SET LOCAL synchronous_commit` inside explicit `BEGIN ... COMMIT` blocks to prevent connection pool contamination.
+  - **UNLOGGED Tables, Ephemeral Caching & Bulk Staging Invariants**:
+    - ❌ **Anti-Pattern**: Querying `UNLOGGED` tables on streaming read replicas (`target_session_attrs=read-only`), expecting replication data (which returns 0 rows due to empty `_init` forks). Storing persistent financial records or auth sessions in unlogged tables (wiped to 0 rows upon crash recovery). Dynamic `CREATE TEMP TABLE` in OLTP hot paths (flooding `pg_catalog` with dead tuples and triggering `shared_inval` cache invalidation storms). Creating `FOREIGN KEY` between unlogged and logged relations (`SQLSTATE 42809`).
+    - ✅ **Production Invariant**:
+      - Enforce **Primary Writer Topology Fencing**: route 100% of queries against `UNLOGGED` tables exclusively to the primary read-write node (`target_session_attrs=read-write`).
+      - Enforce **The Reconstructibility Axiom**: only store ephemeral, reconstructible data in `UNLOGGED` tables (CSV upload staging, embedding scratchpads, rate limiters, session caches).
+      - Enforce **Zero-Catalog-Churn Pre-Created Unlogged Tables**: pre-create permanent `UNLOGGED` tables with composite keys `(batch_id UUID, row_index)` or hash/range partitions instead of dynamic `CREATE TEMP TABLE`.
+      - Enforce **Aggressive Autovacuum & Atomic TRUNCATE**: configure `autovacuum_vacuum_scale_factor = 0.01` and `autovacuum_vacuum_threshold = 100` on unlogged tables, and use `TRUNCATE` (or partition drops) rather than monolithic `DELETE` for batch lifecycle purges.
+      - Enforce **Logical Decoupling**: never declare cross-boundary `FOREIGN KEY` constraints between unlogged and logged relations; enforce referential integrity logically in application code via batch IDs.
 
 
 
