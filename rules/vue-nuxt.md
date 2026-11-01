@@ -6419,6 +6419,49 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   });
   ```
 
+- **Free Space Map (FSM) & Fillfactor Optimization Nitro Routes (Nuxt 3)**:
+  - ❌ **Anti-Pattern: Executing VACUUM FULL in Nitro Server Handlers**:
+    - Triggering synchronous table rewrites or running un-timed `ALTER TABLE ... SET` from API endpoints, exhausting database connection pools and timing out frontend clients.
+  - ✅ **Production Invariant**:
+    - Audit HOT efficiency across all entity tables via `pg_stat_user_tables`.
+    - Apply fillfactor alterations with transaction-scoped `SET LOCAL lock_timeout = '1500ms'`.
+  ```typescript
+  // server/api/admin/storage/fsm/calibrate.post.ts
+  import { primaryDb } from '~/server/utils/db';
+  import { sql } from 'kysely';
+
+  export default defineEventHandler(async (event) => {
+    const { tableName, fillfactor } = await readBody<{ tableName: string; fillfactor: number }>(event);
+
+    if (!tableName || !/^[a-zA-Z0-9_]+$/.test(tableName)) {
+      throw createError({ statusCode: 400, message: 'Invalid or missing table name' });
+    }
+    if (!fillfactor || fillfactor < 50 || fillfactor > 100) {
+      throw createError({ statusCode: 400, message: 'Fillfactor must be between 50 and 100' });
+    }
+
+    try {
+      // INVARIANT: Always wrap ALTER in transaction with strict lock_timeout
+      await primaryDb.transaction().execute(async (tx) => {
+        await sql`SET LOCAL lock_timeout = '1500ms'`.execute(tx);
+        await sql`ALTER TABLE ${sql.raw(`"${tableName}"`)} SET (fillfactor = ${sql.raw(fillfactor.toString())})`.execute(tx);
+      });
+
+      return {
+        success: true,
+        tableName,
+        calibratedFillfactor: fillfactor,
+        repackHint: `Execute "pg_repack --table '${tableName}'" online to repack existing pages without locking.`,
+      };
+    } catch (err: any) {
+      throw createError({
+        statusCode: 500,
+        message: `Failed calibrating fillfactor: ${err.message}`,
+      });
+    }
+  });
+  ```
+
 
 
 

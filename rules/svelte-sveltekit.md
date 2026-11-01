@@ -7147,6 +7147,86 @@ In SvelteKit administrative consoles and system diagnostics:
   };
   ```
 
+- **Free Space Map (FSM) & HOT Update Ratio Telemetry Card (`+page.server.ts`)**:
+  - ❌ **Anti-Pattern: Blind Updates & Missing HOT Metrics in Server Dashboards**:
+    - Showing total updates without tracking `n_tup_hot_upd`, leaving administrators unaware of 10x index write bloat.
+    - Altering fillfactor without bounded lock timeouts, freezing concurrent user queries.
+  - ✅ **Production Invariant**:
+    - Surface HOT update ratios (`n_tup_hot_upd / n_tup_upd`) and highlight tables failing the 85% compliance threshold.
+    - Provide actions to update fillfactor using transaction-scoped `lock_timeout = '1500ms'`.
+  ```typescript
+  // src/routes/admin/storage/fsm/+page.server.ts
+  import type { PageServerLoad, Actions } from './$types';
+  import { fail } from '@sveltejs/kit';
+  import { primaryDb } from '$lib/server/db';
+  import { sql } from 'kysely';
+
+  export const load: PageServerLoad = async () => {
+    // Audit HOT efficiency and fillfactor across production tables
+    const tableReports = await sql<{
+      tableName: string;
+      totalUpdates: string;
+      hotUpdates: string;
+      hotRatio: number;
+      fillfactor: number;
+      isCompliant: boolean;
+    }>`
+      SELECT 
+        c.relname AS "tableName",
+        COALESCE(s.n_tup_upd, 0)::text AS "totalUpdates",
+        COALESCE(s.n_tup_hot_upd, 0)::text AS "hotUpdates",
+        CASE 
+          WHEN COALESCE(s.n_tup_upd, 0) = 0 THEN 1.0
+          ELSE ROUND(COALESCE(s.n_tup_hot_upd, 0)::numeric / s.n_tup_upd::numeric, 4)::float8
+        END AS "hotRatio",
+        COALESCE(
+          (SELECT (regexp_match(reloptions::text, 'fillfactor=([0-9]+)'))[1]::int 
+           FROM pg_class WHERE oid = c.oid),
+          100
+        ) AS "fillfactor",
+        CASE 
+          WHEN COALESCE(s.n_tup_upd, 0) < 500 THEN true
+          ELSE (ROUND(COALESCE(s.n_tup_hot_upd, 0)::numeric / s.n_tup_upd::numeric, 4) >= 0.85)
+        END AS "isCompliant"
+      FROM pg_class c
+      LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE c.relkind = 'r'
+        AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+      ORDER BY s.n_tup_upd DESC NULLS LAST
+      LIMIT 50;
+    `.execute(primaryDb);
+
+    return {
+      tableReports: tableReports.rows,
+    };
+  };
+
+  export const actions: Actions = {
+    calibrateFillfactor: async ({ request }) => {
+      const data = await request.formData();
+      const tableName = data.get('tableName')?.toString();
+      const fillfactor = Number(data.get('fillfactor'));
+
+      if (!tableName || !/^[a-zA-Z0-9_]+$/.test(tableName)) {
+        return fail(400, { message: 'Invalid table name' });
+      }
+      if (isNaN(fillfactor) || fillfactor < 50 || fillfactor > 100) {
+        return fail(400, { message: 'Fillfactor must be between 50 and 100' });
+      }
+
+      try {
+        // INVARIANT: Use strict lock timeout to prevent queue convoys
+        await sql`SET lock_timeout = '1500ms'`.execute(primaryDb);
+        await sql`ALTER TABLE ${sql.raw(`"${tableName}"`)} SET (fillfactor = ${sql.raw(fillfactor.toString())})`.execute(primaryDb);
+        return { success: true, calibrated: tableName, fillfactor };
+      } catch (err: any) {
+        return fail(500, { message: 'Failed to calibrate fillfactor: ' + err.message });
+      }
+    },
+  };
+  ```
+
 
 
 

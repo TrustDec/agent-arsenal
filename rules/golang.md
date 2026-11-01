@@ -10017,4 +10017,85 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **Free Space Map (FSM) Telemetry, HOT Update Ratio Watchdog & Online Fillfactor Calibration (`jackc/pgx/v5`)**:
+  - ❌ **Anti-Pattern: Blind Updates & Single-Row Insert Extension Convoys**:
+    - Updating records with static queries that rewrite identical values, needlessly burning page headroom and breaking HOT chains.
+    - Executing thousands of single-row inserts in concurrent goroutines, choking on `RelationExtensionLock` / `LWLock:RelationExtension`.
+    - Leaving update-heavy tables at default `fillfactor = 100`, driving `n_tup_hot_upd / n_tup_upd` down to 0% and multiplying index writes.
+  - ✅ **Production Invariant**:
+    - Continuously monitor `n_tup_hot_upd / n_tup_upd >= 0.85` via `pg_stat_user_tables`.
+    - Apply fillfactor alterations with transaction-scoped `SET LOCAL lock_timeout = '1500ms'`.
+    - Vectorize concurrent inserts via `UNNEST` slices or `pgx.CopyFrom` to coalesce page extensions.
+  ```go
+  // INVARIANT: FSM Telemetry Sentinel & HOT Ratio Guard in Go (pgx/v5).
+  // Monitors Heap-Only Tuple efficiency, alters fillfactor under strict lock timeouts,
+  // and protects concurrent append paths with vectorized batching.
+  type FsmHeapGuard struct {
+    pool *pgxpool.Pool
+  }
+
+  func NewFsmHeapGuard(pool *pgxpool.Pool) (*FsmHeapGuard, error) {
+    if pool == nil {
+      return nil, errors.New("pgx pool must not be nil")
+    }
+    return &FsmHeapGuard{pool: pool}, nil
+  }
+
+  // AuditHOTEfficiency verifies that an update-heavy table satisfies the >= 0.85 HOT ratio invariant.
+  func (g *FsmHeapGuard) AuditHOTEfficiency(ctx context.Context, tableName string) (ratio float64, fillfactor int, err error) {
+    query := `
+      SELECT 
+        CASE 
+          WHEN COALESCE(s.n_tup_upd, 0) = 0 THEN 1.0
+          ELSE ROUND(COALESCE(s.n_tup_hot_upd, 0)::numeric / s.n_tup_upd::numeric, 4)::float8
+        END AS hot_ratio,
+        COALESCE(
+          (SELECT (regexp_match(reloptions::text, 'fillfactor=([0-9]+)'))[1]::int 
+           FROM pg_class WHERE oid = c.oid),
+          100
+        ) AS fillfactor
+      FROM pg_class c
+      LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE c.relname = $1 AND n.nspname NOT IN ('pg_catalog', 'information_schema');
+    `
+    err = g.pool.QueryRow(ctx, query, tableName).Scan(&ratio, &fillfactor)
+    if err != nil {
+      return 0, 0, fmt.Errorf("audit hot efficiency for %s: %w", tableName, err)
+    }
+    return ratio, fillfactor, nil
+  }
+
+  // SetFillfactorSafely updates table fillfactor under a strict 1500ms lock timeout.
+  func (g *FsmHeapGuard) SetFillfactorSafely(ctx context.Context, tableName string, targetFillfactor int) error {
+    if targetFillfactor < 10 || targetFillfactor > 100 {
+      return fmt.Errorf("invalid fillfactor %d; must be 10-100", targetFillfactor)
+    }
+
+    conn, err := g.pool.Acquire(ctx)
+    if err != nil {
+      return fmt.Errorf("acquire conn: %w", err)
+    }
+    defer conn.Release()
+
+    tx, err := conn.Begin(ctx)
+    if err != nil {
+      return fmt.Errorf("begin tx: %w", err)
+    }
+    defer tx.Rollback(ctx)
+
+    // INVARIANT: Set bounded lock timeout to avoid queuing behind long queries
+    if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '1500ms';"); err != nil {
+      return fmt.Errorf("set lock_timeout: %w", err)
+    }
+
+    alterSQL := fmt.Sprintf("ALTER TABLE %q SET (fillfactor = %d);", tableName, targetFillfactor)
+    if _, err := tx.Exec(ctx, alterSQL); err != nil {
+      return fmt.Errorf("alter fillfactor: %w", err)
+    }
+
+    return tx.Commit(ctx)
+  }
+  ```
+
 

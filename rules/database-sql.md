@@ -4056,6 +4056,14 @@ alwaysApply: false
       - Enforce **Shadow Index Cleaning Before Reindexing**: inspect and drop any lingering `%_ccnew` or `%_ccold` indexes left by interrupted `REINDEX CONCURRENTLY` before retrying maintenance.
       - Enforce **Multi-Phase Timeout Fencing**: always set `SET lock_timeout = '3000ms'` and `SET statement_timeout = '0'` prior to concurrent index builds to eliminate `WaitForOlderSnapshots` lock convoys while avoiding premature statement timeouts.
       - Enforce **2-Step Decoupled Unique Constraints**: on large tables, always build `CREATE UNIQUE INDEX CONCURRENTLY <name>_idx ON <table> (<cols>)` first, followed by `ALTER TABLE <table> ADD CONSTRAINT <name> UNIQUE USING INDEX <name>_idx` for instant sub-millisecond promotion.
+  - **Free Space Map (FSM), Heap Page Allocation & fillfactor HOT Update Invariants**:
+    - ❌ **Anti-Pattern**: Default `fillfactor = 100` on update-heavy OLTP relations, leaving 0% headroom on 8KB heap pages for in-place Heap-Only Tuple (HOT) updates and forcing row modifications to append to foreign pages and write new entries into every single secondary index. Concurrent worker threads performing single-row inserts competing for `RelationExtensionLock`, causing throughput collapse from 40k TPS to 1.5k TPS. Line pointer (`ItemId`) bloat reaching `MaxOffsetNumber` (2048) and abandoning blocks with 40% uncompacted free space. Running `VACUUM FULL` or `CLUSTER` to apply fillfactor changes, acquiring `ACCESS EXCLUSIVE` table locks and crashing production.
+    - ✅ **Production Invariant**:
+      - Enforce **Workload-Specific fillfactor**: set `WITH (fillfactor = 75-85)` on update-heavy relations (sessions, accounts, orders) to guarantee headroom for at least 2 consecutive HOT updates ($\Phi^* \le 100 \times (1 - \frac{k(S_{\text{tuple}}+4)}{8168})$). Keep append-only tables at `fillfactor = 100`.
+      - Enforce **HOT-Guarded Mutations**: append `WHERE col IS DISTINCT FROM $val` to update queries to prevent no-op updates from burning physical page headroom.
+      - Enforce **Batch Extension Coalescing**: vectorize concurrent appends using unnested arrays (`INSERT ... SELECT * FROM UNNEST(...)`) or PostgreSQL `COPY` to leverage PostgreSQL 16+ bulk relation extension (allocating up to 512 blocks per lock acquisition).
+      - Enforce **Modern Autovacuum Cost Limits**: raise `autovacuum_vacuum_cost_limit = 2000-5000` and lower delay to 2ms on modern NVMe storage to prune dead tuples and defragment line pointers before blocks become unfillable.
+      - Enforce **Zero-Downtime Fillfactor Repack**: apply fillfactor modifications via `ALTER TABLE <table> SET (fillfactor = X);` under `lock_timeout = '1500ms'`, followed by online defragmentation via `pg_repack` (never `VACUUM FULL`).
 
 
 

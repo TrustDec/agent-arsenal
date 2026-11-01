@@ -7710,6 +7710,80 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         };
       }
     );
+
+    // Tool: audit_fsm_heap_and_fillfactor
+    server.tool(
+      'audit_fsm_heap_and_fillfactor',
+      'Audits table schemas, migration DDL, and runtime statistics for Free Space Map (FSM) health, fillfactor headroom, Heap-Only Tuple (HOT) update failure hazards, and RelationExtensionLock bottlenecks.',
+      {
+        tableName: z.string().describe('The database table name to audit'),
+        ddlOrMigration: z.string().describe('The SQL table definition or migration DDL'),
+        isUpdateHeavy: z.boolean().optional().default(false).describe('Whether this relation undergoes frequent UPDATE operations'),
+        avgRowSizeBytes: z.number().optional().default(400).describe('Average physical size of a row in bytes'),
+        secondaryIndexCount: z.number().optional().default(3).describe('Number of secondary indexes on the table'),
+      },
+      async (args) => {
+        const violations: string[] = [];
+        const recommendations: string[] = [];
+
+        const sql = args.ddlOrMigration.trim();
+        const hasExplicitFillfactor = /fillfactor\s*=\s*([0-9]+)/i.test(sql);
+        const match = sql.match(/fillfactor\s*=\s*([0-9]+)/i);
+        const currentFF = match ? parseInt(match[1], 10) : 100;
+
+        // Check 1: Update-heavy relation with default fillfactor
+        if (args.isUpdateHeavy && (!hasExplicitFillfactor || currentFF >= 95)) {
+          violations.push(
+            `HOT_STARVATION_HAZARD: Table '${args.tableName}' is update-heavy but has fillfactor=${currentFF}. Page is packed to capacity on INSERT, causing 100% of row updates to fail Heap-Only Tuple (HOT) optimization.`
+          );
+          recommendations.push(
+            `Declare "WITH (fillfactor = 80-85)" to reserve 15-20% headroom per 8KB page for in-place tuple updates without secondary index writes.`
+          );
+        }
+
+        // Check 2: Destructive VACUUM FULL to change fillfactor
+        if (/VACUUM\s+FULL/i.test(sql)) {
+          violations.push(
+            'BLOCKING_VACUUM_FULL: Detected VACUUM FULL. Acquires ACCESS EXCLUSIVE table lock, blocking all production traffic.'
+          );
+          recommendations.push(
+            'Use pg_repack or blue-green shadow swap to defragment and apply fillfactor changes online.'
+          );
+        }
+
+        // Check 3: Missing lock_timeout on ALTER TABLE SET fillfactor
+        if (/ALTER\s+TABLE\s+.*SET\s*\(\s*fillfactor/i.test(sql) && !/lock_timeout/i.test(sql)) {
+          violations.push(
+            'MISSING_LOCK_TIMEOUT_ON_ALTER: ALTER TABLE ... SET (fillfactor=X) must be bounded by lock_timeout <= 2000ms.'
+          );
+          recommendations.push(
+            'Prepend "SET LOCAL lock_timeout = \'1500ms\';" inside an explicit transaction.'
+          );
+        }
+
+        // Calculate potential write amplification reduction
+        const defaultWriteAmp = 1 + args.secondaryIndexCount;
+        const hotWriteAmp = 1 + 0.1 * args.secondaryIndexCount;
+        const writeAmpReductionPct = Math.round(((defaultWriteAmp - hotWriteAmp) / defaultWriteAmp) * 100);
+
+        const isCompliant = violations.length === 0;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              isCompliant,
+              currentFillfactor: currentFF,
+              recommendedFillfactor: args.isUpdateHeavy ? 85 : 100,
+              estimatedWriteAmpReductionPct: `${writeAmpReductionPct}%`,
+              violations,
+              recommendations,
+              status: isCompliant ? 'certified_fsm_heap_compliant' : 'fsm_heap_violations_detected',
+            }, null, 2),
+          }],
+        };
+      }
+    );
   }
   ```
 
