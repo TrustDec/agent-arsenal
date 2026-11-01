@@ -12933,6 +12933,92 @@ func (s *StorageTierSentinel) RelocateRelationBounded(
 }
 ```
 
+---
+
+## 23. PostgreSQL Enterprise SSL/TLS, Mutual TLS (mTLS), Certificate Expiry & verify-full Invariants
+
+When establishing PostgreSQL database connections in production Go services using `jackc/pgx/v5`:
+
+- **Mandatory `sslmode=verify-full`**:
+  - Never allow `sslmode=require` or `sslmode=prefer` in non-local environments. Always configure an explicit `*tls.Config` with `ServerName` populated for Subject Alternative Name (SAN) validation and `InsecureSkipVerify: false`.
+- **Zero-Downtime Dual-Root CA Trust Pool**:
+  - In certificate rotation pipelines, construct an `x509.CertPool` containing both the current and the upcoming root/intermediate CA certificates.
+- **Client Certificate Expiration Watchdog**:
+  - Expose background metrics tracking days until client and server certificate expiration (`ssl_certificate_days_to_expiration`), firing critical alerts when $T_{\text{remain}} \le 30\text{ days}$.
+
+```go
+package tlsguard
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type TLSMetrics struct {
+	DaysUntilServerExpiry int
+	IsVerifyFull          bool
+	MinTLSVersion         string
+}
+
+// SecurePostgresConnector establishes hardened verify-full connections with certificate watchdog.
+type SecurePostgresConnector struct {
+	pool *pgxpool.Pool
+}
+
+func NewSecurePostgresConnector(
+	ctx context.Context,
+	connURI string,
+	caBundlePath string,
+	clientCertPath string,
+	clientKeyPath string,
+) (*SecurePostgresConnector, error) {
+	caPEM, err := os.ReadFile(caBundlePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read CA bundle: %w", err)
+	}
+
+	rootPool := x509.NewCertPool()
+	if !rootPool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("failed to parse CA bundle PEM")
+	}
+
+	poolConfig, err := pgxpool.ParseConfig(connURI)
+	if err != nil {
+		return nil, fmt.Errorf("invalid connection URI: %w", err)
+	}
+
+	tlsCfg := &tls.Config{
+		RootCAs:            rootPool,
+		ServerName:         poolConfig.ConnConfig.Host,
+		MinVersion:         tls.VersionTLS13,
+		InsecureSkipVerify: false,
+	}
+
+	if clientCertPath != "" && clientKeyPath != "" {
+		cert, err := tls.LoadX509KeyPair(clientCertPath, clientKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load client mTLS keypair: %w", err)
+		}
+		tlsCfg.Certificates = []tls.Certificate{cert}
+	}
+
+	poolConfig.ConnConfig.TLSConfig = tlsCfg
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create secure pool: %w", err)
+	}
+
+	return &SecurePostgresConnector{pool: pool}, nil
+}
+```
+
+
 
 
 
