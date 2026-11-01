@@ -3982,6 +3982,20 @@ alwaysApply: false
     - Enforce **Safe Cancellation Signals**: always cancel backends via `pg_cancel_backend(pid)` (SIGINT) first, escalating to `pg_terminate_backend(pid)` (SIGTERM) only if unresponsive; strictly prohibit `SIGQUIT` or OS-level `kill -9`.
     - Enforce **Zero Leaked Aborted Backends**: run automated sentinels asserting zero sessions in `state = 'idle in transaction (aborted)'` in `pg_stat_activity`.
 
+- **SubPlans, InitPlans & Correlated Scalar Subquery Decorrelation Invariants (PostgreSQL)**:
+  - ❌ **Anti-Pattern: $O(N \cdot M)$ SubPlan Loops, Volatile InitPlan Degradation & Existence Scans**:
+    - Embedding correlated scalar subqueries in `SELECT` projections or `WHERE` filters (`SELECT (SELECT count(*) FROM orders WHERE user_id = u.id)`), spawning `SubPlan` execution nodes that execute once for every single outer tuple ($100,000\times$), thrashing shared buffers and pegging CPU for tens of seconds.
+    - Calling non-deterministic or volatile functions (`random()`, `clock_timestamp()`, sequence `nextval()`, or unannotated PL/pgSQL functions) inside filter subqueries, which silently prevents PostgreSQL from promoting the subquery to a cached `InitPlan 1 (returns $0)` and forces repeated per-row re-evaluation.
+    - Inserting unnecessary `LIMIT`, `OFFSET`, `DISTINCT`, or opaque CTE wrappers inside inner subqueries, erecting optimizer optimization barriers that block subquery pull-up, join flattening, and predicate pushdown.
+    - Multiplying scalar subqueries in `SELECT` projections to fetch independent statistics (counts, sums, maximums), spawning multiple independent SubPlans and multiplying index seek overhead by $K\times$.
+    - Using `(SELECT count(*) FROM child WHERE child.fk = parent.id) > 0` to check for child entity existence, forcing full child index scans rather than short-circuiting semi-joins (`WHERE EXISTS (...)`).
+  - ✅ **Production Invariant**:
+    - Enforce **Zero SubPlans in Production Execution Plans**: assert that execution plans for non-bounded queries contain zero nodes prefixed with `SubPlan`; assert all subqueries are either pulled up into hash joins/window aggregates or executed once as `InitPlan 1 (returns $0)`.
+    - Enforce **Set-Based Pre-Aggregation via CTE/JOIN**: pre-aggregate child statistics in dedicated CTEs (`WITH order_stats AS (SELECT user_id, count(*) ... GROUP BY user_id)`) and join them to master relations via `LEFT JOIN`, replacing $O(N \cdot M)$ nested loops with single-pass Hash Joins.
+    - Enforce **Deterministic InitPlan Promotion**: guarantee all functions used inside uncorrelated subqueries are explicitly marked `IMMUTABLE` or `STABLE`, or hoist volatile expressions into client parameters or top-level CTEs.
+    - Enforce **Short-Circuiting Semi-Join EXISTS**: replace all `COUNT(*) > 0` existence checks with `WHERE EXISTS (SELECT 1 FROM ...)`, guaranteeing immediate execution termination on the very first matching tuple.
+    - Enforce **Pull-Up Optimization Barrier Audit**: prohibit gratuitous `LIMIT` or `DISTINCT` in inner subquery filters to ensure PostgreSQL's query planner flattens the query into the global jointree.
+
 
 
 

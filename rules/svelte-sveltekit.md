@@ -6846,6 +6846,55 @@ In SvelteKit administrative consoles and system diagnostics:
   </div>
   ```
 
+- **SvelteKit Server Loaders & Database SubPlan Decorrelation Invariants (+page.server.ts)**:
+  - ❌ **Anti-Pattern: Correlated SubPlans in Page Server Loaders**:
+    - Writing raw SQL queries inside `+page.server.ts` loaders that embed correlated scalar subqueries in `SELECT` projections (`(SELECT count(*) FROM comments WHERE post_id = p.id)`). This forces PostgreSQL to execute a `SubPlan` for every post on the page, multiplying server-side rendering latency by 50x–100x and causing HTTP 504 gateway timeouts.
+    - Using `(SELECT count(*) FROM likes WHERE user_id = u.id) > 0` to check for existence instead of `EXISTS (SELECT 1 ...)`.
+  - ✅ **Production Invariant**:
+    - Always pre-aggregate child statistics in dedicated CTEs and join them via `LEFT JOIN`, or use window functions.
+    - Guarantee single-pass hash execution with zero `SubPlan` nodes, keeping server-side page load times under 20ms.
+  ```typescript
+  // src/routes/dashboard/+page.server.ts
+  import type { PageServerLoad } from './$types';
+  import { db } from '$lib/server/db';
+  import { sql } from 'kysely';
+
+  export const load: PageServerLoad = async ({ locals }) => {
+    const tenantId = locals.tenantId;
+
+    // INVARIANT: Pre-aggregate order stats via CTE and join via LEFT JOIN.
+    // Compiles to a single Hash Aggregate + Hash Join with 0 SubPlans in EXPLAIN.
+    const userSummaries = await db
+      .with('order_stats', (db) =>
+        db
+          .selectFrom('orders')
+          .select([
+            'user_id',
+            db.fn.count<number>('id').as('order_count'),
+            db.fn.coalesce(db.fn.sum<number>('amount_cents'), sql<number>`0`).as('total_spent_cents'),
+          ])
+          .where('tenant_id', '=', tenantId)
+          .groupBy('user_id')
+      )
+      .selectFrom('users')
+      .leftJoin('order_stats', 'order_stats.user_id', 'users.id')
+      .select([
+        'users.id',
+        'users.email',
+        'users.created_at',
+        sql<number>`COALESCE(order_stats.order_count, 0)`.as('order_count'),
+        sql<number>`COALESCE(order_stats.total_spent_cents, 0)`.as('total_spent_cents'),
+      ])
+      .where('users.tenant_id', '=', tenantId)
+      .where('users.status', '=', 'active')
+      .orderBy('users.created_at', 'desc')
+      .limit(50)
+      .execute();
+
+    return { userSummaries };
+  };
+  ```
+
 
 
 

@@ -7239,6 +7239,81 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
       }
     );
   }
+
+  // Tool 12: Audit SubPlan loops, InitPlan degradations, and correlated subqueries
+  public registerAuditSubPlansTool(): void {
+    this.server.tool(
+      'audit_subplans_and_initplans',
+      'Audits a PostgreSQL query execution plan or SQL string to detect SubPlan per-row execution loops, volatile function InitPlan degradation, and COUNT(*) > 0 traps.',
+      {
+        sqlQuery: z.string().describe('The SQL query string to inspect for correlated scalar subqueries'),
+        explainPlanJson: z.string().optional().describe('Optional EXPLAIN (FORMAT JSON) output for deep node inspection'),
+      },
+      async (args) => {
+        const violations: string[] = [];
+        const recommendations: string[] = [];
+        let subPlanCount = 0;
+        let initPlanCount = 0;
+
+        // Static AST / pattern checks
+        if (/\(\s*SELECT\s+COUNT\s*\([^)]*\)\s+FROM\s+[^)]+\)\s*(?:>|>=|!=)\s*0/i.test(args.sqlQuery)) {
+          violations.push('Scalar COUNT(*) compared to 0 detected. This forces a full scan of matching child tuples instead of early termination.');
+          recommendations.push('Rewrite existence check using WHERE EXISTS (SELECT 1 FROM child WHERE ...).');
+        }
+
+        if (/SELECT\s+[\s\S]+?\(\s*SELECT\s+(?:COUNT|SUM|AVG|MIN|MAX)\s*\([^)]*\)\s+FROM/i.test(args.sqlQuery)) {
+          violations.push('Correlated scalar subquery detected in SELECT projection. This compiles to an O(N*M) SubPlan execution loop.');
+          recommendations.push('Pre-aggregate child statistics in a dedicated CTE (WITH agg AS (SELECT ... GROUP BY fk)) and join via LEFT JOIN.');
+        }
+
+        if (/\(\s*SELECT[\s\S]*?\b(?:random|clock_timestamp|gen_random_uuid|nextval)\s*\(/i.test(args.sqlQuery)) {
+          violations.push('Volatile function detected inside subquery. PostgreSQL cannot promote this to a cached InitPlan and will evaluate it per-row as a SubPlan.');
+          recommendations.push('Extract volatile expression into a client parameter, CTE, or mark custom helper functions STABLE/IMMUTABLE.');
+        }
+
+        // Deep EXPLAIN JSON inspection if provided
+        if (args.explainPlanJson) {
+          try {
+            const parsed = JSON.parse(args.explainPlanJson);
+            const checkNode = (node: any) => {
+              const subName = node['Subplan Name'] || '';
+              if (subName.startsWith('SubPlan') || node['Parent Relationship'] === 'SubPlan') {
+                subPlanCount++;
+                const loops = node['Actual Loops'] || 1;
+                violations.push(`Query plan contains ${subName || 'SubPlan node'} executed ${loops} times in a loop.`);
+              } else if (subName.startsWith('InitPlan') || node['Parent Relationship'] === 'InitPlan') {
+                initPlanCount++;
+              }
+              if (Array.isArray(node.Plans)) {
+                node.Plans.forEach(checkNode);
+              }
+            };
+            if (Array.isArray(parsed) && parsed[0]?.Plan) {
+              checkNode(parsed[0].Plan);
+            }
+          } catch {
+            violations.push('Failed parsing explainPlanJson as valid JSON.');
+          }
+        }
+
+        const isCompliant = violations.length === 0;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              isCompliant,
+              subPlanCount,
+              initPlanCount,
+              violations,
+              recommendations,
+              status: isCompliant ? 'certified_zero_subplans' : 'subplan_performance_risk_detected',
+            }, null, 2),
+          }],
+        };
+      }
+    );
+  }
   ```
 
 

@@ -6132,6 +6132,60 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   </template>
   ```
 
+- **Nuxt 3 Server Routes & Database SubPlan Decorrelation Invariants (/server/api)**:
+  - ❌ **Anti-Pattern: Correlated SubPlans in Nitro Event Handlers**:
+    - Writing raw SQL queries inside `defineEventHandler` endpoints that embed correlated scalar subqueries in `SELECT` projections (`(SELECT count(*) FROM comments WHERE post_id = p.id)`). This forces PostgreSQL to evaluate a `SubPlan` for every item in the response list, increasing API response times from 15ms to 10+ seconds and exhausting Nitro worker concurrency.
+    - Using `(SELECT count(*) FROM tags WHERE entity_id = e.id) > 0` instead of `EXISTS (SELECT 1 ...)`.
+  - ✅ **Production Invariant**:
+    - Always pre-aggregate child statistics in dedicated CTEs and join them via `LEFT JOIN`, or use window functions.
+    - Enforce single-pass hash execution with zero `SubPlan` nodes, keeping API response latency under 25ms.
+  ```typescript
+  // server/api/users/summaries.get.ts
+  import { defineEventHandler, getQuery, createError } from 'h3';
+  import { db } from '~/server/utils/db';
+  import { sql } from 'kysely';
+
+  export default defineEventHandler(async (event) => {
+    const query = getQuery(event);
+    const tenantId = (event.context.tenantId as string) || (query.tenantId as string);
+
+    if (!tenantId) {
+      throw createError({ statusCode: 400, message: 'Missing tenantId' });
+    }
+
+    // INVARIANT: Pre-aggregate order stats via CTE and join via LEFT JOIN.
+    // Compiles to a single Hash Aggregate + Hash Join with 0 SubPlans in EXPLAIN.
+    const summaries = await db
+      .with('order_stats', (db) =>
+        db
+          .selectFrom('orders')
+          .select([
+            'user_id',
+            db.fn.count<number>('id').as('order_count'),
+            db.fn.coalesce(db.fn.sum<number>('amount_cents'), sql<number>`0`).as('total_spent_cents'),
+          ])
+          .where('tenant_id', '=', tenantId)
+          .groupBy('user_id')
+      )
+      .selectFrom('users')
+      .leftJoin('order_stats', 'order_stats.user_id', 'users.id')
+      .select([
+        'users.id',
+        'users.email',
+        'users.created_at',
+        sql<number>`COALESCE(order_stats.order_count, 0)`.as('order_count'),
+        sql<number>`COALESCE(order_stats.total_spent_cents, 0)`.as('total_spent_cents'),
+      ])
+      .where('users.tenant_id', '=', tenantId)
+      .where('users.status', '=', 'active')
+      .orderBy('users.created_at', 'desc')
+      .limit(50)
+      .execute();
+
+    return { summaries };
+  });
+  ```
+
 
 
 
