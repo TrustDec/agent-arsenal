@@ -8180,6 +8180,134 @@ When displaying high-frequency token lookups, cryptographic hashes, or database 
     <p class="mt-3 font-mono text-xs text-rose-400">{errorMessage}</p>
   {/if}
 </div>
+
+<!--
+  LargeObjectOrphanAuditor.svelte (Svelte 5 Runes)
+  Production telemetry component auditing PostgreSQL pg_largeobject catalog bloat
+  and triggering non-blocking batched orphan purges.
+-->
+<script lang="ts">
+  interface OrphanStats {
+    totalMetadataLOBs: number;
+    orphanCount: number;
+    orphanRatio: number;
+    estimatedOrphanMB: number;
+    requiresCleanup: boolean;
+  }
+
+  let stats = $state<OrphanStats | null>(null);
+  let isAuditing = $state(false);
+  let isPurging = $state(false);
+  let purgeMessage = $state<string | null>(null);
+  let errorMessage = $state<string | null>(null);
+
+  const hasHighOrphans = $derived((stats?.orphanRatio ?? 0) > 0.05);
+
+  async function runAudit() {
+    isAuditing = true;
+    errorMessage = null;
+    try {
+      const res = await fetch('/api/db/largeobjects/audit');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      stats = await res.json();
+    } catch (err: any) {
+      errorMessage = err.message || 'Audit failed';
+    } finally {
+      isAuditing.value = false;
+    }
+  }
+
+  async function triggerBatchedPurge() {
+    isPurging = true;
+    errorMessage = null;
+    purgeMessage = null;
+    try {
+      const res = await fetch('/api/db/largeobjects/purge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ batchSize: 500 }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      purgeMessage = `Purged ${data.purgedCount} orphans cleanly under advisory lock.`;
+      await runAudit();
+    } catch (err: any) {
+      errorMessage = err.message || 'Purge failed';
+    } finally {
+      isPurging = false;
+    }
+  }
+</script>
+
+<div class="rounded-xl border border-zinc-800 bg-zinc-950 p-5 shadow-2xl">
+  <div class="flex items-center justify-between border-b border-zinc-800/80 pb-3">
+    <div>
+      <h3 class="font-mono text-sm font-semibold text-zinc-100">PostgreSQL Large Object Catalog Bloat</h3>
+      <p class="mt-0.5 text-xs text-zinc-400">pg_largeobject orphan leak sentinel</p>
+    </div>
+    <span
+      class="rounded-full px-2.5 py-0.5 font-mono text-[11px] font-medium {hasHighOrphans
+        ? 'bg-rose-500/10 text-rose-400 border border-rose-500/30'
+        : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'}"
+    >
+      {hasHighOrphans ? 'CRITICAL BLOAT' : 'HEALTHY'}
+    </span>
+  </div>
+
+  {#if stats}
+    <div class="mt-4 grid grid-cols-3 gap-3">
+      <div class="rounded-lg border border-zinc-800/50 bg-zinc-900/40 p-3">
+        <span class="block font-mono text-[10px] uppercase text-zinc-500">Total LOBs</span>
+        <span class="mt-1 font-mono text-lg font-semibold text-zinc-100">{stats.totalMetadataLOBs}</span>
+      </div>
+      <div class="rounded-lg border border-zinc-800/50 bg-zinc-900/40 p-3">
+        <span class="block font-mono text-[10px] uppercase text-zinc-500">Orphaned LOBs</span>
+        <span class="mt-1 font-mono text-lg font-semibold {stats.orphanCount > 0 ? 'text-amber-400' : 'text-zinc-100'}">
+          {stats.orphanCount}
+        </span>
+      </div>
+      <div class="rounded-lg border border-zinc-800/50 bg-zinc-900/40 p-3">
+        <span class="block font-mono text-[10px] uppercase text-zinc-500">Orphan Ratio</span>
+        <span class="mt-1 font-mono text-lg font-semibold {hasHighOrphans ? 'text-rose-400' : 'text-emerald-400'}">
+          {(stats.orphanRatio * 100).toFixed(1)}%
+        </span>
+      </div>
+    </div>
+  {/if}
+
+  <div class="mt-4 flex items-center justify-between gap-3">
+    <button
+      onclick={runAudit}
+      disabled={isAuditing}
+      class="inline-flex items-center gap-1.5 rounded-lg border border-zinc-700/80 bg-zinc-800/50 px-3 py-1.5 font-mono text-xs font-medium text-zinc-200 transition-all hover:bg-zinc-700/50 active:scale-[0.98] disabled:opacity-50"
+    >
+      {#if isAuditing}
+        <span class="h-3 w-3 animate-spin rounded-full border-2 border-zinc-400 border-t-transparent"></span>
+      {/if}
+      Audit Orphans
+    </button>
+
+    {#if stats?.requiresCleanup}
+      <button
+        onclick={triggerBatchedPurge}
+        disabled={isPurging}
+        class="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 font-mono text-xs font-medium text-amber-300 transition-all hover:bg-amber-500/20 active:scale-[0.98] disabled:opacity-50"
+      >
+        {#if isPurging}
+          <span class="h-3 w-3 animate-spin rounded-full border-2 border-amber-400 border-t-transparent"></span>
+        {/if}
+        Purge Batch (500)
+      </button>
+    {/if}
+  </div>
+
+  {#if purgeMessage}
+    <p class="mt-3 font-mono text-xs text-emerald-400">{purgeMessage}</p>
+  {/if}
+  {#if errorMessage}
+    <p class="mt-3 font-mono text-xs text-rose-400">{errorMessage}</p>
+  {/if}
+</div>
 ```
 
 

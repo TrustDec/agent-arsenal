@@ -8502,6 +8502,76 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         };
       }
     );
+
+    // Tool: PostgreSQL Large Object vs Bytea vs S3 Storage Qualifier
+    this.server.tool(
+      'db_large_object_storage_qualifier',
+      'Evaluates binary storage architecture (bytea vs Large Object OID vs S3 Object Storage) to prevent pg_largeobject catalog bloat and OOM memory cliffs.',
+      {
+        tableName: z.string().describe('Target table name'),
+        columnName: z.string().describe('Target binary column name'),
+        estimatedMaxByteSize: z.number().describe('Estimated maximum file/payload size in bytes'),
+        requiresChunkedStreaming: z.boolean().default(false).describe('Whether data is streamed via HTTP/sockets'),
+        isRelationalAtomicityRequired: z.boolean().default(true).describe('Whether rollback must delete the binary asset'),
+      },
+      async (args) => {
+        const warnings: string[] = [];
+        let recommendation: 'BYTEA' | 'LARGE_OBJECT' | 'EXTERNAL_S3' = 'BYTEA';
+        let ddl = '';
+
+        if (args.estimatedMaxByteSize <= 256 * 1024) {
+          recommendation = 'BYTEA';
+          ddl = `ALTER TABLE ${args.tableName} ADD COLUMN ${args.columnName} BYTEA;`;
+        } else if (args.estimatedMaxByteSize <= 5 * 1024 * 1024) {
+          recommendation = 'LARGE_OBJECT';
+          warnings.push(
+            'Large Objects (OID) do NOT auto-unlink on relational row delete. Mandatory BEFORE DELETE trigger required.'
+          );
+          ddl = `
+ALTER TABLE ${args.tableName} ADD COLUMN ${args.columnName} OID;
+
+CREATE OR REPLACE FUNCTION trg_unlink_${args.tableName}_${args.columnName}()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF (TG_OP = 'DELETE' AND OLD.${args.columnName} IS NOT NULL) THEN
+        PERFORM lo_unlink(OLD.${args.columnName});
+    ELSIF (TG_OP = 'UPDATE' AND OLD.${args.columnName} IS NOT NULL AND OLD.${args.columnName} IS DISTINCT FROM NEW.${args.columnName}) THEN
+        PERFORM lo_unlink(OLD.${args.columnName});
+    END IF;
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_temp;
+
+CREATE TRIGGER trg_${args.tableName}_${args.columnName}_cleanup
+BEFORE UPDATE OF ${args.columnName} OR DELETE ON ${args.tableName}
+FOR EACH ROW EXECUTE FUNCTION trg_unlink_${args.tableName}_${args.columnName}();
+          `.trim();
+        } else {
+          recommendation = 'EXTERNAL_S3';
+          warnings.push(
+            `Payload size (${(args.estimatedMaxByteSize / 1024 / 1024).toFixed(1)}MB) exceeds 5MB relational threshold. Storing in database causes 2x-4x WAL amplification and multi-hour PITR restore delays.`
+          );
+          ddl = `
+ALTER TABLE ${args.tableName} ADD COLUMN ${args.columnName}_s3_key TEXT NOT NULL;
+ALTER TABLE ${args.tableName} ADD COLUMN ${args.columnName}_sha256 TEXT NOT NULL;
+ALTER TABLE ${args.tableName} ADD COLUMN ${args.columnName}_byte_size BIGINT NOT NULL;
+          `.trim();
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              tableName: args.tableName,
+              columnName: args.columnName,
+              recommendation,
+              warnings,
+              recommendedDDL: ddl,
+            }, null, 2),
+          }],
+        };
+      }
+    );
   }
   ```
 

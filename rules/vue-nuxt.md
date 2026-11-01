@@ -7107,6 +7107,104 @@ export function useHashIndexAuditor(indexName: MaybeRefOrGetter<string>) {
     error,
   };
 }
+
+/**
+ * useLargeObjectUploader (Vue 3.5 Composable)
+ * Enforces client-side 3-Zone Storage Sizing (bytea vs LOB vs S3 Presigned URL)
+ * and provides chunked streaming progress and abort cleanup.
+ */
+export function useLargeObjectUploader() {
+  const isUploading = ref(false);
+  const progressPercent = ref(0);
+  const error = ref<Error | null>(null);
+
+  const uploadFile = async (
+    file: File,
+    endpointUrl: string,
+    options?: { signal?: AbortSignal }
+  ) => {
+    isUploading.value = true;
+    progressPercent.value = 0;
+    error.value = null;
+
+    try {
+      // 1. Client-Side 3-Zone Storage Qualification
+      const MAX_DB_SIZE = 5 * 1024 * 1024; // 5 MB
+      if (file.size > MAX_DB_SIZE) {
+        // Exceeds 5MB: Request S3 presigned PUT URL instead of streaming into database
+        const presignRes = await fetch('/api/storage/presigned-url', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filename: file.name, byteSize: file.size, contentType: file.type }),
+          signal: options?.signal,
+        });
+        if (!presignRes.ok) throw new Error('Failed to obtain presigned storage URL');
+        const { uploadUrl, fileKey } = await presignRes.json();
+
+        // Direct upload to S3 / Cloudflare R2
+        await fetch(uploadUrl, {
+          method: 'PUT',
+          headers: { 'Content-Type': file.type },
+          body: file,
+          signal: options?.signal,
+        });
+
+        progressPercent.value = 100;
+        return { storageTier: 'EXTERNAL_S3', fileKey };
+      }
+
+      // 2. Direct LOB / Bytea upload with XMLHttpRequest for upload progress tracking
+      return await new Promise<{ storageTier: 'DATABASE'; oid?: number }>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', endpointUrl, true);
+        xhr.setRequestHeader('Content-Type', file.type);
+        xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
+
+        if (options?.signal) {
+          options.signal.addEventListener('abort', () => xhr.abort());
+        }
+
+        xhr.upload.onprogress = (event) => {
+          if (event.lengthComputable) {
+            progressPercent.value = Math.round((event.loaded / event.total) * 100);
+          }
+        };
+
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            try {
+              const res = JSON.parse(xhr.responseText);
+              resolve({ storageTier: 'DATABASE', oid: res.oid });
+            } catch {
+              resolve({ storageTier: 'DATABASE' });
+            }
+          } else {
+            reject(new Error(`Upload failed with HTTP ${xhr.status}`));
+          }
+        };
+
+        xhr.onerror = () => reject(new Error('Network error during upload'));
+        xhr.onabort = () => reject(new DOMException('Upload aborted by user', 'AbortError'));
+
+        xhr.send(file);
+      });
+    } catch (err: any) {
+      if (err.name !== 'AbortError') {
+        error.value = err;
+      }
+      throw err;
+    } finally {
+      isUploading.value = false;
+    }
+  };
+
+  return {
+    isUploading,
+    progressPercent,
+    error,
+    uploadFile,
+  };
+}
 ```
 
 

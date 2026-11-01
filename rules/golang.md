@@ -11742,6 +11742,106 @@ func (s *HashIndexSentinel) ReindexConcurrently(ctx context.Context, indexName s
 }
 ```
 
+---
+
+## 15. PostgreSQL Large Object & Binary Stream Production Invariants
+
+When handling binary payloads (PDFs, images, cryptographic keys, attachments) with PostgreSQL and `jackc/pgx/v5`:
+
+- **The 3-Zone Storage Sizing Boundary**:
+  - `Size <= 256 KB`: Use standard `bytea` with LZ4 compression.
+  - `256 KB < Size <= 5 MB`: Use PostgreSQL Large Objects (`pgx.Tx.LargeObjects()`) with transaction-scoped chunked streaming and automated unlink triggers.
+  - `Size > 5 MB`: **Strictly forbid database storage**. Stream directly to AWS S3, Cloudflare R2, or MinIO via presigned URLs. Storing multi-megabyte binaries in PostgreSQL causes $2\times–4\times$ WAL amplification, degrades PITR restore speeds, and inflates database storage costs.
+- **Transaction Scoping Invariant**:
+  - Descriptors returned by `tx.LargeObjects().Open(...)` are strictly bound to the active transaction. NEVER escape or return an open Large Object descriptor across goroutines or outside `tx.Commit()` / `tx.Rollback()`.
+- **Zero-Allocation O(1) Memory Chunked Streaming**:
+  - Never call `io.ReadAll(obj)` or read the entire binary into memory. Always stream using bounded $64\text{KB}$ buffers via `io.CopyBuffer(dst, obj, buf)`.
+- **Automated Unlink Trigger & Orphan Defense**:
+  - Relational `DELETE` on tables referencing `OID` columns does NOT delete `pg_largeobject` chunks. Every table with an `OID` column MUST have an active `BEFORE UPDATE OF ... OR DELETE` trigger executing `PERFORM lo_unlink(OLD.col);`.
+- **Production Large Object Sentinel & Streamer**:
+
+```go
+package store
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// LargeObjectStorageService provides bounded chunked binary streaming and orphan defense.
+type LargeObjectStorageService struct {
+	pool   *pgxpool.Pool
+	logger *slog.Logger
+}
+
+func NewLargeObjectStorageService(pool *pgxpool.Pool, logger *slog.Logger) *LargeObjectStorageService {
+	return &LargeObjectStorageService{pool: pool, logger: logger}
+}
+
+// StoreStream writes an io.Reader into pg_largeobject using 64KB bounded chunks.
+func (s *LargeObjectStorageService) StoreStream(ctx context.Context, r io.Reader) (uint32, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout = '30000ms';"); err != nil {
+		return 0, fmt.Errorf("set statement_timeout: %w", err)
+	}
+
+	los := tx.LargeObjects()
+	oid, err := los.Create(ctx, 0)
+	if err != nil {
+		return 0, fmt.Errorf("create large object: %w", err)
+	}
+
+	obj, err := los.Open(ctx, oid, pgx.LargeObjectModeWrite)
+	if err != nil {
+		return 0, fmt.Errorf("open large object for writing: %w", err)
+	}
+
+	buf := make([]byte, 64*1024)
+	if _, err := io.CopyBuffer(obj, r, buf); err != nil {
+		return 0, fmt.Errorf("streaming write failed: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit large object: %w", err)
+	}
+
+	return oid, nil
+}
+
+// RetrieveStream pipes a Large Object to an io.Writer with O(1) memory allocation.
+func (s *LargeObjectStorageService) RetrieveStream(ctx context.Context, oid uint32, w io.Writer) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin read transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	los := tx.LargeObjects()
+	obj, err := los.Open(ctx, oid, pgx.LargeObjectModeRead)
+	if err != nil {
+		return fmt.Errorf("open large object oid %d: %w", oid, err)
+	}
+
+	buf := make([]byte, 64*1024)
+	if _, err := io.CopyBuffer(w, obj, buf); err != nil {
+		return fmt.Errorf("streaming read failed: %w", err)
+	}
+
+	return tx.Commit(ctx)
+}
+```
+
 
 
 
