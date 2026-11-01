@@ -6761,6 +6761,91 @@ In SvelteKit administrative consoles and system diagnostics:
   </div>
   ```
 
+- **PostgreSQL Query Cancellation & Zombie Backend Monitor (Svelte 5 Runes)**:
+  - ❌ **Anti-Pattern**: Failing to observe aborted transactions (`SQLSTATE 25P02`) and zombie queries in admin dashboards, letting leaked locks paralyze production tables.
+  - ✅ **Production Invariant**: Use Svelte 5 `$props()` and `$derived()` runes to monitor active session states, statement timeout adherence, and trigger graceful cancellation:
+  ```svelte
+  <script lang="ts">
+    interface SessionRecord {
+      pid: number;
+      usename: string;
+      applicationName: string;
+      state: 'active' | 'idle' | 'idle in transaction' | 'idle in transaction (aborted)';
+      durationMs: number;
+      query: string;
+    }
+
+    interface Props {
+      sessions: SessionRecord[];
+      statementTimeoutMs?: number;
+      onCancelBackend?: (pid: number) => void;
+      onTerminateBackend?: (pid: number) => void;
+    }
+
+    let {
+      sessions,
+      statementTimeoutMs = 10000,
+      onCancelBackend,
+      onTerminateBackend,
+    }: Props = $props();
+
+    const abortedCount = $derived(
+      sessions.filter((s) => s.state === 'idle in transaction (aborted)').length
+    );
+    const runawayCount = $derived(
+      sessions.filter((s) => s.state === 'active' && s.durationMs > statementTimeoutMs).length
+    );
+    const hasZombies = $derived(abortedCount > 0 || runawayCount > 0);
+  </script>
+
+  <div class="p-4 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm space-y-3">
+    <div class="flex items-center justify-between">
+      <div>
+        <h4 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">PostgreSQL Backend Sentinel</h4>
+        <span class="text-xs text-zinc-500">{sessions.length} tracked sessions</span>
+      </div>
+      <span class="px-2.5 py-1 rounded-full text-xs font-medium {!hasZombies ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-400' : 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-400'}">
+        {!hasZombies ? 'Zero Zombie Backends' : `${abortedCount} Aborted (25P02), ${runawayCount} Runaway`}
+      </span>
+    </div>
+
+    <div class="space-y-2">
+      {#each sessions as session (session.pid)}
+        {@const isAborted = session.state === 'idle in transaction (aborted)'}
+        {@const isOverdue = session.state === 'active' && session.durationMs > statementTimeoutMs}
+        {#if isAborted || isOverdue}
+          <div class="flex items-center justify-between p-2.5 rounded-lg border border-rose-200 dark:border-rose-900/50 bg-rose-50/50 dark:bg-rose-950/20 text-xs">
+            <div class="space-y-1 truncate pr-3">
+              <div class="flex items-center gap-2">
+                <span class="font-mono font-semibold text-rose-700 dark:text-rose-400">PID {session.pid}</span>
+                <span class="px-1.5 py-0.5 rounded text-[10px] bg-rose-200 dark:bg-rose-900 text-rose-800 dark:text-rose-200 font-medium">
+                  {isAborted ? 'ABORTED TX (25P02)' : `${(session.durationMs / 1000).toFixed(1)}s RUNAWAY`}
+                </span>
+                <span class="text-zinc-500">[{session.applicationName || 'client'}]</span>
+              </div>
+              <p class="font-mono text-zinc-600 dark:text-zinc-400 truncate">{session.query}</p>
+            </div>
+            <div class="flex gap-1.5 shrink-0">
+              <button
+                onclick={() => onCancelBackend?.(session.pid)}
+                class="px-2 py-1 rounded bg-zinc-200 hover:bg-zinc-300 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-800 dark:text-zinc-200 font-medium transition"
+              >
+                SIGINT Cancel
+              </button>
+              <button
+                onclick={() => onTerminateBackend?.(session.pid)}
+                class="px-2 py-1 rounded bg-rose-600 hover:bg-rose-700 text-white font-medium transition"
+              >
+                Terminate
+              </button>
+            </div>
+          </div>
+        {/if}
+      {/each}
+    </div>
+  </div>
+  ```
+
 
 
 

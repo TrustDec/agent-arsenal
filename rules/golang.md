@@ -9525,6 +9525,87 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **PostgreSQL Query Cancellation, Context Timeouts & Deferred ROLLBACK Invariants in Go**:
+  - ❌ **Anti-Pattern**: Using the request context `ctx` directly in `defer tx.Rollback(ctx)` after `ctx.Done()`, which silently fails to execute `ROLLBACK` because the context is already cancelled, leaving aborted transactions (`25P02`) and held row locks on PostgreSQL until connection pool teardown.
+  - ✅ **Production Invariant**: Use `jackc/pgx/v5` with an independent bounded background context (`context.Background()`) in deferred rollbacks, verify `client_connection_check_interval`, and enforce strict transaction-scoped timeout ladders:
+  ```go
+  // QueryTimeoutProfile encapsulates the 5-tier timeout hierarchy for database operations
+  type QueryTimeoutProfile struct {
+  	LockTimeoutMs      int // Fail-fast threshold for acquiring heavyweight table/row locks
+  	StatementTimeoutMs int // Ceiling for total single-query execution duration
+  }
+
+  var ProductionWebProfile = QueryTimeoutProfile{
+  	LockTimeoutMs:      1500, // 1.5 seconds
+  	StatementTimeoutMs: 8000, // 8.0 seconds
+  }
+
+  // ResilientQuerySession guarantees zero leaked locks and clean cancellation handling
+  type ResilientQuerySession struct {
+  	Pool *pgxpool.Pool
+  }
+
+  // ExecuteTransactionalWork runs a unit of work with guaranteed rollback cleanup even on context cancellation
+  func (s *ResilientQuerySession) ExecuteTransactionalWork(
+  	ctx context.Context,
+  	profile QueryTimeoutProfile,
+  	work func(tx pgx.Tx) error,
+  ) (err error) {
+  	// Validate timeout ladder ordering: lock_timeout < statement_timeout
+  	if profile.LockTimeoutMs <= 0 || profile.StatementTimeoutMs <= profile.LockTimeoutMs {
+  		return fmt.Errorf("invalid timeout ladder: lock_timeout (%dms) must be < statement_timeout (%dms)",
+  			profile.LockTimeoutMs, profile.StatementTimeoutMs)
+  	}
+
+  	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+  	if err != nil {
+  		return fmt.Errorf("begin transaction: %w", err)
+  	}
+
+  	// INVARIANT: If ctx was cancelled (e.g. client disconnect or gateway timeout),
+  	// passing ctx to tx.Rollback(ctx) would fail immediately without rolling back on the wire!
+  	// We MUST allocate a fresh, isolated background context with a bounded 2s deadline to guarantee ROLLBACK.
+  	defer func() {
+  		if err != nil {
+  			cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+  			defer cancel()
+  			if rbErr := tx.Rollback(cleanupCtx); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
+  				// Log rollback failure in APM / telemetry
+  				_ = rbErr
+  			}
+  		}
+  	}()
+
+  	// Apply transaction-scoped timeout ladder
+  	setLadderSQL := fmt.Sprintf(
+  		"SET LOCAL lock_timeout = '%dms'; SET LOCAL statement_timeout = '%dms';",
+  		profile.LockTimeoutMs,
+  		profile.StatementTimeoutMs,
+  	)
+  	if _, err = tx.Exec(ctx, setLadderSQL); err != nil {
+  		return fmt.Errorf("configure timeout ladder: %w", err)
+  	}
+
+  	if err = work(tx); err != nil {
+  		var pgErr *pgconn.PgError
+  		if errors.As(err, &pgErr) {
+  			switch pgErr.Code {
+  			case "57014": // query_canceled
+  				return fmt.Errorf("database query was canceled by statement_timeout or client interrupt: %w", err)
+  			case "55P03": // lock_not_available
+  				return fmt.Errorf("lock timeout exceeded (%dms); failing fast to prevent pool exhaustion: %w",
+  					profile.LockTimeoutMs, err)
+  			case "25P02": // current_transaction_is_aborted
+  				return fmt.Errorf("transaction aborted due to earlier error; deferred rollback active: %w", err)
+  			}
+  		}
+  		return err
+  	}
+
+  	return tx.Commit(ctx)
+  }
+  ```
+
 
 
 

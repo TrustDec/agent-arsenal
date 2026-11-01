@@ -3968,6 +3968,20 @@ alwaysApply: false
     - Enforce **COLLATE "C" Binary Comparison Acceleration**: explicitly assign `COLLATE "C"` to sort expressions and index definitions for text attributes, replacing `strcoll()` with single-instruction `memcmp()`.
     - Enforce **Keyset Seek Pagination**: eliminate deep `OFFSET` pagination in favor of cursor-based seek predicates (`WHERE (col, id) < ($c, $i) ORDER BY col DESC, id DESC LIMIT K`), guaranteeing $O(1)$ memory and sub-millisecond execution.
 
+- **Query Cancellation, Client Disconnect Detection & Timeout Ladder Invariants (PostgreSQL)**:
+  - ❌ **Anti-Pattern: Client Disconnect Blindness, Inverted Timeout Ladders & Aborted Lock Leaks**:
+    - Leaving `client_connection_check_interval = 0` (default), causing PostgreSQL backends to execute expensive queries for tens of minutes after the HTTP client or API gateway has already aborted or disconnected, saturating CPU and NVMe disk I/O with phantom work.
+    - Setting `statement_timeout` without configuring a strict, lower `lock_timeout`, allowing queries blocked by table migrations or row locks to hang for the full statement timeout, exhausting connection pool queues and triggering cascading 504 gateway failures.
+    - Failing to issue an immediate `ROLLBACK` when a query fails inside a transaction block (`SQLSTATE 25P02: current transaction is aborted`), leaving the backend holding exclusive row and table locks and freezing the cluster-wide autovacuum horizon.
+    - Killing hung or slow database backends with `kill -9` or sending `SIGQUIT` to backend processes, forcing postmaster to execute full shared memory crash recovery and severing all active client connections.
+    - Blindly retrying queries cancelled by timeout (`57014: query_canceled`) in tight loops without exponential backoff or circuit breaking, amplifying load on the database primary.
+  - ✅ **Production Invariant**:
+    - Enforce **Active Socket Polling**: configure `client_connection_check_interval = '500ms'` in PostgreSQL 14+ to poll TCP sockets during query execution, aborting execution immediately when client sockets emit `EPIPE` or `ECONNRESET`.
+    - Enforce **Strict 5-Tier Timeout Ordering**: verify that $0 < T_{\text{lock\_timeout}} < T_{\text{statement\_timeout}} < T_{\text{transaction\_timeout}} < T_{\text{idle\_in\_transaction}}$ (e.g. `lock_timeout = 1500ms`, `statement_timeout = 10000ms`, `idle_in_transaction_session_timeout = 5000ms`), ensuring transactions fail fast on lock queues.
+    - Enforce **Immediate Deferred ROLLBACK**: wrap all transactional blocks in runtime constructs (`defer tx.Rollback(cleanupCtx)` in Go, `try/finally` in TypeScript/Python) using a fresh, un-cancelled context to release held locks immediately on failure or cancellation.
+    - Enforce **Safe Cancellation Signals**: always cancel backends via `pg_cancel_backend(pid)` (SIGINT) first, escalating to `pg_terminate_backend(pid)` (SIGTERM) only if unresponsive; strictly prohibit `SIGQUIT` or OS-level `kill -9`.
+    - Enforce **Zero Leaked Aborted Backends**: run automated sentinels asserting zero sessions in `state = 'idle in transaction (aborted)'` in `pg_stat_activity`.
+
 
 
 

@@ -7169,6 +7169,75 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         };
       }
     );
+
+    // Tool: Audit Query Cancellation, Timeout Ladder & Zombie Backend compliance
+    this.server.tool(
+      'audit_query_cancellation_and_timeouts',
+      'Audits PostgreSQL pg_stat_activity and GUC timeout settings to verify socket polling (client_connection_check_interval), timeout ladder ordering (lock_timeout < statement_timeout), and detect zombie / aborted transactions (25P02)',
+      {
+        lockTimeoutMs: z.number().describe('Configured lock_timeout in milliseconds'),
+        statementTimeoutMs: z.number().describe('Configured statement_timeout in milliseconds'),
+        idleInTransactionTimeoutMs: z.number().describe('Configured idle_in_transaction_session_timeout in milliseconds'),
+        clientConnectionCheckIntervalMs: z.number().describe('Configured client_connection_check_interval in milliseconds (0 if disabled)'),
+        activeSessionsJson: z.string().describe('JSON array of active pg_stat_activity records [{pid, state, query, duration_ms, wait_event_type}]'),
+      },
+      async (args) => {
+        const violations: string[] = [];
+        const recommendations: string[] = [];
+
+        // Check 1: Client socket polling enabled (PG 14+)
+        if (args.clientConnectionCheckIntervalMs === 0) {
+          violations.push('client_connection_check_interval is 0 (disabled). PostgreSQL cannot detect dropped HTTP clients during query execution');
+          recommendations.push("ALTER SYSTEM SET client_connection_check_interval = '500ms'; SELECT pg_reload_conf();");
+        }
+
+        // Check 2: Strict timeout ladder ordering
+        if (args.lockTimeoutMs <= 0) {
+          violations.push('lock_timeout is 0 (disabled). Queries will hang indefinitely on table lock queues');
+          recommendations.push('Set lock_timeout between 1000ms and 2000ms');
+        } else if (args.lockTimeoutMs >= args.statementTimeoutMs) {
+          violations.push(`Inverted timeout ladder: lock_timeout (${args.lockTimeoutMs}ms) >= statement_timeout (${args.statementTimeoutMs}ms)`);
+          recommendations.push('Ensure lock_timeout is strictly less than statement_timeout (recommended: lock_timeout <= statement_timeout / 4)');
+        }
+
+        // Check 3: Parse active sessions for zombie/aborted backends
+        const sessions = JSON.parse(args.activeSessionsJson) as Array<{
+          pid: number;
+          state: string;
+          query: string;
+          duration_ms?: number;
+          wait_event_type?: string;
+        }>;
+
+        const zombies = sessions.filter((s) => {
+          if (s.state === 'idle in transaction (aborted)') return true;
+          if (s.state === 'idle in transaction' && (s.duration_ms ?? 0) > args.idleInTransactionTimeoutMs) return true;
+          if (s.state === 'active' && (s.duration_ms ?? 0) > args.statementTimeoutMs * 1.5) return true;
+          return false;
+        });
+
+        if (zombies.length > 0) {
+          violations.push(`Detected ${zombies.length} zombie / leaked backends holding locks or resources`);
+          const terminatePids = zombies.map((z) => z.pid);
+          recommendations.push(`Terminate zombie sessions safely via: SELECT pg_terminate_backend(pid) FROM unnest(ARRAY[${terminatePids.join(',')}]) AS pid;`);
+        }
+
+        const isCompliant = violations.length === 0;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              isCompliant,
+              zombiesCount: zombies.length,
+              violations,
+              recommendations,
+              status: isCompliant ? 'compliant' : 'timeout_or_zombie_violations_detected',
+            }, null, 2),
+          }],
+        };
+      }
+    );
   }
   ```
 

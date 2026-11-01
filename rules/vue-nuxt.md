@@ -6040,6 +6040,98 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   </template>
   ```
 
+- **PostgreSQL Query Cancellation & Zombie Backend Monitor (Vue 3 / Nuxt 3)**:
+  - ❌ **Anti-Pattern**: Omitting real-time visibility into orphaned database sessions and transaction-lock holds, letting aborted `25P02` connections silently starve worker pools.
+  - ✅ **Production Invariant**: Implement Vue 3 Composition API reactive components displaying zombie backends, active vs aborted states, and providing non-destructive `pg_cancel_backend` controls:
+  ```vue
+  <script setup lang="ts">
+  import { computed } from 'vue';
+
+  interface SessionRecord {
+    pid: number;
+    usename: string;
+    applicationName: string;
+    state: 'active' | 'idle' | 'idle in transaction' | 'idle in transaction (aborted)';
+    durationMs: number;
+    query: string;
+  }
+
+  const props = withDefaults(defineProps<{
+    sessions?: SessionRecord[];
+    statementTimeoutMs?: number;
+  }>(), {
+    sessions: () => [],
+    statementTimeoutMs: 10000,
+  });
+
+  const emit = defineEmits<{
+    (e: 'cancelBackend', pid: number): void;
+    (e: 'terminateBackend', pid: number): void;
+  }>();
+
+  const abortedSessions = computed(() =>
+    props.sessions.filter((s) => s.state === 'idle in transaction (aborted)')
+  );
+
+  const runawaySessions = computed(() =>
+    props.sessions.filter((s) => s.state === 'active' && s.durationMs > props.statementTimeoutMs)
+  );
+
+  const hasZombies = computed(() => abortedSessions.value.length > 0 || runawaySessions.value.length > 0);
+  </script>
+
+  <template>
+    <div class="p-4 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm space-y-3">
+      <div class="flex items-center justify-between">
+        <div>
+          <h4 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">PostgreSQL Backend Sentinel</h4>
+          <span class="text-xs text-zinc-500">{{ sessions.length }} active backend sessions</span>
+        </div>
+        <span
+          class="px-2.5 py-1 rounded-full text-xs font-medium"
+          :class="!hasZombies ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-400' : 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-400'"
+        >
+          {{ !hasZombies ? 'Zero Zombie Backends' : `${abortedSessions.length} Aborted (25P02), ${runawaySessions.length} Runaway` }}
+        </span>
+      </div>
+
+      <div class="space-y-2">
+        <template v-for="session in sessions" :key="session.pid">
+          <div
+            v-if="session.state === 'idle in transaction (aborted)' || (session.state === 'active' && session.durationMs > statementTimeoutMs)"
+            class="flex items-center justify-between p-2.5 rounded-lg border border-rose-200 dark:border-rose-900/50 bg-rose-50/50 dark:bg-rose-950/20 text-xs"
+          >
+            <div class="space-y-1 truncate pr-3">
+              <div class="flex items-center gap-2">
+                <span class="font-mono font-semibold text-rose-700 dark:text-rose-400">PID {{ session.pid }}</span>
+                <span class="px-1.5 py-0.5 rounded text-[10px] bg-rose-200 dark:bg-rose-900 text-rose-800 dark:text-rose-200 font-medium">
+                  {{ session.state === 'idle in transaction (aborted)' ? 'ABORTED TX (25P02)' : `${(session.durationMs / 1000).toFixed(1)}s RUNAWAY` }}
+                </span>
+                <span class="text-zinc-500">[{{ session.applicationName || 'client' }}]</span>
+              </div>
+              <p class="font-mono text-zinc-600 dark:text-zinc-400 truncate">{{ session.query }}</p>
+            </div>
+            <div class="flex gap-1.5 shrink-0">
+              <button
+                @click="emit('cancelBackend', session.pid)"
+                class="px-2 py-1 rounded bg-zinc-200 hover:bg-zinc-300 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-800 dark:text-zinc-200 font-medium transition"
+              >
+                SIGINT Cancel
+              </button>
+              <button
+                @click="emit('terminateBackend', session.pid)"
+                class="px-2 py-1 rounded bg-rose-600 hover:bg-rose-700 text-white font-medium transition"
+              >
+                Terminate
+              </button>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+  </template>
+  ```
+
 
 
 
