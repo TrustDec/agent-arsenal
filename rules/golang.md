@@ -10201,4 +10201,161 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **Autovacuum Cost Accounting, Worker Division Telemetry & Table Override Sentinel (`jackc/pgx/v5`)**:
+  - ❌ **Anti-Pattern: Unscaled Worker Concurrency & Undersized TID Buffers**:
+    - Increasing `autovacuum_max_workers` without scaling `autovacuum_vacuum_cost_limit`, starving workers to $<2\text{ MB/s}$ throughput.
+    - Altering table autovacuum settings without `lock_timeout`, causing queue blockades behind slow queries.
+  - ✅ **Production Invariant**:
+    - Audit cluster cost limits and ensure per-worker allocation $C_w \ge 400$ points.
+    - Apply isolated table-level cost overrides (`autovacuum_vacuum_cost_limit`, `cost_delay = 0`) under bounded `lock_timeout = 2000ms`.
+  ```go
+  // INVARIANT: Autovacuum Health Sentinel & Table Cost Isolator in Go (pgx/v5).
+  // Verifies that multi-worker cost division does not throttle vacuum line speed,
+  // and enables high-throughput line-rate vacuuming on mission-critical hot tables.
+  type AutovacuumGuard struct {
+    pool *pgxpool.Pool
+  }
+
+  func NewAutovacuumGuard(pool *pgxpool.Pool) (*AutovacuumGuard, error) {
+    if pool == nil {
+      return nil, errors.New("pgx pool must not be nil")
+    }
+    return &AutovacuumGuard{pool: pool}, nil
+  }
+
+  type AutovacuumHealthReport struct {
+    MaxWorkers       int     `json:"max_workers"`
+    CostLimit        int     `json:"cost_limit"`
+    CostDelayMs      float64 `json:"cost_delay_ms"`
+    WorkMemMb        int     `json:"work_mem_mb"`
+    PerWorkerCost    float64 `json:"per_worker_cost"`
+    IsThrottled      bool    `json:"is_throttled"`
+    MultiPassWorkers int     `json:"multi_pass_workers"`
+  }
+
+  // AuditClusterHealth checks for per-worker throttle division and multi-pass index sweeps.
+  func (g *AutovacuumGuard) AuditClusterHealth(ctx context.Context) (*AutovacuumHealthReport, []string, error) {
+    conn, err := g.pool.Acquire(ctx)
+    if err != nil {
+      return nil, nil, fmt.Errorf("acquire conn: %w", err)
+    }
+    defer conn.Release()
+
+    rows, err := conn.Query(ctx, `
+      SELECT name, setting 
+      FROM pg_settings 
+      WHERE name IN (
+        'autovacuum_max_workers', 
+        'autovacuum_vacuum_cost_limit', 
+        'autovacuum_vacuum_cost_delay', 
+        'autovacuum_work_mem',
+        'maintenance_work_mem'
+      );`)
+    if err != nil {
+      return nil, nil, fmt.Errorf("query pg_settings: %w", err)
+    }
+    defer rows.Close()
+
+    settings := make(map[string]string)
+    for rows.Next() {
+      var k, v string
+      if err := rows.Scan(&k, &v); err != nil {
+        return nil, nil, err
+      }
+      settings[k] = v
+    }
+
+    report := &AutovacuumHealthReport{}
+    fmt.Sscanf(settings["autovacuum_max_workers"], "%d", &report.MaxWorkers)
+    fmt.Sscanf(settings["autovacuum_vacuum_cost_limit"], "%d", &report.CostLimit)
+    fmt.Sscanf(settings["autovacuum_vacuum_cost_delay"], "%f", &report.CostDelayMs)
+
+    var autoKb, maintKb int
+    fmt.Sscanf(settings["autovacuum_work_mem"], "%d", &autoKb)
+    fmt.Sscanf(settings["maintenance_work_mem"], "%d", &maintKb)
+    if autoKb > 0 {
+      report.WorkMemMb = autoKb / 1024
+    } else {
+      report.WorkMemMb = maintKb / 1024
+    }
+
+    if report.MaxWorkers > 0 {
+      report.PerWorkerCost = float64(report.CostLimit) / float64(report.MaxWorkers)
+    }
+    report.IsThrottled = report.PerWorkerCost < 300.0
+
+    // Audit active multi-pass index sweeps
+    var multiPassCount int
+    err = conn.QueryRow(ctx, `
+      SELECT count(*) 
+      FROM pg_stat_progress_vacuum 
+      WHERE index_vacuum_count > 1;
+    `).Scan(&multiPassCount)
+    if err != nil {
+      return nil, nil, fmt.Errorf("query progress: %w", err)
+    }
+    report.MultiPassWorkers = multiPassCount
+
+    var warnings []string
+    if report.IsThrottled {
+      warnings = append(warnings, fmt.Sprintf(
+        "THROTTLE_HAZARD: Per-worker cost allowance %.1f < 300 pts. Raise autovacuum_vacuum_cost_limit to %d.",
+        report.PerWorkerCost, report.MaxWorkers*500,
+      ))
+    }
+    if report.WorkMemMb < 512 {
+      warnings = append(warnings, fmt.Sprintf(
+        "TID_MEMORY_HAZARD: autovacuum_work_mem (%dMB) is under 512MB. Risk of multi-pass index sweeps.",
+        report.WorkMemMb,
+      ))
+    }
+    if report.MultiPassWorkers > 0 {
+      warnings = append(warnings, fmt.Sprintf(
+        "ACTIVE_MULTI_PASS_INDEX_SWEEPS: %d worker(s) currently re-scanning indexes.",
+        report.MultiPassWorkers,
+      ))
+    }
+
+    return report, warnings, nil
+  }
+
+  // IsolateHotTable sets dedicated unthrottled parameters on high-churn relations.
+  func (g *AutovacuumGuard) IsolateHotTable(ctx context.Context, table string, costLimit int, costDelayMs int) error {
+    matched, _ := regexp.MatchString(`^[a-zA-Z0-9_]+$`, table)
+    if !matched {
+      return errors.New("invalid table name identifier")
+    }
+
+    conn, err := g.pool.Acquire(ctx)
+    if err != nil {
+      return fmt.Errorf("acquire conn: %w", err)
+    }
+    defer conn.Release()
+
+    tx, err := conn.Begin(ctx)
+    if err != nil {
+      return fmt.Errorf("begin tx: %w", err)
+    }
+    defer tx.Rollback(ctx)
+
+    if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '2000ms';"); err != nil {
+      return fmt.Errorf("set lock_timeout: %w", err)
+    }
+
+    ddl := fmt.Sprintf(`
+      ALTER TABLE %s SET (
+        autovacuum_vacuum_cost_limit = %d,
+        autovacuum_vacuum_cost_delay = %d,
+        autovacuum_vacuum_scale_factor = 0.02,
+        autovacuum_vacuum_threshold = 200
+      );`, table, costLimit, costDelayMs)
+
+    if _, err := tx.Exec(ctx, ddl); err != nil {
+      return fmt.Errorf("alter table autovacuum: %w", err)
+    }
+
+    return tx.Commit(ctx)
+  }
+  ```
+
 

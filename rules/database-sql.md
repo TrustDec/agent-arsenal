@@ -4072,6 +4072,14 @@ alwaysApply: false
       - Enforce **System Catalog Vacuum Horizon Fencing**: continuously monitor `SELECT max(age(catalog_xmin)) FROM pg_replication_slots WHERE slot_type = 'logical'` to guarantee catalog horizon age $\le 500,000$ transactions.
       - Enforce **PostgreSQL 17+ HA Failover Synchronization**: configure logical slots with `failover = true` and standbys with `sync_replication_slots = on` to guarantee uninterrupted CDC failover.
       - Enforce **Zero-Orphaned-Slot CI Teardown**: audit CI test clusters to ensure all test-generated slots (`^(test|tmp|agent)_`) are dropped in `defer` / `afterEach` blocks via `SELECT pg_drop_replication_slot(slot_name)`.
+  - **Autovacuum Cost Limits, Multi-Worker Throttle Division & TID Allocation Invariants**:
+    - ❌ **Anti-Pattern**: Increasing `autovacuum_max_workers` from 3 to 10 while leaving default `autovacuum_vacuum_cost_limit = 200`, dividing the cost limit into a pathetic 20 points per worker and throttling vacuum throughput below $2\text{ MB/s}$ on high-speed NVMe storage. Leaving `autovacuum_work_mem = -1` (inheriting 64MB `maintenance_work_mem`), which overflows on tables with $>11\text{M}$ dead tuples and triggers $4\times–8\times$ redundant full index scan passes across all secondary B-tree, GIN, and GiST indexes. Allowing bloated multi-terabyte tables to monopolize all worker slots, starving small OLTP relations. Allowing table transaction age to approach `autovacuum_freeze_max_age` (200M XIDs) and trigger uncancelable emergency anti-wraparound freezes during peak traffic.
+    - ✅ **Production Invariant**:
+      - Enforce **Scaled Global Cost Limit**: always configure `autovacuum_vacuum_cost_limit = 2500–5000` (guaranteeing $\ge 500$ points per worker) and `autovacuum_vacuum_cost_delay = '2ms'` on NVMe SSD storage.
+      - Enforce **Dedicated autovacuum_work_mem Sizing**: configure `ALTER SYSTEM SET autovacuum_work_mem = '1024MB'` to guarantee single-pass dead TID collection and eliminate redundant index sweeps (`index_vacuum_count == 1`).
+      - Enforce **Isolated Table-Level Overrides**: detach high-churn relations from the shared global cost pool via `ALTER TABLE <hot_table> SET (autovacuum_vacuum_cost_limit = 5000, autovacuum_vacuum_cost_delay = 0, autovacuum_vacuum_scale_factor = 0.02)`.
+      - Enforce **Anti-Wraparound Critical Horizon Sentinel**: continuously audit `SELECT max(age(relfrozenxid)) FROM pg_class` and alert when XID age exceeds 100,000,000 to execute scheduled off-peak freeze runs.
+      - Enforce **Vacuum Telemetry Observability**: configure `ALTER SYSTEM SET log_autovacuum_min_duration = 250;` to capture index passes, dead tuple counts, and I/O rates.
 
 
 

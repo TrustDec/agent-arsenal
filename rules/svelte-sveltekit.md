@@ -7297,6 +7297,99 @@ In SvelteKit administrative consoles and system diagnostics:
   };
   ```
 
+- **Autovacuum Health, Throttle Division & Hot Table Override Dashboard (`+page.server.ts`)**:
+  - ❌ **Anti-Pattern: Blind Multi-Pass Index Sweeps & Throttle Ignorance**:
+    - Failing to monitor `index_vacuum_count` in active vacuum runs, allowing workers to thrash storage with multiple passes.
+    - Applying table-level autovacuum overrides without bounded lock timeouts.
+  - ✅ **Production Invariant**:
+    - Query active vacuum progress via `pg_stat_progress_vacuum` and audit global cost limits.
+    - Provide actions to isolate hot tables with dedicated cost limits under `lock_timeout = '2000ms'`.
+  ```typescript
+  // src/routes/admin/storage/autovacuum/+page.server.ts
+  import type { PageServerLoad, Actions } from './$types';
+  import { fail } from '@sveltejs/kit';
+  import { primaryDb } from '$lib/server/db';
+  import { sql } from 'kysely';
+
+  export const load: PageServerLoad = async () => {
+    // 1. Audit active vacuum progress
+    const activeProgress = await sql<{
+      pid: number;
+      tableName: string;
+      phase: string;
+      heapBlksTotal: number;
+      heapBlksScanned: number;
+      indexVacuumCount: number;
+      numDeadTuples: number;
+    }>`
+      SELECT 
+        p.pid,
+        c.relname AS "tableName",
+        p.phase,
+        p.heap_blks_total AS "heapBlksTotal",
+        p.heap_blks_scanned AS "heapBlksScanned",
+        p.index_vacuum_count AS "indexVacuumCount",
+        p.num_dead_tuples AS "numDeadTuples"
+      FROM pg_stat_progress_vacuum p
+      JOIN pg_class c ON c.oid = p.relid
+    `.execute(primaryDb);
+
+    // 2. Audit global settings
+    const settings = await sql<{ name: string; setting: string }>`
+      SELECT name, setting 
+      FROM pg_settings 
+      WHERE name IN (
+        'autovacuum_max_workers', 
+        'autovacuum_vacuum_cost_limit', 
+        'autovacuum_vacuum_cost_delay', 
+        'autovacuum_work_mem',
+        'maintenance_work_mem'
+      )
+    `.execute(primaryDb);
+
+    const map = new Map(settings.rows.map(r => [r.name, r.setting]));
+    const maxWorkers = parseInt(map.get('autovacuum_max_workers') || '3', 10);
+    const costLimit = parseInt(map.get('autovacuum_vacuum_cost_limit') || '200', 10);
+    const perWorkerCost = maxWorkers > 0 ? costLimit / maxWorkers : costLimit;
+
+    return {
+      activeProgress: activeProgress.rows,
+      maxWorkers,
+      costLimit,
+      perWorkerCost,
+      isThrottled: perWorkerCost < 300,
+    };
+  };
+
+  export const actions: Actions = {
+    isolateTable: async ({ request }) => {
+      const data = await request.formData();
+      const tableName = data.get('tableName')?.toString();
+
+      if (!tableName || !/^[a-zA-Z0-9_]+$/.test(tableName)) {
+        return fail(400, { message: 'Invalid table name identifier' });
+      }
+
+      try {
+        await primaryDb.transaction().execute(async (tx) => {
+          await sql`SET LOCAL lock_timeout = '2000ms'`.execute(tx);
+          await sql.raw(`
+            ALTER TABLE ${tableName} SET (
+              autovacuum_vacuum_cost_limit = 5000,
+              autovacuum_vacuum_cost_delay = 0,
+              autovacuum_vacuum_scale_factor = 0.02,
+              autovacuum_vacuum_threshold = 200
+            )
+          `).execute(tx);
+        });
+        return { success: true, table: tableName };
+      } catch (err: any) {
+        return fail(500, { message: 'Failed to isolate table cost: ' + err.message });
+      }
+    },
+  };
+  ```
+
 
 
 

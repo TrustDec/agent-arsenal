@@ -7857,6 +7857,75 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         };
       }
     );
+
+    // Tool: audit_autovacuum_cost_and_worker_starvation
+    server.tool(
+      'audit_autovacuum_cost_and_worker_starvation',
+      'Audits PostgreSQL autovacuum settings, worker throttle division, autovacuum_work_mem TID buffer capacity, and active multi-pass index sweeps.',
+      {
+        autovacuumMaxWorkers: z.number().describe('Number of autovacuum workers (autovacuum_max_workers)'),
+        autovacuumCostLimit: z.number().describe('Global autovacuum cost limit (autovacuum_vacuum_cost_limit)'),
+        autovacuumCostDelayMs: z.number().describe('Cost delay in ms (autovacuum_vacuum_cost_delay)'),
+        autovacuumWorkMemMb: z.number().describe('Effective autovacuum work mem in MB'),
+        activeMultiPassVacuums: z.number().optional().default(0).describe('Count of active vacuums with index_vacuum_count > 1'),
+        maxTableXidAge: z.number().optional().default(0).describe('Maximum age(relfrozenxid) across user relations'),
+      },
+      async (args) => {
+        const violations: string[] = [];
+        const recommendations: string[] = [];
+
+        const perWorkerCost = args.autovacuumCostLimit / args.autovacuumMaxWorkers;
+
+        // Check 1: Multi-worker throttle division
+        if (perWorkerCost < 300) {
+          violations.push(
+            `THROTTLE_DIVISION_VIOLATION: Per-worker cost allowance is ${perWorkerCost.toFixed(0)} points (Limit: ${args.autovacuumCostLimit}, Workers: ${args.autovacuumMaxWorkers}). Workers sleep 90% of the time, dropping aggregate throughput below 2 MB/s.`
+          );
+          recommendations.push(
+            `Scale cost limit: ALTER SYSTEM SET autovacuum_vacuum_cost_limit = ${Math.max(2500, args.autovacuumMaxWorkers * 500)};`
+          );
+        }
+
+        // Check 2: autovacuum_work_mem single-pass sizing
+        if (args.autovacuumWorkMemMb < 512) {
+          violations.push(
+            `UNDERSIZED_TID_MEMORY: autovacuum_work_mem is ${args.autovacuumWorkMemMb}MB. Tables with >15M dead rows will trigger multi-pass index sweeps.`
+          );
+          recommendations.push(`Configure dedicated memory: ALTER SYSTEM SET autovacuum_work_mem = '1024MB';`);
+        }
+
+        // Check 3: Active multi-pass sweeps
+        if (args.activeMultiPassVacuums > 0) {
+          violations.push(
+            `ACTIVE_MULTI_PASS_INDEX_SWEEPS: ${args.activeMultiPassVacuums} vacuum operations are currently executing repeated full index scans.`
+          );
+          recommendations.push(`Increase autovacuum_work_mem to allow single-pass dead TID collection.`);
+        }
+
+        // Check 4: Anti-wraparound horizon
+        if (args.maxTableXidAge > 100000000) {
+          violations.push(
+            `WRAPAROUND_HORIZON_WARNING: Max relation XID age is ${args.maxTableXidAge} (approaching 200M emergency freeze limit).`
+          );
+          recommendations.push(`Schedule manual vacuum freeze on older tables during maintenance windows.`);
+        }
+
+        const isCompliant = violations.length === 0;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              isCompliant,
+              perWorkerCost,
+              violations,
+              recommendations,
+              status: isCompliant ? 'certified_autovacuum_cost_compliant' : 'autovacuum_throttle_hazards_detected',
+            }, null, 2),
+          }],
+        };
+      }
+    );
   }
   ```
 

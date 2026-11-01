@@ -6513,6 +6513,56 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   });
   ```
 
+- **Autovacuum Health Sentinel & Hot Table Cost Isolator Nitro Routes (Nuxt 3)**:
+  - ❌ **Anti-Pattern: Monolithic Cost Throttling in High-Churn APIs**:
+    - Allowing queue tables or session logs to choke on global autovacuum limits without dedicated table overrides.
+  - ✅ **Production Invariant**:
+    - Audit `pg_stat_progress_vacuum` and global cost allowances.
+    - Execute table-specific cost overrides under transaction-scoped `SET LOCAL lock_timeout = '2000ms'`.
+  ```typescript
+  // server/api/admin/storage/autovacuum/isolate.post.ts
+  import { primaryDb } from '~/server/utils/db';
+  import { sql } from 'kysely';
+
+  export default defineEventHandler(async (event) => {
+    const { tableName, costLimit = 5000, costDelay = 0 } = await readBody<{
+      tableName: string;
+      costLimit?: number;
+      costDelay?: number;
+    }>(event);
+
+    if (!tableName || !/^[a-zA-Z0-9_]+$/.test(tableName)) {
+      throw createError({ statusCode: 400, message: 'Invalid or missing table identifier' });
+    }
+
+    try {
+      await primaryDb.transaction().execute(async (tx) => {
+        await sql`SET LOCAL lock_timeout = '2000ms'`.execute(tx);
+        await sql.raw(`
+          ALTER TABLE ${tableName} SET (
+            autovacuum_vacuum_cost_limit = ${costLimit},
+            autovacuum_vacuum_cost_delay = ${costDelay},
+            autovacuum_vacuum_scale_factor = 0.02,
+            autovacuum_vacuum_threshold = 200
+          )
+        `).execute(tx);
+      });
+
+      return {
+        success: true,
+        table: tableName,
+        isolatedCostLimit: costLimit,
+        isolatedCostDelay: costDelay,
+      };
+    } catch (err: any) {
+      throw createError({
+        statusCode: 500,
+        message: `Failed isolating table autovacuum: ${err.message}`,
+      });
+    }
+  });
+  ```
+
 
 
 
