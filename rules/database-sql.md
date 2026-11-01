@@ -4080,6 +4080,13 @@ alwaysApply: false
       - Enforce **Isolated Table-Level Overrides**: detach high-churn relations from the shared global cost pool via `ALTER TABLE <hot_table> SET (autovacuum_vacuum_cost_limit = 5000, autovacuum_vacuum_cost_delay = 0, autovacuum_vacuum_scale_factor = 0.02)`.
       - Enforce **Anti-Wraparound Critical Horizon Sentinel**: continuously audit `SELECT max(age(relfrozenxid)) FROM pg_class` and alert when XID age exceeds 100,000,000 to execute scheduled off-peak freeze runs.
       - Enforce **Vacuum Telemetry Observability**: configure `ALTER SYSTEM SET log_autovacuum_min_duration = 250;` to capture index passes, dead tuple counts, and I/O rates.
+  - **Commit Log (CLOG / pg_xact), SLRU Cache Buffers & Hint Bit Invariants**:
+    - ❌ **Anti-Pattern**: Exposing bulk-loaded tables immediately to concurrent client/analytical readers without prior hint-bit pre-warming, forcing every backend to inspect `pg_xact` via the tiny 128-buffer SLRU pool, serializing on `WaitEvent: CLogControlLock`, and collapsing throughput by 95%. Assuming `SELECT` queries never write WAL: under `wal_log_hints = on` (or page checksums), reading un-hinted pages marks buffer pages dirty and emits Full Page Images (FPIs, 8KB) into WAL on subsequent checkpoints, turning a read-only query into a multi-gigabyte WAL write storm. Allowing long-running transactions to hold `OldestXmin` for days, accumulating hundreds of `pg_xact` segment files until checkpoint unlinks trigger massive `CLogTruncationLock` connection lock convoys.
+    - ✅ **Production Invariant**:
+      - Enforce **Post-Bulk Ingest Hint-Bit Pre-Warming**: immediately execute `VACUUM (ANALYZE) <relation>` on freshly loaded or migrated tables prior to exposing relations to read queries, stamping `HEAP_XMIN_COMMITTED` across all pages.
+      - Enforce **SLRU Cache Telemetry Watchdogs**: continuously monitor `SELECT blks_hit, blks_read FROM pg_stat_slru WHERE name = 'clog'` and alert when `hit_ratio < 0.99`.
+      - Enforce **OldestXmin Horizon Protection**: configure `ALTER SYSTEM SET idle_in_transaction_session_timeout = '15m'` and alert when `SELECT max(age(backend_xmin)) FROM pg_stat_activity` exceeds 1,000,000 transactions.
+      - Enforce **Subtransaction SLRU Protection**: ban loops containing `SAVEPOINT` or `begin_nested()` to eliminate $O(\text{depth})$ multi-hop lookups across `pg_subtrans` and `pg_xact`.
 
 
 

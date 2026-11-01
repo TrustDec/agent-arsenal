@@ -6563,6 +6563,55 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   });
   ```
 
+- **Commit Log (CLOG / `pg_xact`) SLRU Telemetry & Hint-Bit Pre-Warming Route (Nuxt 3)**:
+  - ❌ **Anti-Pattern: Opening Cold Tables Directly to Nuxt API Handlers**:
+    - Triggering hundreds of concurrent server routes against un-hinted tables, pinning database CPU in `CLogControlLock`.
+  - ✅ **Production Invariant**:
+    - Provide an administrative route to verify SLRU hit ratio and execute hint-bit pre-warming via `VACUUM (ANALYZE)` before directing API traffic.
+  ```typescript
+  // server/api/admin/storage/clog/prewarm.post.ts
+  import { primaryDb } from '~/server/utils/db';
+  import { sql } from 'kysely';
+
+  export default defineEventHandler(async (event) => {
+    const { tableName } = await readBody<{ tableName: string }>(event);
+
+    if (!tableName || !/^[a-zA-Z0-9_]+$/.test(tableName)) {
+      throw createError({ statusCode: 400, message: 'Invalid or missing table identifier' });
+    }
+
+    try {
+      const start = performance.now();
+      // Set hint bits across all pages of newly populated table
+      await sql.raw(`VACUUM (ANALYZE) ${tableName}`).execute(primaryDb);
+      const durationMs = performance.now() - start;
+
+      // Audit resulting SLRU stats
+      const slruRes = await sql<{ hit_ratio: string }>`
+        SELECT 
+          CASE 
+            WHEN (blks_hit + blks_read) = 0 THEN 1.0 
+            ELSE (blks_hit::float / (blks_hit + blks_read))
+          END AS hit_ratio
+        FROM pg_stat_slru
+        WHERE name = 'clog'
+      `.execute(primaryDb);
+
+      return {
+        success: true,
+        table: tableName,
+        durationMs,
+        currentSlruHitRatio: parseFloat(slruRes.rows[0]?.hit_ratio || '1.0'),
+      };
+    } catch (err: any) {
+      throw createError({
+        statusCode: 500,
+        message: `Failed pre-warming hint bits: ${err.message}`,
+      });
+    }
+  });
+  ```
+
 
 
 

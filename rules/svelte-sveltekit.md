@@ -7390,6 +7390,70 @@ In SvelteKit administrative consoles and system diagnostics:
   };
   ```
 
+- **Commit Log (CLOG / `pg_xact`) SLRU Diagnostics & Pre-Warming Action (`+page.server.ts`)**:
+  - ❌ **Anti-Pattern: Neglecting Hint-Bit Cold Reads in SvelteKit SSR**:
+    - Firing server-side page load queries against un-hinted tables during high user concurrency, stalling workers in `CLogControlLock`.
+  - ✅ **Production Invariant**:
+    - Monitor `pg_stat_slru` and active CLOG wait events in the load function, providing a pre-warm action.
+  ```typescript
+  // src/routes/admin/storage/clog/+page.server.ts
+  import type { PageServerLoad, Actions } from './$types';
+  import { fail } from '@sveltejs/kit';
+  import { primaryDb } from '$lib/server/db';
+  import { sql } from 'kysely';
+
+  export const load: PageServerLoad = async () => {
+    const slruStats = await sql<{
+      name: string;
+      blksHit: number;
+      blksRead: number;
+      hitRatio: number;
+      activeWaits: number;
+    }>`
+      WITH slru AS (
+        SELECT 
+          name,
+          blks_hit AS "blksHit",
+          blks_read AS "blksRead",
+          CASE 
+            WHEN (blks_hit + blks_read) = 0 THEN 1.0 
+            ELSE (blks_hit::float / (blks_hit + blks_read))
+          END AS "hitRatio"
+        FROM pg_stat_slru
+        WHERE name = 'clog'
+      ),
+      waits AS (
+        SELECT COUNT(*)::int AS "activeWaits"
+        FROM pg_stat_activity
+        WHERE wait_event IN ('CLogControlLock', 'CLogTruncationLock', 'XactSLRULock', 'clog')
+      )
+      SELECT s.*, w."activeWaits"
+      FROM slru s
+      CROSS JOIN waits w;
+    `.execute(primaryDb);
+
+    return { slru: slruStats.rows[0] ?? null };
+  };
+
+  export const actions: Actions = {
+    prewarm: async ({ request }) => {
+      const data = await request.formData();
+      const tableName = data.get('tableName')?.toString();
+
+      if (!tableName || !/^[a-zA-Z0-9_]+$/.test(tableName)) {
+        return fail(400, { message: 'Invalid or missing table name' });
+      }
+
+      try {
+        await sql.raw(`VACUUM (ANALYZE) ${tableName}`).execute(primaryDb);
+        return { success: true, table: tableName };
+      } catch (err: any) {
+        return fail(500, { message: 'Pre-warming failed: ' + err.message });
+      }
+    },
+  };
+  ```
+
 
 
 

@@ -7926,6 +7926,76 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         };
       }
     );
+
+    // Tool: audit_clog_slru_and_hint_bits
+    server.tool(
+      'audit_clog_slru_and_hint_bits',
+      'Audits PostgreSQL Commit Log (pg_xact) SLRU buffer cache hit ratio, CLogControlLock wait events, un-hinted tables, and OldestXmin horizon age.',
+      {
+        blocksHit: z.number().describe('Number of SLRU blocks hit in pg_stat_slru for clog'),
+        blocksRead: z.number().describe('Number of SLRU blocks read from disk in pg_stat_slru for clog'),
+        activeCLogWaitEvents: z.number().optional().default(0).describe('Count of backends waiting on CLogControlLock or XactSLRULock'),
+        oldestXminAge: z.number().optional().default(0).describe('Maximum age of backend_xmin across active connections'),
+        targetTableName: z.string().optional().describe('Optional table to check for hint-bit pre-warming requirement'),
+        rowsRecentlyIngested: z.number().optional().default(0).describe('Number of recently ingested rows without subsequent VACUUM'),
+      },
+      async (args) => {
+        const violations: string[] = [];
+        const recommendations: string[] = [];
+
+        const totalBlocks = args.blocksHit + args.blocksRead;
+        const hitRatio = totalBlocks === 0 ? 1.0 : args.blocksHit / totalBlocks;
+
+        // Check 1: SLRU Cache Hit Ratio
+        if (hitRatio < 0.99) {
+          violations.push(
+            `SLRU_CACHE_DEGRADATION: Commit Log (pg_xact) hit ratio is ${(hitRatio * 100).toFixed(2)}% (< 99.0%). Synchronous disk reads against pg_xact segment files are degrading query throughput.`
+          );
+          recommendations.push(
+            `Investigate transactions reading across wide XID age dispersion; schedule hint-bit pre-warming on cold tables.`
+          );
+        }
+
+        // Check 2: Lock Contention / Convoys
+        if (args.activeCLogWaitEvents > 0) {
+          violations.push(
+            `LOCK_CONVOY_DETECTED: ${args.activeCLogWaitEvents} backends are stalled waiting on CLogControlLock / XactSLRULock.`
+          );
+          recommendations.push(`Pre-warm relation hint bits via VACUUM (ANALYZE) immediately.`);
+        }
+
+        // Check 3: OldestXmin horizon
+        if (args.oldestXminAge > 10000000) {
+          violations.push(
+            `OLDEST_XMIN_HAZARD: OldestXmin age is ${args.oldestXminAge.toLocaleString()} transactions. Segment files in pg_xact cannot be truncated, risking a CLogTruncationLock convoy at next checkpoint.`
+          );
+          recommendations.push(`Terminate long-running or idle-in-transaction connections holding backend_xmin.`);
+        }
+
+        // Check 4: Un-hinted table cold read hazard
+        if (args.rowsRecentlyIngested > 100000 && args.targetTableName) {
+          violations.push(
+            `UNHINTED_READ_STORM_HAZARD: Table ${args.targetTableName} received ${args.rowsRecentlyIngested.toLocaleString()} rows without VACUUM. Concurrent readers will thrash pg_xact SLRU buffers.`
+          );
+          recommendations.push(`Execute VACUUM (ANALYZE) ${args.targetTableName}; before opening to user traffic.`);
+        }
+
+        const isCompliant = violations.length === 0;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              isCompliant,
+              hitRatio,
+              violations,
+              recommendations,
+              status: isCompliant ? 'certified_clog_slru_healthy' : 'clog_slru_hazards_detected',
+            }, null, 2),
+          }],
+        };
+      }
+    );
   }
   ```
 

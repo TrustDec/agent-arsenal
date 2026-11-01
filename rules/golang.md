@@ -10358,4 +10358,117 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **Commit Log (CLOG / `pg_xact`), SLRU Cache Telemetry & Hint-Bit Pre-Warmer (`jackc/pgx/v5`)**:
+  - ❌ **Anti-Pattern: Cold Ingestion Read Convoys & SLRU Blindness**:
+    - Querying freshly bulk-copied tables with concurrent worker pools without pre-warming hint bits, pinning CPU in `WaitEvent: CLogControlLock`.
+    - Permitting unmonitored `idle in transaction` connections to pin `OldestXmin` and balloon `pg_xact` segment storage.
+  - ✅ **Production Invariant**:
+    - Pre-warm newly ingested tables via immediate post-load `VACUUM (ANALYZE)` to stamp `HEAP_XMIN_COMMITTED` on all pages.
+    - Continuously inspect `pg_stat_slru` where `name = 'clog'` to guarantee `blks_hit / (blks_hit + blks_read) >= 0.99`.
+  ```go
+  // INVARIANT: CLOG SLRU Sentinel & Hint-Bit Pre-Warmer in Go (pgx/v5).
+  // Prevents CLogControlLock contention, eliminates Full Page Image WAL storms,
+  // and audits OldestXmin horizons across high-throughput clusters.
+  type CLOGSLRUSentinel struct {
+    pool *pgxpool.Pool
+  }
+
+  func NewCLOGSLRUSentinel(pool *pgxpool.Pool) (*CLOGSLRUSentinel, error) {
+    if pool == nil {
+      return nil, errors.New("pgx pool must not be nil")
+    }
+    return &CLOGSLRUSentinel{pool: pool}, nil
+  }
+
+  type SLRUAuditResult struct {
+    HitRatio        float64 `json:"hit_ratio"`
+    BlocksHit       int64   `json:"blocks_hit"`
+    BlocksRead      int64   `json:"blocks_read"`
+    ActiveWaits     int64   `json:"active_clog_waits"`
+    OldestXminAge   int64   `json:"oldest_xmin_age"`
+    IsCompliant     bool    `json:"is_compliant"`
+  }
+
+  func (s *CLOGSLRUSentinel) AuditHealth(ctx context.Context) (*SLRUAuditResult, error) {
+    conn, err := s.pool.Acquire(ctx)
+    if err != nil {
+      return nil, fmt.Errorf("acquire conn: %w", err)
+    }
+    defer conn.Release()
+
+    query := `
+      WITH slru AS (
+        SELECT 
+          blks_hit,
+          blks_read,
+          CASE 
+            WHEN (blks_hit + blks_read) = 0 THEN 1.0 
+            ELSE (blks_hit::float8 / (blks_hit + blks_read))
+          END AS hit_ratio
+        FROM pg_stat_slru
+        WHERE name = 'clog'
+      ),
+      waits AS (
+        SELECT COUNT(*) AS active_waits
+        FROM pg_stat_activity
+        WHERE wait_event IN ('CLogControlLock', 'CLogTruncationLock', 'XactSLRULock', 'clog')
+      ),
+      xmin_horizon AS (
+        SELECT COALESCE(MAX(age(backend_xmin)), 0) AS max_age
+        FROM pg_stat_activity
+        WHERE backend_xmin IS NOT NULL
+      )
+      SELECT 
+        COALESCE(s.blks_hit, 0),
+        COALESCE(s.blks_read, 0),
+        COALESCE(s.hit_ratio, 1.0),
+        COALESCE(w.active_waits, 0),
+        COALESCE(x.max_age, 0)
+      FROM waits w
+      CROSS JOIN xmin_horizon x
+      LEFT JOIN slru s ON true;
+    `
+
+    var res SLRUAuditResult
+    err = conn.QueryRow(ctx, query).Scan(
+      &res.BlocksHit,
+      &res.BlocksRead,
+      &res.HitRatio,
+      &res.ActiveWaits,
+      &res.OldestXminAge,
+    )
+    if err != nil {
+      return nil, fmt.Errorf("audit slru health query: %w", err)
+    }
+
+    res.IsCompliant = res.HitRatio >= 0.99 && res.ActiveWaits == 0 && res.OldestXminAge < 10000000
+    return &res, nil
+  }
+
+  // PrewarmRelationHintBits executes a non-blocking VACUUM ANALYZE to stamp hint bits.
+  func (s *CLOGSLRUSentinel) PrewarmRelationHintBits(ctx context.Context, table string) error {
+    if table == "" {
+      return errors.New("table name cannot be empty")
+    }
+
+    conn, err := s.pool.Acquire(ctx)
+    if err != nil {
+      return fmt.Errorf("acquire conn: %w", err)
+    }
+    defer conn.Release()
+
+    // Bounded statement timeout for maintenance operation
+    if _, err := conn.Exec(ctx, "SET statement_timeout = '60000ms';"); err != nil {
+      return fmt.Errorf("set statement timeout: %w", err)
+    }
+
+    vacuumSQL := fmt.Sprintf("VACUUM (ANALYZE) %s;", pgx.Identifier{table}.Sanitize())
+    if _, err := conn.Exec(ctx, vacuumSQL); err != nil {
+      return fmt.Errorf("prewarm hint bits vacuum: %w", err)
+    }
+
+    return nil
+  }
+  ```
+
 
