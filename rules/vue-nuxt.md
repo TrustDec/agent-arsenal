@@ -6986,6 +6986,82 @@ onUnmounted(() => {
 </template>
 ```
 
+---
+
+## 15. Vue 3.5+ Reactivity Invariants & Memory Leak Elimination Discipline
+
+In modern Vue 3.5+ and Nuxt 3/4 architectures, autonomous agents frequently make four critical mistakes: deeply proxying third-party objects (causing 100x memory overhead), leaking un-cancelled async requests in watchers, mishandling composable arguments, and triggering SSR hydration mismatches. Enforce these strict invariants:
+
+```typescript
+// composables/useAgentResourcePoller.ts
+import { ref, shallowRef, toValue, watchEffect, onWatcherCleanup, type MaybeRefOrGetter } from 'vue';
+
+export interface PollerOptions<T> {
+  url: MaybeRefOrGetter<string>;
+  intervalMs?: MaybeRefOrGetter<number>;
+  onSuccess?: (data: T) => void;
+}
+
+/**
+ * Vue 3.5+ Composable demonstrating:
+ * 1. MaybeRefOrGetter normalization with toValue()
+ * 2. Automatic async cleanup via onWatcherCleanup() (eliminating race conditions)
+ * 3. shallowRef for heavy API responses to prevent deep reactivity overhead
+ */
+export function useAgentResourcePoller<T>(options: PollerOptions<T>) {
+  // Use shallowRef for data payloads to eliminate deep reactive Proxy creation
+  const data = shallowRef<T | null>(null);
+  const isPending = ref(false);
+  const error = shallowRef<Error | null>(null);
+
+  watchEffect(() => {
+    // Normalize reactive getters, refs, and plain values
+    const targetUrl = toValue(options.url);
+    const interval = toValue(options.intervalMs) ?? 10000;
+
+    if (!targetUrl) return;
+
+    const controller = new AbortController();
+
+    // Register async abort cleanup for the active effect iteration (Vue 3.5+)
+    onWatcherCleanup(() => {
+      controller.abort();
+    });
+
+    const fetchData = async () => {
+      isPending.value = true;
+      try {
+        const res = await fetch(targetUrl, { signal: controller.signal });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = (await res.json()) as T;
+        data.value = json;
+        error.value = null;
+        options.onSuccess?.(json);
+      } catch (err: any) {
+        if (err.name !== 'AbortError') {
+          error.value = err;
+        }
+      } finally {
+        isPending.value = false;
+      }
+    };
+
+    fetchData();
+    const timer = setInterval(fetchData, interval);
+
+    onWatcherCleanup(() => {
+      clearInterval(timer);
+    });
+  });
+
+  return {
+    data,
+    isPending,
+    error,
+  };
+}
+```
+
 
 
 

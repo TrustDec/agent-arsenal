@@ -11340,6 +11340,190 @@ func (s *LogicalReplicationSentinel) SafeSkipLSN(ctx context.Context, targetLSN,
 }
 ```
 
+---
+
+## 15. PostgreSQL GIN Pending List Maintenance & Non-Blocking Worker Discipline
+
+When operating high-throughput applications with JSONB, full-text search, or array columns indexed with GIN, leaving `fastupdate = on` without automated background cleanup causes unpredictable 15-second write stalls when `ginInsertCleanup()` hijacks user transactions. Autonomous Go services must decouple GIN maintenance from OLTP request paths:
+
+```go
+// internal/db/gin_cleaner.go
+package db
+
+import (
+	"context"
+	"fmt"
+	"hash/fnv"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// GINMaintenanceTarget configures background cleanup parameters for a specific GIN index.
+type GINMaintenanceTarget struct {
+	IndexName        string
+	TableName        string
+	Interval         time.Duration
+	LockTimeout      time.Duration
+	StatementTimeout time.Duration
+}
+
+// GINMaintenanceWorker safely cleans GIN pending lists out-of-band using advisory locks.
+type GINMaintenanceWorker struct {
+	pool    *pgxpool.Pool
+	logger  *slog.Logger
+	targets []GINMaintenanceTarget
+	mu      sync.Mutex
+	stopCh  chan struct{}
+	doneCh  chan struct{}
+}
+
+// NewGINMaintenanceWorker initializes the maintenance sentinel.
+func NewGINMaintenanceWorker(pool *pgxpool.Pool, logger *slog.Logger, targets []GINMaintenanceTarget) *GINMaintenanceWorker {
+	return &GINMaintenanceWorker{
+		pool:    pool,
+		logger:  logger.With("subsystem", "gin_maintenance"),
+		targets: targets,
+		stopCh:  make(chan struct{}),
+		doneCh:  make(chan struct{}),
+	}
+}
+
+// Start spawns background maintenance routines for each registered target index.
+func (w *GINMaintenanceWorker) Start(ctx context.Context) {
+	go func() {
+		defer close(w.doneCh)
+		var wg sync.WaitGroup
+
+		for _, target := range w.targets {
+			wg.Add(1)
+			go func(t GINMaintenanceTarget) {
+				defer wg.Done()
+				w.runTargetLoop(ctx, t)
+			}(target)
+		}
+
+		wg.Wait()
+	}()
+}
+
+// Stop initiates graceful shutdown and awaits completion of active cleanups.
+func (w *GINMaintenanceWorker) Stop() {
+	close(w.stopCh)
+	<-w.doneCh
+}
+
+func (w *GINMaintenanceWorker) runTargetLoop(ctx context.Context, target GINMaintenanceTarget) {
+	interval := target.Interval
+	if interval <= 0 {
+		interval = 60 * time.Second
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-w.stopCh:
+			return
+		case <-ticker.C:
+			w.cleanIndex(ctx, target)
+		}
+	}
+}
+
+func (w *GINMaintenanceWorker) cleanIndex(ctx context.Context, target GINMaintenanceTarget) {
+	// Stable 64-bit advisory lock hash derived from index name
+	hasher := fnv.New64a()
+	_, _ = hasher.Write([]byte("gin_cleanup_" + target.IndexName))
+	lockKey := int64(hasher.Sum64())
+
+	lockTimeout := target.LockTimeout
+	if lockTimeout <= 0 {
+		lockTimeout = 2 * time.Second
+	}
+	stmtTimeout := target.StatementTimeout
+	if stmtTimeout <= 0 {
+		stmtTimeout = 30 * time.Second
+	}
+
+	// Bound overall worker execution time
+	workCtx, cancel := context.WithTimeout(ctx, stmtTimeout+5*time.Second)
+	defer cancel()
+
+	conn, err := w.pool.Acquire(workCtx)
+	if err != nil {
+		w.logger.WarnContext(ctx, "failed to acquire pool connection for GIN cleanup",
+			"index", target.IndexName, "error", err)
+		return
+	}
+	defer conn.Release()
+
+	tx, err := conn.BeginTx(workCtx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		w.logger.WarnContext(ctx, "failed to begin transaction for GIN cleanup",
+			"index", target.IndexName, "error", err)
+		return
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	// 1. Acquire transaction-scoped non-blocking advisory lock
+	var acquired bool
+	err = tx.QueryRow(workCtx, "SELECT pg_try_advisory_xact_lock($1);", lockKey).Scan(&acquired)
+	if err != nil {
+		w.logger.WarnContext(ctx, "advisory lock query failed", "index", target.IndexName, "error", err)
+		return
+	}
+	if !acquired {
+		w.logger.DebugContext(ctx, "GIN cleanup skipped; advisory lock held by another process",
+			"index", target.IndexName)
+		return
+	}
+
+	// 2. Set strict local timeouts
+	_, err = tx.Exec(workCtx, fmt.Sprintf("SET LOCAL lock_timeout = '%dms';", lockTimeout.Milliseconds()))
+	if err != nil {
+		w.logger.WarnContext(ctx, "failed to set lock_timeout", "index", target.IndexName, "error", err)
+		return
+	}
+	_, err = tx.Exec(workCtx, fmt.Sprintf("SET LOCAL statement_timeout = '%dms';", stmtTimeout.Milliseconds()))
+	if err != nil {
+		w.logger.WarnContext(ctx, "failed to set statement_timeout", "index", target.IndexName, "error", err)
+		return
+	}
+
+	// 3. Execute PostgreSQL native gin_clean_pending_list
+	start := time.Now()
+	var pagesCleaned int64
+	err = tx.QueryRow(workCtx, "SELECT gin_clean_pending_list($1::regclass);", target.IndexName).Scan(&pagesCleaned)
+	if err != nil {
+		w.logger.WarnContext(ctx, "gin_clean_pending_list failed or timed out",
+			"index", target.IndexName, "error", err, "duration", time.Since(start))
+		return
+	}
+
+	if err := tx.Commit(workCtx); err != nil {
+		w.logger.WarnContext(ctx, "failed to commit GIN cleanup transaction",
+			"index", target.IndexName, "error", err)
+		return
+	}
+
+	duration := time.Since(start)
+	if pagesCleaned > 0 {
+		w.logger.InfoContext(ctx, "GIN pending list cleaned successfully",
+			"index", target.IndexName,
+			"pages_cleaned", pagesCleaned,
+			"duration_ms", duration.Milliseconds(),
+		)
+	}
+}
+```
+
 
 
 

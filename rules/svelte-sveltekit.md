@@ -7942,6 +7942,111 @@ In SvelteKit 2 mission-critical database operations dashboards, rendering real-t
 </div>
 ```
 
+---
+
+## 15. Svelte 5 Runes Invariants: `$state.raw`, `$effect.pre` & Reactivity Loop Defense
+
+In Svelte 5, runes completely replace legacy `let` / `$:` reactive declarations. Autonomous agents must strictly observe these production invariants:
+1. **Never use `$state()` for third-party or heavy data collections**: Deep reactivity proxies each nested property. Use `$state.raw()` for immutable payloads, large arrays, and external class instances (e.g., editor state, charting models).
+2. **Never mutate state inside `$effect()` without `untrack()`**: Mutating state that an effect reads creates an infinite reactive cycle.
+3. **Use `$effect.pre()` strictly for DOM pre-render measurements** (such as auto-scrolling to bottom before new elements cause layout reflow).
+
+```svelte
+<!-- src/lib/components/StreamingAgentConsole.svelte -->
+<script lang="ts">
+  import { untrack } from 'svelte';
+
+  interface ConsoleLog {
+    id: string;
+    timestamp: number;
+    level: 'info' | 'warn' | 'error';
+    message: string;
+  }
+
+  interface Props {
+    endpoint: string;
+    maxEntries?: number;
+  }
+
+  let { endpoint, maxEntries = 500 }: Props = $props();
+
+  // 🛡️ Invariant 1: Use $state.raw() for large arrays to prevent deep proxying of 500+ items
+  let logs = $state.raw<ConsoleLog[]>([]);
+  let isConnected = $state(false);
+  let containerRef: HTMLDivElement | null = $state(null);
+  let shouldAutoScroll = $state(true);
+
+  // 🛡️ Invariant 2: $effect.pre runs BEFORE the DOM updates, ideal for measuring scroll position
+  $effect.pre(() => {
+    // Read logs dependency to trigger on update
+    if (logs.length > 0 && containerRef) {
+      const { scrollTop, scrollHeight, clientHeight } = containerRef;
+      shouldAutoScroll = scrollHeight - scrollTop - clientHeight < 40;
+    }
+  });
+
+  // 🛡️ Invariant 3: Clean up active WebSocket connections upon component destruction or endpoint change
+  $effect(() => {
+    const ws = new WebSocket(endpoint);
+
+    ws.onopen = () => {
+      isConnected = true;
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const item: ConsoleLog = JSON.parse(event.data);
+        // Untrack maxEntries so changing maxEntries prop does not rebuild the log array
+        const limit = untrack(() => maxEntries);
+        // Mutate by replacing reference with $state.raw
+        logs = [...logs.slice(-(limit - 1)), item];
+      } catch (err) {
+        console.error('Failed to parse WebSocket message', err);
+      }
+    };
+
+    ws.onclose = () => {
+      isConnected = false;
+    };
+
+    return () => {
+      ws.close();
+    };
+  });
+
+  // Post-render effect for auto-scrolling
+  $effect(() => {
+    if (logs.length > 0 && shouldAutoScroll && containerRef) {
+      containerRef.scrollTop = containerRef.scrollHeight;
+    }
+  });
+</script>
+
+<div class="rounded-xl border border-slate-200 bg-slate-950 p-4 font-mono text-xs text-slate-100 shadow-sm">
+  <div class="mb-3 flex items-center justify-between border-b border-slate-800 pb-2">
+    <span class="font-semibold text-slate-300">Live Agent Stream</span>
+    <span class="inline-flex items-center gap-1.5 text-[11px] {isConnected ? 'text-emerald-400' : 'text-slate-500'}">
+      <span class="h-2 w-2 rounded-full {isConnected ? 'bg-emerald-400 animate-pulse' : 'bg-slate-600'}"></span>
+      {isConnected ? 'Connected' : 'Disconnected'}
+    </span>
+  </div>
+
+  <div bind:this={containerRef} class="h-64 overflow-y-auto space-y-1.5 pr-2">
+    {#each logs as log (log.id)}
+      <div class="flex items-start gap-2">
+        <span class="text-slate-500 select-none">{new Date(log.timestamp).toLocaleTimeString()}</span>
+        <span
+          class="font-bold select-none {log.level === 'error' ? 'text-rose-400' : log.level === 'warn' ? 'text-amber-400' : 'text-sky-400'}"
+        >
+          [{log.level.toUpperCase()}]
+        </span>
+        <span class="text-slate-200">{log.message}</span>
+      </div>
+    {/each}
+  </div>
+</div>
+```
+
 
 
 
