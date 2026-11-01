@@ -8572,6 +8572,125 @@ ALTER TABLE ${args.tableName} ADD COLUMN ${args.columnName}_byte_size BIGINT NOT
         };
       }
     );
+
+    // Tool: Audit DDL Event Triggers, Table Rewrite Risks & Unindexed Foreign Keys
+    this.server.tool(
+      'audit_ddl_event_triggers_and_table_rewrites',
+      'Audits PostgreSQL event trigger guardrails, detects unindexed foreign key hazards, assesses table rewrite risks on target tables, and inspects recent DDL audit logs.',
+      {
+        targetTable: z.string().optional().describe('Optional table name to assess for RewriteTable risk and size'),
+      },
+      async (args) => {
+        // 1. Verify installed event triggers
+        const triggerRes = await pool.query<{ name: string; event: string; enabled: string }>(`
+          SELECT
+              evtname AS name,
+              evtevent AS event,
+              evtenabled AS enabled
+          FROM pg_event_trigger
+          WHERE evtname IN (
+              'trg_guard_destructive_drops',
+              'trg_guard_table_rewrite',
+              'trg_guard_schema_invariants',
+              'trg_audit_ddl_commands'
+          );
+        `);
+
+        // 2. Unindexed foreign keys
+        const unindexedFkRes = await pool.query<{
+          constraintName: string;
+          childTable: string;
+          referencingColumns: string[];
+        }>(`
+          SELECT
+              c.conname AS "constraintName",
+              c.conrelid::regclass::text AS "childTable",
+              ARRAY(
+                  SELECT a.attname
+                  FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+                  JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+                  ORDER BY k.ord
+              ) AS "referencingColumns"
+          FROM pg_constraint c
+          WHERE c.contype = 'f'
+            AND NOT EXISTS (
+                SELECT 1
+                FROM pg_index idx
+                WHERE idx.indrelid = c.conrelid
+                  AND (idx.indkey::int2[])[0:cardinality(c.conkey)-1] = c.conkey
+            )
+          LIMIT 20;
+        `);
+
+        // 3. Optional target table rewrite assessment
+        let tableAssessment = null;
+        if (args.targetTable) {
+          const tableRes = await pool.query<{ sizeBytes: string; sizeMB: number }>(`
+            SELECT
+                pg_total_relation_size(c.oid)::text AS "sizeBytes",
+                round(pg_total_relation_size(c.oid) / (1024.0 * 1024.0), 2) AS "sizeMB"
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relname = $1 AND n.nspname = 'public';
+          `, [args.targetTable]);
+
+          if (tableRes.rows.length > 0) {
+            const row = tableRes.rows[0];
+            const sizeMB = Number(row.sizeMB);
+            tableAssessment = {
+              tableName: args.targetTable,
+              sizeBytes: row.sizeBytes,
+              sizeMB,
+              rewriteHighRisk: sizeMB > 50,
+              recommendation: sizeMB > 50
+                ? 'CRITICAL: Relation exceeds 50MB. Any column type change or non-null addition will acquire AccessExclusiveLock for extended periods. Must use expand/contract or SET LOCAL app.allow_table_rewrite = true during maintenance.'
+                : 'LOW_RISK: Relation is under 50MB.',
+            };
+          }
+        }
+
+        // 4. Recent DDL audit logs
+        let recentAudits: any[] = [];
+        try {
+          const auditRes = await pool.query(`
+            SELECT id, executed_at, command_tag, object_type, object_identity, session_user_name
+            FROM public.ddl_audit_log
+            ORDER BY id DESC
+            LIMIT 10;
+          `);
+          recentAudits = auditRes.rows;
+        } catch {
+          // ddl_audit_log may not exist yet if guardrails not deployed
+        }
+
+        const requiredTriggers = [
+          'trg_guard_destructive_drops',
+          'trg_guard_table_rewrite',
+          'trg_guard_schema_invariants',
+          'trg_audit_ddl_commands',
+        ];
+        const installedNames = triggerRes.rows.map((r) => r.name);
+        const missingTriggers = requiredTriggers.filter((t) => !installedNames.includes(t));
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              guardrailStatus: {
+                allInstalled: missingTriggers.length === 0,
+                installed: triggerRes.rows,
+                missing: missingTriggers,
+              },
+              unindexedForeignKeysCount: unindexedFkRes.rows.length,
+              unindexedForeignKeys: unindexedFkRes.rows,
+              tableAssessment,
+              recentAuditsCount: recentAudits.length,
+              recentAudits,
+            }, null, 2),
+          }],
+        };
+      }
+    );
   }
   ```
 

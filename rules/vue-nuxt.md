@@ -7207,6 +7207,125 @@ export function useLargeObjectUploader() {
 }
 ```
 
+---
+
+## 15. Database DDL Audit & Table Rewrite Sentinel (Vue 3 / Nuxt 3)
+
+When building administrative consoles, DevOps dashboards, or migration monitors:
+
+- **Real-Time DDL Audit Sentinel**: Stream DDL change events with auto-refresh and highlight destructive commands (`DROP`, `ALTER`, `TRUNCATE`).
+- **Table Rewrite Alert Banner**: Warn developers and operators before migration scripts trigger dangerous table rewrites.
+
+```vue
+<!-- components/DDLGuardrailStatusCard.vue -->
+<script setup lang="ts">
+import { ref, onMounted } from 'vue';
+
+interface DDLAuditEntry {
+  id: number;
+  executed_at: string;
+  tx_lsn: string;
+  command_tag: string;
+  object_type: string;
+  object_identity: string;
+  session_user_name: string;
+}
+
+interface GuardrailStatus {
+  allInstalled: boolean;
+  unindexedForeignKeysCount: number;
+  recentAudits: DDLAuditEntry[];
+}
+
+const status = ref<GuardrailStatus | null>(null);
+const isLoading = ref(true);
+const errorMessage = ref<string | null>(null);
+
+async function fetchStatus() {
+  isLoading.value = true;
+  errorMessage.value = null;
+  try {
+    const res = await $fetch<GuardrailStatus>('/api/admin/database/ddl-guards');
+    status.value = res;
+  } catch (err: any) {
+    errorMessage.value = err?.data?.message || err.message || 'Failed to fetch DDL guardrail status';
+  } finally {
+    isLoading.value = false;
+  }
+}
+
+onMounted(() => {
+  fetchStatus();
+});
+</script>
+
+<template>
+  <div class="rounded-xl border border-zinc-800 bg-zinc-950 p-5 shadow-2xl">
+    <div class="flex items-center justify-between pb-4 border-b border-zinc-850">
+      <div class="flex items-center gap-3">
+        <span
+          class="flex h-3 w-3 rounded-full"
+          :class="status?.allInstalled ? 'bg-emerald-500 ring-4 ring-emerald-500/20' : 'bg-rose-500 ring-4 ring-rose-500/20'"
+        />
+        <h3 class="text-sm font-semibold tracking-wide text-zinc-100">PostgreSQL DDL Guardrails</h3>
+      </div>
+      <button
+        @click="fetchStatus"
+        :disabled="isLoading"
+        class="inline-flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-xs font-medium text-zinc-300 hover:bg-zinc-800 active:scale-95 disabled:opacity-50 transition-all"
+      >
+        <span v-if="isLoading" class="h-3 w-3 animate-spin rounded-full border-2 border-zinc-400 border-t-transparent" />
+        Refresh
+      </button>
+    </div>
+
+    <!-- Warning: Unindexed FKs -->
+    <div
+      v-if="status && status.unindexedForeignKeysCount > 0"
+      class="mt-4 flex items-start gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3.5 text-xs text-amber-300"
+    >
+      <svg class="h-4 w-4 shrink-0 mt-0.5 text-amber-400" viewBox="0 0 20 20" fill="currentColor">
+        <path fill-rule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.17 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 5a.75.75 0 01.75.75v4.5a.75.75 0 01-1.5 0v-4.5A.75.75 0 0110 5zm0 10a1 1 0 100-2 1 1 0 000 2z" clip-rule="evenodd" />
+      </svg>
+      <div>
+        <p class="font-medium text-amber-200">Unindexed Foreign Keys Detected ({{ status.unindexedForeignKeysCount }})</p>
+        <p class="mt-0.5 text-amber-300/80">Foreign keys lacking child indexes risk full table sequential scans and lock escalations during updates.</p>
+      </div>
+    </div>
+
+    <!-- Recent DDL Events -->
+    <div class="mt-5">
+      <h4 class="text-xs font-medium text-zinc-400 uppercase tracking-wider">Recent Schema Mutations</h4>
+      <div class="mt-2.5 divide-y divide-zinc-850 overflow-hidden rounded-lg border border-zinc-850">
+        <div
+          v-for="entry in status?.recentAudits || []"
+          :key="entry.id"
+          class="flex items-center justify-between p-2.5 text-xs bg-zinc-900/40 hover:bg-zinc-900/80 transition-colors"
+        >
+          <div class="flex items-center gap-2">
+            <span
+              class="rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold"
+              :class="{
+                'bg-rose-500/20 text-rose-300 border border-rose-500/30': entry.command_tag.includes('DROP'),
+                'bg-amber-500/20 text-amber-300 border border-amber-500/30': entry.command_tag.includes('ALTER'),
+                'bg-blue-500/20 text-blue-300 border border-blue-500/30': entry.command_tag.includes('CREATE'),
+              }"
+            >
+              {{ entry.command_tag }}
+            </span>
+            <span class="font-mono text-zinc-200 font-medium">{{ entry.object_identity }}</span>
+          </div>
+          <div class="flex items-center gap-3 text-zinc-500 font-mono text-[11px]">
+            <span>{{ entry.session_user_name }}</span>
+            <span>{{ new Date(entry.executed_at).toLocaleTimeString() }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+```
+
 
 
 

@@ -8310,6 +8310,128 @@ When displaying high-frequency token lookups, cryptographic hashes, or database 
 </div>
 ```
 
+---
+
+## 15. Database DDL Audit & Event Trigger Guardrail Sentinel (Svelte 5 Runes)
+
+When implementing database observability or schema migration admin interfaces with Svelte 5 runes:
+
+```svelte
+<!-- src/lib/components/DDLAuditSentinel.svelte -->
+<script lang="ts">
+  interface DDLAuditEntry {
+    id: number;
+    executed_at: string;
+    tx_lsn: string;
+    command_tag: string;
+    object_type: string;
+    object_identity: string;
+    session_user_name: string;
+  }
+
+  interface GuardrailStatus {
+    allInstalled: boolean;
+    unindexedForeignKeysCount: number;
+    recentAudits: DDLAuditEntry[];
+  }
+
+  let { initialStatus = null }: { initialStatus?: GuardrailStatus | null } = $props();
+
+  let status = $state<GuardrailStatus | null>(initialStatus);
+  let isLoading = $state(false);
+  let errorMessage = $state<string | null>(null);
+
+  async function refresh() {
+    isLoading = true;
+    errorMessage = null;
+    try {
+      const res = await fetch('/api/admin/database/ddl-guards');
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+      status = await res.json();
+    } catch (err: any) {
+      errorMessage = err.message || 'Failed to fetch DDL guardrail status';
+    } finally {
+      isLoading = false;
+    }
+  }
+
+  $effect(() => {
+    if (!status) {
+      refresh();
+    }
+  });
+</script>
+
+<div class="rounded-xl border border-zinc-800 bg-zinc-950 p-5 shadow-2xl">
+  <div class="flex items-center justify-between pb-4 border-b border-zinc-800">
+    <div class="flex items-center gap-3">
+      <span
+        class="flex h-3 w-3 rounded-full transition-colors"
+        class:bg-emerald-500={status?.allInstalled}
+        class:ring-4={true}
+        class:ring-emerald-500/20={status?.allInstalled}
+        class:bg-rose-500={!status?.allInstalled}
+        class:ring-rose-500/20={!status?.allInstalled}
+      ></span>
+      <h3 class="text-sm font-semibold tracking-wide text-zinc-100">PostgreSQL DDL Guardrails</h3>
+    </div>
+    <button
+      onclick={refresh}
+      disabled={isLoading}
+      class="inline-flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-xs font-medium text-zinc-300 hover:bg-zinc-800 active:scale-95 disabled:opacity-50 transition-all"
+    >
+      {#if isLoading}
+        <span class="h-3 w-3 animate-spin rounded-full border-2 border-zinc-400 border-t-transparent"></span>
+      {/if}
+      Refresh
+    </button>
+  </div>
+
+  {#if status && status.unindexedForeignKeysCount > 0}
+    <div class="mt-4 flex items-start gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3.5 text-xs text-amber-300">
+      <svg class="h-4 w-4 shrink-0 mt-0.5 text-amber-400" viewBox="0 0 20 20" fill="currentColor">
+        <path fill-rule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.17 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 5a.75.75 0 01.75.75v4.5a.75.75 0 01-1.5 0v-4.5A.75.75 0 0110 5zm0 10a1 1 0 100-2 1 1 0 000 2z" clip-rule="evenodd" />
+      </svg>
+      <div>
+        <p class="font-medium text-amber-200">Unindexed Foreign Keys: {status.unindexedForeignKeysCount}</p>
+        <p class="mt-0.5 text-amber-300/80">Missing child indexes risk full table sequential scans and deadlocks on parent deletions.</p>
+      </div>
+    </div>
+  {/if}
+
+  <div class="mt-5">
+    <h4 class="text-xs font-medium text-zinc-400 uppercase tracking-wider">Recent Schema Mutations</h4>
+    <div class="mt-2.5 divide-y divide-zinc-800/80 overflow-hidden rounded-lg border border-zinc-800/80">
+      {#each (status?.recentAudits ?? []) as entry (entry.id)}
+        <div class="flex items-center justify-between p-2.5 text-xs bg-zinc-900/40 hover:bg-zinc-900/80 transition-colors">
+          <div class="flex items-center gap-2">
+            <span
+              class="rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold"
+              class:bg-rose-500/20={entry.command_tag.includes('DROP')}
+              class:text-rose-300={entry.command_tag.includes('DROP')}
+              class:border-rose-500/30={entry.command_tag.includes('DROP')}
+              class:bg-amber-500/20={entry.command_tag.includes('ALTER')}
+              class:text-amber-300={entry.command_tag.includes('ALTER')}
+              class:border-amber-500/30={entry.command_tag.includes('ALTER')}
+              class:bg-blue-500/20={entry.command_tag.includes('CREATE')}
+              class:text-blue-300={entry.command_tag.includes('CREATE')}
+              class:border-blue-500/30={entry.command_tag.includes('CREATE')}
+            >
+              {entry.command_tag}
+            </span>
+            <span class="font-mono text-zinc-200 font-medium">{entry.object_identity}</span>
+          </div>
+          <div class="flex items-center gap-3 text-zinc-500 font-mono text-[11px]">
+            <span>{entry.session_user_name}</span>
+            <span>{new Date(entry.executed_at).toLocaleTimeString()}</span>
+          </div>
+        </div>
+      {/each}
+    </div>
+  </div>
+</div>
+```
+
 
 
 

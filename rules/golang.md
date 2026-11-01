@@ -11842,6 +11842,209 @@ func (s *LargeObjectStorageService) RetrieveStream(ctx context.Context, oid uint
 }
 ```
 
+---
+
+## 16. PostgreSQL Event Triggers, Migration Pre-Flight Sentinels & DDL Guardrails
+
+When executing database schema migrations or running agentic database maintenance in Go (`jackc/pgx/v5`):
+
+- **Zero-Bypass DDL Execution with Lock Timeout**:
+  - Never execute DDL without setting `SET LOCAL lock_timeout = '2000ms'`. Without lock timeout, an `AccessExclusiveLock` request blocks in the Lock Manager queue, creating a head-of-line convoy that locks all concurrent queries and exhausts the connection pool in seconds.
+- **Table Rewrite Safety Fencing**:
+  - Large relations (> 50MB) undergoing physical table rewrites (`RewriteTable()`) acquire exclusive locks that freeze production. Use pre-flight assessment to estimate table size and explicitly fence rewrites behind `SET LOCAL app.allow_table_rewrite = 'true'` only during scheduled maintenance windows.
+- **Foreign Key Index Verification**:
+  - Always verify that new or existing foreign keys are supported by B-Tree indexes on child columns before deploying to production.
+- **Production Event Trigger & DDL Sentinel**:
+
+```go
+package migration
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type UnindexedForeignKey struct {
+	ConstraintName     string   `json:"constraint_name"`
+	ChildTable         string   `json:"child_table"`
+	ReferencingColumns []string `json:"referencing_columns"`
+}
+
+type TableRewriteAssessment struct {
+	TableName      string `json:"table_name"`
+	SizeBytes      int64  `json:"size_bytes"`
+	SizeMB         int64  `json:"size_mb"`
+	IsHighRisk     bool   `json:"is_high_risk"`
+	RequiresBypass bool   `json:"requires_bypass"`
+}
+
+type DDLAuditRecord struct {
+	ID             int64     `json:"id"`
+	ExecutedAt     time.Time `json:"executed_at"`
+	TxLSN          string    `json:"tx_lsn"`
+	CommandTag     string    `json:"command_tag"`
+	ObjectType     string    `json:"object_type"`
+	ObjectIdentity string    `json:"object_identity"`
+	SessionUser    string    `json:"session_user"`
+}
+
+type EventTriggerMigrationSentinel struct {
+	pool *pgxpool.Pool
+}
+
+func NewEventTriggerMigrationSentinel(pool *pgxpool.Pool) *EventTriggerMigrationSentinel {
+	return &EventTriggerMigrationSentinel{pool: pool}
+}
+
+// AuditUnindexedForeignKeys queries pg_constraint and pg_index to detect child tables lacking B-tree indexes.
+func (s *EventTriggerMigrationSentinel) AuditUnindexedForeignKeys(ctx context.Context) ([]UnindexedForeignKey, error) {
+	query := `
+		SELECT
+			c.conname,
+			c.conrelid::regclass::text,
+			ARRAY(
+				SELECT a.attname
+				FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+				JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+				ORDER BY k.ord
+			)
+		FROM pg_constraint c
+		WHERE c.contype = 'f'
+		  AND NOT EXISTS (
+			  SELECT 1
+			  FROM pg_index idx
+			  WHERE idx.indrelid = c.conrelid
+			    AND (idx.indkey::int2[])[0:cardinality(c.conkey)-1] = c.conkey
+		  )
+		ORDER BY 2, 1;
+	`
+
+	rows, err := s.pool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("audit unindexed foreign keys: %w", err)
+	}
+	defer rows.Close()
+
+	var results []UnindexedForeignKey
+	for rows.Next() {
+		var fk UnindexedForeignKey
+		if err := rows.Scan(&fk.ConstraintName, &fk.ChildTable, &fk.ReferencingColumns); err != nil {
+			return nil, fmt.Errorf("scan unindexed fk: %w", err)
+		}
+		results = append(results, fk)
+	}
+
+	return results, rows.Err()
+}
+
+// AssessTableRewriteRisk checks relation size before migration to detect dangerous RewriteTable operations.
+func (s *EventTriggerMigrationSentinel) AssessTableRewriteRisk(ctx context.Context, tableName string) (*TableRewriteAssessment, error) {
+	query := `
+		SELECT
+			c.oid::regclass::text,
+			pg_total_relation_size(c.oid)
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relname = $1
+		  AND n.nspname = 'public'
+		  AND c.relkind = 'r';
+	`
+
+	var relName string
+	var sizeBytes int64
+	err := s.pool.QueryRow(ctx, query, tableName).Scan(&relName, &sizeBytes)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, fmt.Errorf("table %q not found in public schema", tableName)
+		}
+		return nil, fmt.Errorf("query table size: %w", err)
+	}
+
+	sizeMB := sizeBytes / (1024 * 1024)
+	isHighRisk := sizeMB > 50
+
+	return &TableRewriteAssessment{
+		TableName:      relName,
+		SizeBytes:      sizeBytes,
+		SizeMB:         sizeMB,
+		IsHighRisk:     isHighRisk,
+		RequiresBypass: isHighRisk,
+	}, nil
+}
+
+// ExecuteGuardedMigration executes a DDL script wrapped with strict lock timeout and maintenance bypass flags.
+func (s *EventTriggerMigrationSentinel) ExecuteGuardedMigration(
+	ctx context.Context,
+	migrationSQL string,
+	allowTableRewrite bool,
+	lockTimeout time.Duration,
+) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return fmt.Errorf("begin migration tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Enforce strict lock timeout to eliminate lock convoys
+	lockMs := int(lockTimeout.Milliseconds())
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = '%dms';", lockMs)); err != nil {
+		return fmt.Errorf("set lock_timeout: %w", err)
+	}
+
+	if allowTableRewrite {
+		slog.Warn("Enabling table rewrite permission for active migration", "lock_timeout", lockTimeout)
+		if _, err := tx.Exec(ctx, "SET LOCAL app.allow_table_rewrite = 'true';"); err != nil {
+			return fmt.Errorf("set allow_table_rewrite: %w", err)
+		}
+	}
+
+	if _, err := tx.Exec(ctx, migrationSQL); err != nil {
+		return fmt.Errorf("execute migration statements: %w", err)
+	}
+
+	return tx.Commit(ctx)
+}
+
+// FetchRecentDDLAudits queries ddl_audit_log for recently executed DDL operations.
+func (s *EventTriggerMigrationSentinel) FetchRecentDDLAudits(ctx context.Context, limit int) ([]DDLAuditRecord, error) {
+	query := `
+		SELECT
+			id,
+			executed_at,
+			tx_lsn::text,
+			command_tag,
+			object_type,
+			object_identity,
+			session_user_name
+		FROM public.ddl_audit_log
+		ORDER BY id DESC
+		LIMIT $1;
+	`
+
+	rows, err := s.pool.Query(ctx, query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query ddl audit log: %w", err)
+	}
+	defer rows.Close()
+
+	var records []DDLAuditRecord
+	for rows.Next() {
+		var r DDLAuditRecord
+		if err := rows.Scan(&r.ID, &r.ExecutedAt, &r.TxLSN, &r.CommandTag, &r.ObjectType, &r.ObjectIdentity, &r.SessionUser); err != nil {
+			return nil, fmt.Errorf("scan ddl audit record: %w", err)
+		}
+		results = append(results, r)
+	}
+
+	return records, rows.Err()
+}
+```
+
 
 
 
