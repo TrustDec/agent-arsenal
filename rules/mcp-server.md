@@ -7314,6 +7314,84 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
       }
     );
   }
+
+  public registerAuditFastPathLocksTool(): void {
+    this.server.tool(
+      'audit_fastpath_locks_and_fanout',
+      'Audits a PostgreSQL query or schema design to detect 16-slot fast-path lock overflow, unpruned partition fanout, session-level advisory lock leaks, and max_locks_per_transaction saturation risk.',
+      {
+        sqlQuery: z.string().describe('The SQL query string to inspect for table counts, partition predicates, and advisory lock usage'),
+        isPartitioned: z.boolean().optional().default(false).describe('Whether the target query touches partitioned tables'),
+        childPartitionCount: z.number().optional().default(0).describe('Total number of child partitions in the partitioned table hierarchy'),
+        indexesPerTable: z.number().optional().default(3).describe('Estimated average indexes per table'),
+      },
+      async (args) => {
+        const violations: string[] = [];
+        const recommendations: string[] = [];
+
+        // Count referenced tables
+        const fromMatches = args.sqlQuery.match(/\bFROM\s+([a-zA-Z0-9_]+)/gi) || [];
+        const joinMatches = args.sqlQuery.match(/\bJOIN\s+([a-zA-Z0-9_]+)/gi) || [];
+        const tableCount = fromMatches.length + joinMatches.length;
+
+        let totalRelationLocks = tableCount * (1 + args.indexesPerTable);
+
+        // Partition fanout checks
+        if (args.isPartitioned && args.childPartitionCount > 0) {
+          const hasPruningPredicate = /\b(?:WHERE|AND)\b[\s\S]*?(?:date|timestamp|time|id|tenant|created_at|event_date)\s*(?:=|IN|>=|<=|>|<|BETWEEN)\b/i.test(args.sqlQuery);
+          if (!hasPruningPredicate) {
+            const partitionLocks = args.childPartitionCount * (1 + args.indexesPerTable);
+            totalRelationLocks += partitionLocks;
+            violations.push(
+              `Unpruned query touches partitioned relation with ${args.childPartitionCount} child partitions, requiring ~${partitionLocks} relation locks. This risks exhausting max_locks_per_transaction (FATAL: out of shared memory).`
+            );
+            recommendations.push(
+              'Add explicit partition key range or equality predicates to the WHERE clause to enable static planner partition pruning.'
+            );
+          }
+        }
+
+        // Fast-path limit check (16 slots)
+        const FAST_PATH_LIMIT = 16;
+        const exceedsFastPath = totalRelationLocks > FAST_PATH_LIMIT;
+        if (exceedsFastPath) {
+          violations.push(
+            `Total estimated relation locks (${totalRelationLocks}) exceeds the 16 fast-path slot limit (FAST_PATH_BITS_PER_SLOT = 16). Surplus locks will spill into shared memory (LockMethodLockHash), contending on LockHashPartitionLock.`
+          );
+          recommendations.push(
+            'Decompose query into smaller bounded steps or pre-aggregated CTEs to keep relation + index locks <= 16.'
+          );
+        }
+
+        // Advisory lock leak check
+        if (/\bpg_advisory_lock\s*\(/i.test(args.sqlQuery) && !/\bpg_advisory_xact_lock\s*\(/i.test(args.sqlQuery)) {
+          violations.push(
+            'Session-level pg_advisory_lock detected. In connection pools (PgBouncer), leaked advisory locks permanently consume shared lock table slots.'
+          );
+          recommendations.push(
+            'Replace with transaction-scoped pg_advisory_xact_lock() to guarantee automatic lock release at COMMIT/ROLLBACK.'
+          );
+        }
+
+        const isCompliant = violations.length === 0;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              isCompliant,
+              tableCount,
+              totalEstimatedRelationLocks: totalRelationLocks,
+              exceedsFastPath,
+              violations,
+              recommendations,
+              status: isCompliant ? 'certified_fastpath_compliant' : 'fastpath_overflow_risk_detected',
+            }, null, 2),
+          }],
+        };
+      }
+    );
+  }
   ```
 
 

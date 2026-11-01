@@ -6895,6 +6895,41 @@ In SvelteKit administrative consoles and system diagnostics:
   };
   ```
 
+- **SvelteKit Server Loaders & Fast-Path Lock Preservation Invariants (+page.server.ts)**:
+  - ❌ **Anti-Pattern: Unpruned Partition Queries & Mega-Joins Exceeding 16 Fast-Path Slots**:
+    - Writing queries in `+page.server.ts` or form actions that join 8+ tables with multiple indexes, exceeding the 16 fast-path lock slots (`FAST_PATH_BITS_PER_SLOT = 16`) and spilling into shared memory (`LockMethodLockHash`), creating `LockHashPartitionLock` bottlenecks during traffic bursts.
+    - Fetching time-series or event data without partition key bounds, locking all child partitions and risking shared lock table exhaustion (`FATAL: out of shared memory`).
+  - ✅ **Production Invariant**:
+    - Keep relations + indexes bounded $\le 16$ per transaction; enforce mandatory partition key filters (`event_date = $1`) in loaders.
+    - Always use transaction-scoped `pg_advisory_xact_lock` for concurrency controls in SvelteKit form actions.
+  ```typescript
+  // src/routes/events/+page.server.ts
+  import type { PageServerLoad } from './$types';
+  import { db } from '$lib/server/db';
+  import { error } from '@sveltejs/kit';
+
+  export const load: PageServerLoad = async ({ url, locals }) => {
+    const tenantId = locals.tenantId;
+    const dateParam = url.searchParams.get('date') || new Date().toISOString().split('T')[0];
+
+    // INVARIANT: Always filter on partition key (event_date) to enable static partition pruning.
+    // Avoids locking all 365 daily partitions; locks exactly 1 partition and preserves fast-path arrays.
+    const dailyEvents = await db
+      .selectFrom('partitioned_events')
+      .select(['id', 'event_type', 'payload', 'created_at'])
+      .where('tenant_id', '=', tenantId)
+      .where('event_date', '=', sql<Date>`${dateParam}::date`)
+      .orderBy('created_at', 'desc')
+      .limit(50)
+      .execute();
+
+    return {
+      selectedDate: dateParam,
+      events: dailyEvents,
+    };
+  };
+  ```
+
 
 
 

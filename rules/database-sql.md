@@ -3996,6 +3996,20 @@ alwaysApply: false
     - Enforce **Short-Circuiting Semi-Join EXISTS**: replace all `COUNT(*) > 0` existence checks with `WHERE EXISTS (SELECT 1 FROM ...)`, guaranteeing immediate execution termination on the very first matching tuple.
     - Enforce **Pull-Up Optimization Barrier Audit**: prohibit gratuitous `LIMIT` or `DISTINCT` in inner subquery filters to ensure PostgreSQL's query planner flattens the query into the global jointree.
 
+- **Fast-Path Locking, Lock Table Hash Contention & max_locks_per_transaction Invariants (PostgreSQL)**:
+  - ❌ **Anti-Pattern: 16-Slot Fast-Path Overflow, Partition Fanout Lock Spikes & Leaked Advisory Locks**:
+    - Touching > 16 relations and indexes in a single transaction (e.g., massive ORM joins across 8 tables with 15 indexes), spilling locks from backend-local $O(1)$ fast-path arrays (`FAST_PATH_BITS_PER_SLOT = 16`) into the global shared memory lock table (`LockMethodLockHash`), thrashing the 16 `LockHashPartitionLock` lightweight locks and inducing CPU spinlock contention under concurrency.
+    - Querying partitioned relations without partition pruning (e.g. `WHERE status = 'active'` on daily partitions), forcing PostgreSQL to acquire relation locks on every child partition and every index ($300 \times 4 = 1,200$ locks), instantly exhausting the cluster's fixed shared memory lock allocation and triggering `FATAL: out of shared memory (HINT: You might need to increase max_locks_per_transaction)`.
+    - Executing strong locks (`ALTER TABLE`, `VACUUM FULL`, `ShareUpdateExclusiveLock`) on tables holding active fast-path locks, invoking `FastPathTransferRelationLocks` which acquires shared `ProcArrayLock`, halts backends, and forces fast-path lock transfers into shared memory.
+    - Deeply nesting ORM savepoints or subtransactions (`SAVEPOINT`), which duplicates lock hash entries across savepoint levels, multiplying shared lock table consumption by savepoint depth.
+    - Using session-level `pg_advisory_lock()` without guaranteed release in `finally` blocks, leaking lock table slots across pooled connections in PgBouncer and starving active transactions.
+  - ✅ **Production Invariant**:
+    - Enforce **Fast-Path 16-Relation Budget**: keep total touched relations plus indexes per transaction $\le 16$; decompose mega-joins into smaller bounded steps or pre-aggregated CTEs; verify `COUNT(*) FILTER (WHERE NOT fastpath) == 0` in `pg_locks` for high-frequency OLTP routes.
+    - Enforce **Static Partition Pruning**: mandate partition key equality or range predicates in `WHERE` clauses on partitioned tables, ensuring locks are restricted strictly to relevant child partitions and avoiding cluster-wide lock table exhaustion.
+    - Enforce **Calibrated max_locks_per_transaction Sizing**: pre-allocate sufficient lock table capacity by setting `max_locks_per_transaction >= 256` in `postgresql.conf` on systems with partitioned tables, microservices, or complex views.
+    - Enforce **Transaction-Scoped Advisory Locks**: replace all session-level `pg_advisory_lock()` with `pg_advisory_xact_lock()`, ensuring locks are automatically released at `COMMIT` or `ROLLBACK` and never leaked across pooled connections.
+    - Enforce **Lock Table Saturation Sentinels**: monitor active lock utilization against total allocated slots $(\text{max\_connections} + \text{max\_prepared\_transactions}) \times \text{max\_locks\_per\_transaction}$, alerting if shared lock table usage exceeds 60%.
+
 
 
 

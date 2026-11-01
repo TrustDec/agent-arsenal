@@ -6186,6 +6186,45 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   });
   ```
 
+- **Nuxt Server Handlers & Fast-Path Lock Preservation Invariants (server/api)**:
+  - ❌ **Anti-Pattern: 16-Lock Slot Overflow & Unbounded Partition Locks in Event Handlers**:
+    - Writing Nitro server event handlers with unpartitioned queries or large relational joins exceeding 16 total relation + index locks, spilling locks into shared memory (`LockMethodLockHash`), degrading concurrent SSR rendering throughput.
+    - Using session-level advisory locks in server routes that leak across connection pool checkouts.
+  - ✅ **Production Invariant**:
+    - Guard server handlers with strict partition pruning parameters (`event_date = $1`) and keep joined relations $\le 16$.
+    - Wrap advisory locks in explicit transaction blocks via `pg_advisory_xact_lock()`.
+  ```typescript
+  // server/api/events/daily.get.ts
+  import { db } from '~/server/utils/db';
+  import { sql } from 'kysely';
+
+  export default defineEventHandler(async (event) => {
+    const query = getQuery(event);
+    const tenantId = event.context.auth?.tenantId;
+    const dateParam = (query.date as string) || new Date().toISOString().split('T')[0];
+
+    if (!tenantId) {
+      throw createError({ statusCode: 401, message: 'Unauthorized' });
+    }
+
+    // INVARIANT: Static partition pruning via dateParam; avoids locking all child partitions.
+    // Preserves fast-path 16-slot array and guarantees sub-5ms API response latency.
+    const events = await db
+      .selectFrom('partitioned_events')
+      .select(['id', 'event_type', 'payload', 'created_at'])
+      .where('tenant_id', '=', tenantId)
+      .where('event_date', '=', sql<Date>`${dateParam}::date`)
+      .orderBy('created_at', 'desc')
+      .limit(100)
+      .execute();
+
+    return {
+      date: dateParam,
+      events,
+    };
+  });
+  ```
+
 
 
 

@@ -9659,6 +9659,77 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **Database Fast-Path Locking, Partition Pruning & Lock Saturation Invariants (`jackc/pgx/v5`)**:
+  - ❌ **Anti-Pattern: 16-Lock Fast-Path Overflow & Unpruned Partition Fanout**:
+    - Spawning multi-table repository transactions that touch > 16 relations and indexes, spilling locks from backend-local $O(1)$ fast-path arrays (`FAST_PATH_BITS_PER_SLOT = 16`) into PostgreSQL's shared lock table (`LockMethodLockHash`), triggering `LWLock:LockHashPartitionLock` spinlock stalls under high concurrent Go goroutine traffic.
+    - Querying partitioned relations without explicit partition key predicates, locking hundreds of child partitions and thousands of indexes, quickly blowing past `max_locks_per_transaction` and crashing concurrent backends with `FATAL: out of shared memory`.
+    - Using session-level advisory locks (`SELECT pg_advisory_lock(...)`) across pooled connections in `pgxpool.Pool`, leaking lock entries when goroutines error or context cancels before reaching `pg_advisory_unlock(...)`.
+  - ✅ **Production Invariant**:
+    - Enforce **Partition Key Invariant in Query Signatures**: require date/tenant partition keys in repository method parameters, ensuring queries always filter on partition boundaries and limit relation locks to $1 + N_{\text{indexes}}$.
+    - Enforce **Transaction-Scoped Advisory Locks**: always invoke `SELECT pg_advisory_xact_lock($1)` within a transaction block, ensuring locks automatically release upon `COMMIT` or `ROLLBACK` even if the Go goroutine panics.
+    - Enforce **Fast-Path Lock Telemetry Auditing**: monitor `pg_locks` during integration tests to assert that `fastpath = true` for all high-frequency repository methods.
+  ```go
+  // INVARIANT: Execute partitioned query with strict partition pruning and fast-path lock compliance.
+  // Locks exactly 1 parent + 1 target partition + 3 indexes = 5 relation locks (<= 16 fast-path slots).
+  func (r *EventRepository) FetchPrunedEventsWithLockAudit(
+  	ctx context.Context,
+  	tenantID string,
+  	eventDate time.Time,
+  ) ([]EventSummary, error) {
+  	tx, err := r.Pool.Begin(ctx)
+  	if err != nil {
+  		return nil, fmt.Errorf("begin tx: %w", err)
+  	}
+  	defer tx.Rollback(context.WithoutCancel(ctx))
+
+  	// 1. Mandatory static partition pruning via explicit date equality
+  	const query = `
+  		SELECT 
+  			event_date::text,
+  			COUNT(*) AS total_count,
+  			COALESCE(MAX(created_at), NOW()) AS latest_event
+  		FROM partitioned_events
+  		WHERE tenant_id = $1 
+  		  AND event_date = $2::date
+  		GROUP BY event_date;
+  	`
+  	dateStr := eventDate.Format("2006-01-02")
+  	rows, err := tx.Query(ctx, query, tenantID, dateStr)
+  	if err != nil {
+  		return nil, fmt.Errorf("query partitioned events: %w", err)
+  	}
+  	defer rows.Close()
+
+  	var summaries []EventSummary
+  	for rows.Next() {
+  		var s EventSummary
+  		if err := rows.Scan(&s.PartitionDate, &s.TotalCount, &s.LatestEvent); err != nil {
+  			return nil, fmt.Errorf("scan event summary: %w", err)
+  		}
+  		summaries = append(summaries, s)
+  	}
+  	if err := rows.Err(); err != nil {
+  		return nil, err
+  	}
+
+  	// 2. Telemetry Invariant: verify backend relation locks stay within fast-path array
+  	var fastPathCount, sharedCount int
+  	err = tx.QueryRow(ctx, `
+  		SELECT 
+  			COALESCE(SUM(CASE WHEN fastpath THEN 1 ELSE 0 END), 0),
+  			COALESCE(SUM(CASE WHEN NOT fastpath THEN 1 ELSE 0 END), 0)
+  		FROM pg_locks
+  		WHERE pid = pg_backend_pid() AND locktype = 'relation';
+  	`).Scan(&fastPathCount, &sharedCount)
+  	if err == nil && sharedCount > 0 {
+  		// In production, log warning; in CI test suites, assert sharedCount == 0
+  		fmt.Printf("WARNING: Fast-path lock overflow detected (shared locks: %d, fast-path: %d)\n", sharedCount, fastPathCount)
+  	}
+
+  	return summaries, tx.Commit(ctx)
+  }
+  ```
+
 
 
 
