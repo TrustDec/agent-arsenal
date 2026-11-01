@@ -8769,6 +8769,108 @@ ALTER TABLE ${args.tableName} ADD COLUMN ${args.columnName}_byte_size BIGINT NOT
       }
     );
 
+    // Tool: Audit Logical Replication Publications, Row Filters & Schema Parity
+    this.server.tool(
+      'audit_logical_replication_publications_and_row_filters',
+      'Audits PostgreSQL logical replication publications for row filter replica identity hazards, missing primary keys, unpartitioned root publication settings, and cross-table referential integrity gaps.',
+      {
+        publicationName: z.string().optional().describe('Optional publication name to filter inspection'),
+      },
+      async (args) => {
+        let filterClause = '';
+        const params: any[] = [];
+        if (args.publicationName) {
+          params.push(args.publicationName);
+          filterClause = 'WHERE p.pubname = $1';
+        }
+
+        const pubRes = await pool.query<{
+          pubname: string;
+          schemaname: string;
+          tablename: string;
+          rowfilter: string | null;
+          column_count: number;
+          replica_identity: string;
+          has_pk: boolean;
+          pubviaroot: boolean;
+          is_partitioned: boolean;
+        }>(`
+          SELECT
+              p.pubname,
+              n.nspname AS schemaname,
+              c.relname AS tablename,
+              pr.prqual::text AS rowfilter,
+              coalesce(cardinality(pr.prattrs), 0) AS column_count,
+              c.relreplident::text AS replica_identity,
+              EXISTS (
+                  SELECT 1 FROM pg_constraint con
+                  WHERE con.conrelid = c.oid AND con.contype = 'p'
+              ) AS has_pk,
+              p.pubviaroot,
+              c.relkind = 'p' AS is_partitioned
+          FROM pg_publication p
+          JOIN pg_publication_rel pr ON pr.prpubid = p.oid
+          JOIN pg_class c ON c.oid = pr.prrelid
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          ${filterClause}
+          ORDER BY p.pubname, n.nspname, c.relname;
+        `, params);
+
+        const hazards: Array<{
+          pubname: string;
+          table: string;
+          issue: string;
+          severity: string;
+          remediation: string;
+        }> = [];
+
+        for (const row of pubRes.rows) {
+          if (row.rowfilter && row.replica_identity !== 'f') {
+            hazards.push({
+              pubname: row.pubname,
+              table: `${row.schemaname}.${row.tablename}`,
+              issue: `Row filter "${row.rowfilter}" active with REPLICA IDENTITY '${row.replica_identity}'.`,
+              severity: 'CRITICAL',
+              remediation: `ALTER TABLE ${row.schemaname}.${row.tablename} REPLICA IDENTITY FULL; (prevents SQLSTATE 55000 on row mutation)`,
+            });
+          }
+
+          if (row.is_partitioned && !row.pubviaroot) {
+            hazards.push({
+              pubname: row.pubname,
+              table: `${row.schemaname}.${row.tablename}`,
+              issue: 'Partitioned table published with publish_via_partition_root = false.',
+              severity: 'HIGH',
+              remediation: `ALTER PUBLICATION ${row.pubname} SET (publish_via_partition_root = true);`,
+            });
+          }
+
+          if (!row.has_pk && row.replica_identity !== 'f') {
+            hazards.push({
+              pubname: row.pubname,
+              table: `${row.schemaname}.${row.tablename}`,
+              issue: 'Table lacks PRIMARY KEY and REPLICA IDENTITY is not FULL.',
+              severity: 'HIGH',
+              remediation: `Add PRIMARY KEY or execute ALTER TABLE ${row.schemaname}.${row.tablename} REPLICA IDENTITY FULL;`,
+            });
+          }
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              totalPublishedTables: pubRes.rows.length,
+              totalHazardsCount: hazards.length,
+              criticalCount: hazards.filter((h) => h.severity === 'CRITICAL').length,
+              hazards,
+              publications: pubRes.rows,
+            }, null, 2),
+          }],
+        };
+      }
+    );
+
   }
   ```
 

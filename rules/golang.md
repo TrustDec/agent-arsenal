@@ -12307,6 +12307,154 @@ func (c *ParallelSwarmCoordinator) AuditPinnedHorizons(ctx context.Context, thre
 }
 ```
 
+---
+
+## 18. PostgreSQL Logical Replication Publications, Row Filter Guards & Replica Identity Sentinels
+
+When managing PostgreSQL logical replication publications, multi-tenant CDC streams, or filtered subscriber topologies in Go (`jackc/pgx/v5`):
+
+- **REPLICA IDENTITY FULL Assertion on Row-Filtered Tables**:
+  - Always assert that tables published with row filters (`WHERE`) have `REPLICA IDENTITY FULL`. Without full replica identity, updates that cause rows to no longer match the filter throw `SQLSTATE 55000` on the publisher, breaking production writers.
+- **Pre-Flight Schema Parity Verification**:
+  - Verify that subscriber databases possess matching target relations and column definitions before adding tables to publisher publications.
+- **Transitive Foreign Key Co-Filtering**:
+  - Verify that foreign key child tables reference only filtered rows from parents to prevent `SQLSTATE 23503` apply worker crashes.
+- **Production Publication Sentinel Implementation**:
+
+```go
+package replication
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type PublicationAnomaly struct {
+	PubName         string `json:"pub_name"`
+	SchemaName      string `json:"schema_name"`
+	TableName       string `json:"table_name"`
+	RowFilter       string `json:"row_filter"`
+	ReplicaIdentity string `json:"replica_identity"`
+	Severity        string `json:"severity"`
+	Remediation     string `json:"remediation"`
+}
+
+type PublicationGovernanceSentinel struct {
+	pubPool *pgxpool.Pool
+	subPool *pgxpool.Pool
+}
+
+func NewPublicationGovernanceSentinel(pubPool, subPool *pgxpool.Pool) *PublicationGovernanceSentinel {
+	return &PublicationGovernanceSentinel{
+		pubPool: pubPool,
+		subPool: subPool,
+	}
+}
+
+// AuditPublicationInvariants checks publisher publications for row filter replica identity hazards and missing PKs.
+func (s *PublicationGovernanceSentinel) AuditPublicationInvariants(ctx context.Context) ([]PublicationAnomaly, error) {
+	query := `
+		SELECT
+			p.pubname,
+			n.nspname,
+			c.relname,
+			coalesce(pr.prqual::text, ''),
+			c.relreplident::text,
+			EXISTS (
+				SELECT 1 FROM pg_constraint con
+				WHERE con.conrelid = c.oid AND con.contype = 'p'
+			) AS has_pk,
+			p.pubviaroot,
+			c.relkind = 'p' AS is_partitioned
+		FROM pg_publication p
+		JOIN pg_publication_rel pr ON pr.prpubid = p.oid
+		JOIN pg_class c ON c.oid = pr.prrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		ORDER BY 1, 2, 3;
+	`
+
+	rows, err := s.pubPool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("audit publication invariants: %w", err)
+	}
+	defer rows.Close()
+
+	var anomalies []PublicationAnomaly
+	for rows.Next() {
+		var (
+			pubName         string
+			schemaName      string
+			tableName       string
+			rowFilter       string
+			replicaIdent    string
+			hasPK           bool
+			pubViaRoot      bool
+			isPartitioned   bool
+		)
+
+		if err := rows.Scan(&pubName, &schemaName, &tableName, &rowFilter, &replicaIdent, &hasPK, &pubViaRoot, &isPartitioned); err != nil {
+			return nil, fmt.Errorf("scan publication row: %w", err)
+		}
+
+		if rowFilter != "" && replicaIdent != "f" {
+			anomalies = append(anomalies, PublicationAnomaly{
+				PubName:         pubName,
+				SchemaName:      schemaName,
+				TableName:       tableName,
+				RowFilter:       rowFilter,
+				ReplicaIdentity: replicaIdent,
+				Severity:        "CRITICAL",
+				Remediation:     fmt.Sprintf("ALTER TABLE %s.%s REPLICA IDENTITY FULL; (prevents SQLSTATE 55000 on row-filter mutation)", schemaName, tableName),
+			})
+		}
+
+		if isPartitioned && !pubViaRoot {
+			anomalies = append(anomalies, PublicationAnomaly{
+				PubName:         pubName,
+				SchemaName:      schemaName,
+				TableName:       tableName,
+				RowFilter:       rowFilter,
+				ReplicaIdentity: replicaIdent,
+				Severity:        "HIGH",
+				Remediation:     fmt.Sprintf("ALTER PUBLICATION %s SET (publish_via_partition_root = true);", pubName),
+			})
+		}
+	}
+
+	return anomalies, rows.Err()
+}
+
+// RemediateReplicaIdentityFull enforces REPLICA IDENTITY FULL with strict lock_timeout.
+func (s *PublicationGovernanceSentinel) RemediateReplicaIdentityFull(ctx context.Context, schema, table string, timeout time.Duration) error {
+	tx, err := s.pubPool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin remediation tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	ms := int(timeout.Milliseconds())
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = '%dms';", ms)); err != nil {
+		return fmt.Errorf("set lock_timeout: %w", err)
+	}
+
+	sql := fmt.Sprintf("ALTER TABLE %s.%s REPLICA IDENTITY FULL;",
+		pgx.Identifier{schema}.Sanitize(),
+		pgx.Identifier{table}.Sanitize(),
+	)
+	slog.Info("Setting REPLICA IDENTITY FULL", "table", fmt.Sprintf("%s.%s", schema, table))
+	if _, err := tx.Exec(ctx, sql); err != nil {
+		return fmt.Errorf("execute alter replica identity: %w", err)
+	}
+
+	return tx.Commit(ctx)
+}
+```
+
 
 
 

@@ -7484,6 +7484,128 @@ onUnmounted(() => {
   </div>
 </template>
 
+---
+
+## 17. Logical Replication Publication & Row Filter Monitor (Vue 3 / Nuxt 3)
+
+When building database administration tools or CDC dashboards with Vue 3 / Nuxt 3:
+
+```vue
+<!-- components/PublicationSentinelCard.vue -->
+<script setup lang="ts">
+import { ref, onMounted } from 'vue';
+
+interface PublicationTable {
+  pubname: string;
+  schemaname: string;
+  tablename: string;
+  rowfilter: string | null;
+  replica_identity: string;
+  has_pk: boolean;
+  pubviaroot: boolean;
+}
+
+interface PublicationStatus {
+  totalPublishedTables: number;
+  totalHazardsCount: number;
+  criticalCount: number;
+  hazards: Array<{
+    pubname: string;
+    table: string;
+    issue: string;
+    severity: string;
+    remediation: string;
+  }>;
+  publications: PublicationTable[];
+}
+
+const status = ref<PublicationStatus | null>(null);
+const isLoading = ref(true);
+const errorMessage = ref<string | null>(null);
+
+async function fetchStatus() {
+  isLoading.value = true;
+  errorMessage.value = null;
+  try {
+    status.value = await $fetch<PublicationStatus>('/api/admin/database/publications');
+  } catch (err: any) {
+    errorMessage.value = err?.data?.message || err.message || 'Failed to load publication status';
+  } finally {
+    isLoading.value = false;
+  }
+}
+
+onMounted(() => {
+  fetchStatus();
+});
+</script>
+
+<template>
+  <div class="rounded-xl border border-zinc-800 bg-zinc-950 p-5 shadow-2xl">
+    <div class="flex items-center justify-between pb-4 border-b border-zinc-850">
+      <div class="flex items-center gap-3">
+        <span
+          class="flex h-3 w-3 rounded-full"
+          :class="status && status.criticalCount === 0 ? 'bg-emerald-500 ring-4 ring-emerald-500/20' : 'bg-rose-500 ring-4 ring-rose-500/20'"
+        />
+        <div>
+          <h3 class="text-sm font-semibold tracking-wide text-zinc-100">Logical Replication Publications</h3>
+          <p class="text-[11px] text-zinc-500">Row filters, replica identity & partition root status</p>
+        </div>
+      </div>
+      <button
+        @click="fetchStatus"
+        :disabled="isLoading"
+        class="inline-flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-xs font-medium text-zinc-300 hover:bg-zinc-800 active:scale-95 disabled:opacity-50 transition-all"
+      >
+        <span v-if="isLoading" class="h-3 w-3 animate-spin rounded-full border-2 border-zinc-400 border-t-transparent" />
+        Refresh
+      </button>
+    </div>
+
+    <!-- Hazard Alert -->
+    <div
+      v-if="status && status.criticalCount > 0"
+      class="mt-4 flex items-start gap-3 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3.5 text-xs text-rose-300"
+    >
+      <svg class="h-4 w-4 shrink-0 mt-0.5 text-rose-400" viewBox="0 0 20 20" fill="currentColor">
+        <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.28 7.22a.75.75 0 00-1.06 1.06L8.94 10l-1.72 1.72a.75.75 0 101.06 1.06L10 11.06l1.72 1.72a.75.75 0 101.06-1.06L11.06 10l1.72-1.72a.75.75 0 00-1.06-1.06L10 8.94 8.28 7.22z" clip-rule="evenodd" />
+      </svg>
+      <div>
+        <p class="font-medium text-rose-200">Critical Row Filter Hazards ({{ status.criticalCount }})</p>
+        <p class="mt-0.5 text-rose-300/80">Tables with row filters lacking REPLICA IDENTITY FULL will crash publisher transactions upon updating filter columns (SQLSTATE 55000).</p>
+      </div>
+    </div>
+
+    <!-- Publications List -->
+    <div class="mt-5">
+      <h4 class="text-xs font-medium text-zinc-400 uppercase tracking-wider">Published Relations ({{ status?.totalPublishedTables ?? 0 }})</h4>
+      <div class="mt-2.5 divide-y divide-zinc-850 overflow-hidden rounded-lg border border-zinc-850">
+        <div
+          v-for="pub in status?.publications || []"
+          :key="`${pub.pubname}.${pub.schemaname}.${pub.tablename}`"
+          class="flex items-center justify-between p-3 text-xs bg-zinc-900/40 hover:bg-zinc-900/70 transition-colors"
+        >
+          <div>
+            <div class="flex items-center gap-2">
+              <span class="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-[10px] text-zinc-300">{{ pub.pubname }}</span>
+              <span class="font-mono text-zinc-200 font-semibold">{{ pub.schemaname }}.{{ pub.tablename }}</span>
+            </div>
+            <p v-if="pub.rowfilter" class="mt-1 font-mono text-[11px] text-amber-400/90">WHERE {{ pub.rowfilter }}</p>
+          </div>
+          <span
+            class="rounded px-1.5 py-0.5 font-mono text-[11px] border"
+            :class="pub.replica_identity === 'f' ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30' : 'bg-amber-500/20 text-amber-300 border-amber-500/30'"
+          >
+            replident: {{ pub.replica_identity }}
+          </span>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+```
+
 ```
 
 

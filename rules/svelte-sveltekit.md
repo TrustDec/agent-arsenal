@@ -8590,6 +8590,142 @@ When coordinating parallel bulk data exports, vector embedding backfills, or tab
 </div>
 ```
 
+---
+
+## 17. Logical Replication Publication & Row Filter Guard Sentinel (Svelte 5 Runes)
+
+When visualizing PostgreSQL logical replication publication health, row filter safety, and schema parity in Svelte 5 runes:
+
+```svelte
+<!-- src/lib/components/PublicationGuardSentinel.svelte -->
+<script lang="ts">
+  interface PublicationTable {
+    pubname: string;
+    schemaname: string;
+    tablename: string;
+    rowfilter: string | null;
+    replica_identity: string;
+    has_pk: boolean;
+    pubviaroot: boolean;
+  }
+
+  interface PublicationHazard {
+    pubname: string;
+    table: string;
+    issue: string;
+    severity: 'CRITICAL' | 'HIGH';
+    remediation: string;
+  }
+
+  interface PublicationStatus {
+    totalPublishedTables: number;
+    totalHazardsCount: number;
+    criticalCount: number;
+    hazards: PublicationHazard[];
+    publications: PublicationTable[];
+  }
+
+  let { initialStatus = null }: { initialStatus?: PublicationStatus | null } = $props();
+
+  let status = $state<PublicationStatus | null>(initialStatus);
+  let isLoading = $state(false);
+  let errorMessage = $state<string | null>(null);
+
+  async function fetchStatus() {
+    isLoading = true;
+    errorMessage = null;
+    try {
+      const res = await fetch('/api/admin/database/publications');
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+      status = await res.json();
+    } catch (err: any) {
+      errorMessage = err.message || 'Failed to fetch publication status';
+    } finally {
+      isLoading = false;
+    }
+  }
+
+  $effect(() => {
+    if (!status) {
+      fetchStatus();
+    }
+  });
+</script>
+
+<div class="rounded-xl border border-zinc-800 bg-zinc-950 p-5 shadow-2xl">
+  <div class="flex items-center justify-between pb-4 border-b border-zinc-800">
+    <div class="flex items-center gap-3">
+      <span
+        class="flex h-3 w-3 rounded-full transition-colors"
+        class:bg-emerald-500={status && status.criticalCount === 0}
+        class:ring-emerald-500/20={status && status.criticalCount === 0}
+        class:bg-rose-500={status && status.criticalCount > 0}
+        class:ring-rose-500/20={status && status.criticalCount > 0}
+        class:ring-4={true}
+      ></span>
+      <div>
+        <h3 class="text-sm font-semibold tracking-wide text-zinc-100">Logical Replication Publications</h3>
+        <p class="text-[11px] text-zinc-500">Row filters, replica identity & partition root harmonization</p>
+      </div>
+    </div>
+    <button
+      onclick={fetchStatus}
+      disabled={isLoading}
+      class="inline-flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-xs font-medium text-zinc-300 hover:bg-zinc-800 active:scale-95 disabled:opacity-50 transition-all"
+    >
+      {#if isLoading}
+        <span class="h-3 w-3 animate-spin rounded-full border-2 border-zinc-400 border-t-transparent"></span>
+      {/if}
+      Refresh
+    </button>
+  </div>
+
+  {#if status && status.criticalCount > 0}
+    <div class="mt-4 flex items-start gap-3 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3.5 text-xs text-rose-300">
+      <svg class="h-4 w-4 shrink-0 mt-0.5 text-rose-400" viewBox="0 0 20 20" fill="currentColor">
+        <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.28 7.22a.75.75 0 00-1.06 1.06L8.94 10l-1.72 1.72a.75.75 0 101.06 1.06L10 11.06l1.72 1.72a.75.75 0 101.06-1.06L11.06 10l1.72-1.72a.75.75 0 00-1.06-1.06L10 8.94 8.28 7.22z" clip-rule="evenodd" />
+      </svg>
+      <div>
+        <p class="font-medium text-rose-200">Critical Row Filter Hazards: {status.criticalCount}</p>
+        <p class="mt-0.5 text-rose-300/80">Tables with row filters lacking REPLICA IDENTITY FULL will abort publisher transactions on update (SQLSTATE 55000).</p>
+      </div>
+    </div>
+  {/if}
+
+  <div class="mt-5">
+    <h4 class="text-xs font-medium text-zinc-400 uppercase tracking-wider">Published Relations ({status?.totalPublishedTables ?? 0})</h4>
+    <div class="mt-2.5 divide-y divide-zinc-850 overflow-hidden rounded-lg border border-zinc-850">
+      {#each (status?.publications ?? []) as pub}
+        <div class="flex items-center justify-between p-3 text-xs bg-zinc-900/40 hover:bg-zinc-900/70 transition-colors">
+          <div>
+            <div class="flex items-center gap-2">
+              <span class="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-[10px] text-zinc-300">{pub.pubname}</span>
+              <span class="font-mono text-zinc-200 font-semibold">{pub.schemaname}.{pub.tablename}</span>
+            </div>
+            {#if pub.rowfilter}
+              <p class="mt-1 font-mono text-[11px] text-amber-400/90">WHERE {pub.rowfilter}</p>
+            {/if}
+          </div>
+          <div class="flex items-center gap-2 font-mono text-[11px]">
+            <span
+              class="rounded px-1.5 py-0.5 border"
+              class:bg-emerald-500/20={pub.replica_identity === 'f'}
+              class:text-emerald-300={pub.replica_identity === 'f'}
+              class:border-emerald-500/30={pub.replica_identity === 'f'}
+              class:bg-amber-500/20={pub.replica_identity !== 'f'}
+              class:text-amber-300={pub.replica_identity !== 'f'}
+              class:border-amber-500/30={pub.replica_identity !== 'f'}
+            >
+              replident: {pub.replica_identity}
+            </span>
+          </div>
+        </div>
+      {/each}
+    </div>
+  </div>
+</div>
+```
+
 
 
 
