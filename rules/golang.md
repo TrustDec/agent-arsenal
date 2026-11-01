@@ -12543,6 +12543,126 @@ func (e *ExtensionPreFlight) SafeInstallExtension(ctx context.Context, extName s
 }
 ```
 
+---
+
+## 20. PostgreSQL GUC Parameter Scopes, Safe SET LOCAL Scoping & Configuration Drift Sentinel
+
+When configuring PostgreSQL parameters or executing query-specific timeouts/schemas in Go (`jackc/pgx/v5`):
+
+- **Strict Transactional Scoping (`SET LOCAL`)**:
+  - Never execute raw `SET` commands (`SET statement_timeout`, `SET search_path`, `SET work_mem`) on pooled connections (`*pgxpool.Pool`). In pooled environments, bare `SET` mutates the physical server session, leaking dirty parameters into subsequent unrelated queries. Always wrap in `Begin()` and use `SET LOCAL`.
+- **Pre-Flight Context Introspection**:
+  - Introspect `pg_settings.context` prior to configuration modifications. Parameters with `postmaster` context require a cluster restart and cannot be dynamically reloaded via `pg_reload_conf()`.
+- **`pg_file_settings` Syntax Auditing**:
+  - Whenever modifying configuration files or issuing reload calls, query `pg_file_settings` for `error IS NOT NULL` to prevent silent syntax failures.
+
+```go
+package guc
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"strings"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type GucParameterSentinel struct {
+	pool   *pgxpool.Pool
+	logger *slog.Logger
+}
+
+func NewGucParameterSentinel(pool *pgxpool.Pool, logger *slog.Logger) *GucParameterSentinel {
+	return &GucParameterSentinel{pool: pool, logger: logger}
+}
+
+// ExecuteWithScopedSettings runs user logic in an isolated transaction using SET LOCAL.
+// Upon COMMIT or ROLLBACK, all GUC overrides revert automatically, guaranteeing zero pool contamination.
+func (s *GucParameterSentinel) ExecuteWithScopedSettings(
+	ctx context.Context,
+	settings map[string]string,
+	fn func(tx pgx.Tx) error,
+) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	for key, val := range settings {
+		// Guard against SQL injection in GUC keys
+		if strings.ContainsAny(key, " ;\t\n\r'\"") {
+			return fmt.Errorf("invalid GUC key: %q", key)
+		}
+		escapedVal := strings.ReplaceAll(val, "'", "''")
+		stmt := fmt.Sprintf("SET LOCAL %s = '%s';", key, escapedVal)
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("failed setting local GUC %q: %w", key, err)
+		}
+	}
+
+	if err := fn(tx); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+
+// AuditClusterDrift audits pg_file_settings errors and pg_settings pending restarts.
+func (s *GucParameterSentinel) AuditClusterDrift(ctx context.Context) error {
+	// 1. Audit syntax errors in configuration files
+	rows, err := s.pool.Query(ctx, `
+		SELECT sourcefile, sourceline, name, setting, COALESCE(error, '')
+		FROM pg_file_settings
+		WHERE error IS NOT NULL OR applied = false;
+	`)
+	if err != nil {
+		return fmt.Errorf("query pg_file_settings: %w", err)
+	}
+	defer rows.Close()
+
+	var fileErrors []string
+	for rows.Next() {
+		var srcFile, name, setting, errMsg string
+		var line int
+		if err := rows.Scan(&srcFile, &line, &name, &setting, &errMsg); err != nil {
+			return err
+		}
+		fileErrors = append(fileErrors, fmt.Sprintf("%s:%d [%s=%s] Error: %s", srcFile, line, name, setting, errMsg))
+	}
+
+	if len(fileErrors) > 0 {
+		return fmt.Errorf("unapplied or corrupt configuration lines in pg_file_settings: %s", strings.Join(fileErrors, "; "))
+	}
+
+	// 2. Audit parameters pending restart
+	restartRows, err := s.pool.Query(ctx, `
+		SELECT name, setting, context
+		FROM pg_settings
+		WHERE pending_restart = true;
+	`)
+	if err != nil {
+		return fmt.Errorf("query pending_restart: %w", err)
+	}
+	defer restartRows.Close()
+
+	for restartRows.Next() {
+		var name, setting, contextStr string
+		if err := restartRows.Scan(&name, &setting, &contextStr); err != nil {
+			return err
+		}
+		s.logger.Warn("PostgreSQL parameter pending restart",
+			"name", name,
+			"context", contextStr,
+			"current_setting", setting)
+	}
+
+	return nil
+}
+```
+
 
 
 

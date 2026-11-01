@@ -7734,6 +7734,148 @@ const missingPreloadCount = computed(() =>
 </template>
 ```
 
+---
+
+## 19. PostgreSQL GUC Parameter Scopes & Configuration Drift Sentinel (Vue 3.5 / Nuxt 3)
+
+When building database infrastructure management dashboards in Vue 3.5 / Nuxt 3, monitor GUC contexts, pending restarts, and configuration file errors using reactive primitives and `useTemplateRef`:
+
+```vue
+<script setup lang="ts">
+import { ref, computed, useTemplateRef } from 'vue';
+
+interface GucParamItem {
+  name: string;
+  setting: string;
+  context: 'internal' | 'postmaster' | 'sighup' | 'superuser-backend' | 'backend' | 'superuser' | 'user';
+  source: string;
+  pendingRestart: boolean;
+}
+
+interface FileErrorItem {
+  sourcefile: string;
+  sourceline: number;
+  name: string;
+  setting: string;
+  error: string;
+}
+
+const props = defineProps<{
+  parameters: GucParamItem[];
+  fileErrors: FileErrorItem[];
+}>();
+
+const emit = defineEmits<{
+  (e: 'reloadConf'): void;
+  (e: 'inspect', paramName: string): void;
+}>();
+
+const searchInputRef = useTemplateRef<HTMLInputElement>('searchInput');
+const searchFilter = ref('');
+
+const pendingRestarts = computed(() =>
+  props.parameters.filter((p) => p.pendingRestart)
+);
+
+const filteredParameters = computed(() => {
+  const query = searchFilter.value.toLowerCase().trim();
+  if (!query) return props.parameters;
+  return props.parameters.filter(
+    (p) =>
+      p.name.toLowerCase().includes(query) ||
+      p.context.toLowerCase().includes(query) ||
+      p.source.toLowerCase().includes(query)
+  );
+});
+</script>
+
+<template>
+  <div class="space-y-4 rounded-xl border border-zinc-800 bg-zinc-950 p-6 font-mono text-sm">
+    <div class="flex items-center justify-between border-b border-zinc-800 pb-4">
+      <div>
+        <h3 class="text-base font-semibold text-zinc-100">PostgreSQL GUC Hierarchy & Drift Sentinel</h3>
+        <p class="text-xs text-zinc-400">Audits parameter context scopes, pending restarts, and syntax errors</p>
+      </div>
+      <button
+        @click="emit('reloadConf')"
+        class="rounded bg-emerald-950 px-3 py-1.5 text-xs font-medium text-emerald-400 border border-emerald-800 hover:bg-emerald-900 transition"
+      >
+        SELECT pg_reload_conf()
+      </button>
+    </div>
+
+    <!-- Alert Banner: File Errors -->
+    <div v-if="fileErrors.length > 0" class="rounded-lg border border-rose-900 bg-rose-950/40 p-3 space-y-1">
+      <div class="flex items-center gap-2 text-rose-400 text-xs font-semibold">
+        <span>⚠ Syntax Errors in Configuration Files (pg_file_settings)</span>
+      </div>
+      <div v-for="err in fileErrors" :key="`${err.sourcefile}:${err.sourceline}`" class="text-xs text-rose-300">
+        {{ err.sourcefile }}:{{ err.sourceline }} [{{ err.name }}] - {{ err.error }}
+      </div>
+    </div>
+
+    <!-- Alert Banner: Pending Restarts -->
+    <div v-if="pendingRestarts.length > 0" class="rounded-lg border border-amber-900 bg-amber-950/40 p-3 space-y-1">
+      <div class="flex items-center gap-2 text-amber-400 text-xs font-semibold">
+        <span>⏳ Parameters Pending Postmaster Restart ({{ pendingRestarts.length }})</span>
+      </div>
+      <div class="flex flex-wrap gap-2 pt-1">
+        <span
+          v-for="p in pendingRestarts"
+          :key="p.name"
+          class="rounded bg-amber-950 px-2 py-0.5 text-[11px] text-amber-300 border border-amber-800/60"
+        >
+          {{ p.name }} ({{ p.context }})
+        </span>
+      </div>
+    </div>
+
+    <!-- Search input with useTemplateRef -->
+    <div>
+      <input
+        ref="searchInput"
+        v-model="searchFilter"
+        type="text"
+        placeholder="Search parameter by name or context..."
+        class="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs text-zinc-200 placeholder-zinc-500 focus:border-zinc-600 focus:outline-none"
+      />
+    </div>
+
+    <!-- Parameter Listing -->
+    <div class="divide-y divide-zinc-900 rounded-lg border border-zinc-900">
+      <div
+        v-for="p in filteredParameters"
+        :key="p.name"
+        class="flex items-center justify-between p-3 hover:bg-zinc-900/40 transition"
+      >
+        <div class="space-y-0.5">
+          <div class="flex items-center gap-2">
+            <span class="font-bold text-zinc-200">{{ p.name }}</span>
+            <span class="rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] text-zinc-400 border border-zinc-700">
+              {{ p.context }}
+            </span>
+            <span
+              v-if="p.source === 'auto.conf'"
+              class="rounded bg-purple-950/60 px-1.5 py-0.5 text-[10px] text-purple-400 border border-purple-800/40"
+            >
+              ALTER SYSTEM
+            </span>
+          </div>
+          <p class="text-xs text-zinc-400">Current Setting: <span class="text-zinc-200">{{ p.setting }}</span></p>
+        </div>
+
+        <button
+          @click="emit('inspect', p.name)"
+          class="rounded bg-zinc-800 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-700 transition"
+        >
+          Inspect
+        </button>
+      </div>
+    </div>
+  </div>
+</template>
+```
+
 
 
 

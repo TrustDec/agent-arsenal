@@ -8838,6 +8838,143 @@ When building database administration dashboards in Svelte 5, monitor extension 
 </div>
 ```
 
+---
+
+## 19. PostgreSQL GUC Parameter Scopes & Configuration Drift Sentinel (Svelte 5 Runes)
+
+When building database administration dashboards in Svelte 5, monitor GUC parameter hierarchy, pending restarts, and configuration file syntax errors using runes (`$props`, `$state`, `$derived`):
+
+```svelte
+<script lang="ts">
+  interface GucParamItem {
+    name: string;
+    setting: string;
+    context: 'internal' | 'postmaster' | 'sighup' | 'superuser-backend' | 'backend' | 'superuser' | 'user';
+    source: string;
+    pendingRestart: boolean;
+  }
+
+  interface FileErrorItem {
+    sourcefile: string;
+    sourceline: number;
+    name: string;
+    setting: string;
+    error: string;
+  }
+
+  interface Props {
+    parameters: GucParamItem[];
+    fileErrors?: FileErrorItem[];
+    onReloadConf?: () => void;
+    onInspect?: (paramName: string) => void;
+  }
+
+  const { parameters = [], fileErrors = [], onReloadConf, onInspect }: Props = $props();
+
+  let filterText = $state('');
+
+  const pendingRestarts = $derived(
+    parameters.filter((p) => p.pendingRestart)
+  );
+
+  const filteredParameters = $derived(
+    parameters.filter((p) =>
+      p.name.toLowerCase().includes(filterText.toLowerCase()) ||
+      p.context.toLowerCase().includes(filterText.toLowerCase()) ||
+      p.source.toLowerCase().includes(filterText.toLowerCase())
+    )
+  );
+</script>
+
+<div class="space-y-4 rounded-xl border border-zinc-800 bg-zinc-950 p-6 font-mono text-sm">
+  <div class="flex items-center justify-between border-b border-zinc-800 pb-4">
+    <div>
+      <h3 class="text-base font-semibold text-zinc-100">PostgreSQL GUC Hierarchy & Drift Sentinel</h3>
+      <p class="text-xs text-zinc-400">Audits parameter context scopes, pending restarts, and syntax errors</p>
+    </div>
+    {#if onReloadConf}
+      <button
+        onclick={onReloadConf}
+        class="rounded bg-emerald-950 px-3 py-1.5 text-xs font-medium text-emerald-400 border border-emerald-800 hover:bg-emerald-900 transition"
+      >
+        SELECT pg_reload_conf()
+      </button>
+    {/if}
+  </div>
+
+  <!-- Alert Banner: File Errors -->
+  {#if fileErrors.length > 0}
+    <div class="rounded-lg border border-rose-900 bg-rose-950/40 p-3 space-y-1">
+      <div class="flex items-center gap-2 text-rose-400 text-xs font-semibold">
+        <span>⚠ Syntax Errors in Configuration Files (pg_file_settings)</span>
+      </div>
+      {#each fileErrors as err (err.sourcefile + ':' + err.sourceline)}
+        <div class="text-xs text-rose-300">
+          {err.sourcefile}:{err.sourceline} [{err.name}] - {err.error}
+        </div>
+      {/each}
+    </div>
+  {/if}
+
+  <!-- Alert Banner: Pending Restarts -->
+  {#if pendingRestarts.length > 0}
+    <div class="rounded-lg border border-amber-900 bg-amber-950/40 p-3 space-y-1">
+      <div class="flex items-center gap-2 text-amber-400 text-xs font-semibold">
+        <span>⏳ Parameters Pending Postmaster Restart ({pendingRestarts.length})</span>
+      </div>
+      <div class="flex flex-wrap gap-2 pt-1">
+        {#each pendingRestarts as p (p.name)}
+          <span class="rounded bg-amber-950 px-2 py-0.5 text-[11px] text-amber-300 border border-amber-800/60">
+            {p.name} ({p.context})
+          </span>
+        {/each}
+      </div>
+    </div>
+  {/if}
+
+  <!-- Search Filter -->
+  <div>
+    <input
+      type="text"
+      bind:value={filterText}
+      placeholder="Search parameter by name or context..."
+      class="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs text-zinc-200 placeholder-zinc-500 focus:border-zinc-600 focus:outline-none"
+    />
+  </div>
+
+  <!-- Parameter Listing -->
+  <div class="divide-y divide-zinc-900 rounded-lg border border-zinc-900">
+    {#each filteredParameters as p (p.name)}
+      <div class="flex items-center justify-between p-3 hover:bg-zinc-900/40 transition">
+        <div class="space-y-0.5">
+          <div class="flex items-center gap-2">
+            <span class="font-bold text-zinc-200">{p.name}</span>
+            <span class="rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] text-zinc-400 border border-zinc-700">
+              {p.context}
+            </span>
+            {#if p.source === 'auto.conf'}
+              <span class="rounded bg-purple-950/60 px-1.5 py-0.5 text-[10px] text-purple-400 border border-purple-800/40">
+                ALTER SYSTEM
+              </span>
+            {/if}
+          </div>
+          <p class="text-xs text-zinc-400">Current Setting: <span class="text-zinc-200">{p.setting}</span></p>
+        </div>
+
+        {#if onInspect}
+          <button
+            onclick={() => onInspect(p.name)}
+            class="rounded bg-zinc-800 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-700 transition"
+          >
+            Inspect
+          </button>
+        {/if}
+      </div>
+    {/each}
+  </div>
+</div>
+```
+
 
 
 

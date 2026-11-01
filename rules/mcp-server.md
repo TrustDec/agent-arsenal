@@ -8957,6 +8957,98 @@ ALTER TABLE ${args.tableName} ADD COLUMN ${args.columnName}_byte_size BIGINT NOT
       }
     );
 
+    // MCP Tool: Audit PostgreSQL GUC Parameter Hierarchy, Pending Restarts & File Errors
+    server.tool(
+      'audit_pg_guc_configuration',
+      'Audits PostgreSQL GUC configuration for pending restarts, pg_file_settings syntax errors, out-of-band postgresql.auto.conf overrides, and insecure search_path functions.',
+      {},
+      async () => {
+        const client = await pool.connect();
+        try {
+          const [fileErrorsRes, pendingRestartRes, autoConfRes, secDefinerRes] = await Promise.all([
+            client.query(`
+              SELECT sourcefile, sourceline, name, setting, error
+              FROM pg_file_settings
+              WHERE error IS NOT NULL OR applied = false;
+            `),
+            client.query(`
+              SELECT name, setting, unit, context, source, pending_restart
+              FROM pg_settings
+              WHERE pending_restart = true;
+            `),
+            client.query(`
+              SELECT name, setting, sourcefile
+              FROM pg_settings
+              WHERE source = 'auto.conf';
+            `),
+            client.query(`
+              SELECT n.nspname AS schema_name, p.proname AS func_name
+              FROM pg_proc p
+              JOIN pg_namespace n ON p.pronamespace = n.oid
+              WHERE p.prosecdef = true
+                AND (p.proconfig IS NULL OR NOT (p.proconfig::text LIKE '%search_path=%'))
+                AND n.nspname NOT IN ('pg_catalog', 'information_schema');
+            `),
+          ]);
+
+          const issues: Array<{ severity: string; category: string; description: string; remediation: string }> = [];
+
+          for (const err of fileErrorsRes.rows) {
+            issues.push({
+              severity: 'CRITICAL',
+              category: 'Syntax / File Error',
+              description: `${err.sourcefile}:${err.sourceline} [${err.name}=${err.setting}] error: ${err.error || 'unapplied directive'}`,
+              remediation: 'Correct syntax in configuration file and rerun pg_reload_conf().',
+            });
+          }
+
+          for (const r of pendingRestartRes.rows) {
+            issues.push({
+              severity: 'HIGH',
+              category: 'Pending Restart',
+              description: `Parameter '${r.name}' (${r.context} context) has been modified but requires a cluster restart to take effect.`,
+              remediation: 'Schedule a maintenance window to restart PostgreSQL postmaster.',
+            });
+          }
+
+          for (const ac of autoConfRes.rows) {
+            issues.push({
+              severity: 'MEDIUM',
+              category: 'GitOps Drift',
+              description: `Parameter '${ac.name}' is overridden by postgresql.auto.conf (via ALTER SYSTEM), bypassing IaC manifests.`,
+              remediation: `Reconcile '${ac.name}' into version-controlled postgresql.conf and execute ALTER SYSTEM RESET "${ac.name}".`,
+            });
+          }
+
+          for (const fn of secDefinerRes.rows) {
+            issues.push({
+              severity: 'HIGH',
+              category: 'CVE-2018-1058 search_path Risk',
+              description: `SECURITY DEFINER function ${fn.schema_name}.${fn.func_name}() does not declare an immutable search_path.`,
+              remediation: `ALTER FUNCTION ${fn.schema_name}.${fn.func_name}() SET search_path = pg_catalog, pg_temp;`,
+            });
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                status: issues.length === 0 ? 'HEALTHY' : 'DRIFT_DETECTED',
+                totalIssues: issues.length,
+                pendingRestartCount: pendingRestartRes.rows.length,
+                fileErrorCount: fileErrorsRes.rows.length,
+                autoConfOverrideCount: autoConfRes.rows.length,
+                unpinnedSecurityDefinerCount: secDefinerRes.rows.length,
+                issues,
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
+
   }
   ```
 
