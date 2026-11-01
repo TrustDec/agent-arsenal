@@ -7392,6 +7392,79 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
       }
     );
   }
+
+  public registerAuditSecurityBarrierViewTool(): void {
+    this.server.tool(
+      'audit_security_barrier_views_and_pushdown',
+      'Audits PostgreSQL view DDL and outer queries for security_barrier declarations, leaky function side-channel risks (CVE-2012-3489), view inlining optimization fences (GROUP BY, DISTINCT), and non-leakproof predicate pushdown blockades.',
+      {
+        sqlStatement: z.string().describe('The SQL string (CREATE VIEW DDL or outer query) to analyze'),
+        isViewDDL: z.boolean().describe('True if analyzing a CREATE VIEW statement, false if analyzing an outer query querying a view'),
+      },
+      async (args) => {
+        const violations: string[] = [];
+        const recommendations: string[] = [];
+
+        if (args.isViewDDL) {
+          const isView = /\bCREATE\s+(?:OR\s+REPLACE\s+)?VIEW\b/i.test(args.sqlStatement);
+          const hasSecurityBarrier = /\bWITH\s*\(\s*security_barrier\s*=\s*true\s*\)/i.test(args.sqlStatement);
+          const hasTenancyFilter = /\b(?:tenant_id|org_id|account_id|user_id|role)\b/i.test(args.sqlStatement) &&
+                                   /\bWHERE\b/i.test(args.sqlStatement);
+
+          if (isView && hasTenancyFilter && !hasSecurityBarrier) {
+            violations.push(
+              'MISSING_SECURITY_BARRIER: View contains row-level tenancy/security filters but lacks WITH (security_barrier = true). Optimizer view inlining exposes private rows to leaky function side-channels (CVE-2012-3489).'
+            );
+            recommendations.push(
+              'Add WITH (security_barrier = true) to the CREATE VIEW definition to ensure security quals evaluate strictly before user predicates.'
+            );
+          }
+
+          const hasGroupBy = /\bGROUP\s+BY\b/i.test(args.sqlStatement);
+          const hasDistinct = /\bDISTINCT\b/i.test(args.sqlStatement);
+          const hasLimit = /\bLIMIT\b/i.test(args.sqlStatement);
+          const hasWindow = /\bOVER\s*\(/i.test(args.sqlStatement);
+
+          if (isView && (hasGroupBy || hasDistinct || hasLimit || hasWindow)) {
+            violations.push(
+              'VIEW_INLINING_OPTIMIZATION_FENCE: Security view contains GROUP BY, DISTINCT, LIMIT, or window functions. This blocks subquery pull-up and prevents outer predicates from pushing down to base tables.'
+            );
+            recommendations.push(
+              'Decompose the view: keep row security in a pure 1-to-1 projection view, and move analytical aggregations to outer queries.'
+            );
+          }
+        } else {
+          // Query analysis
+          const hasRegex = /~|\bSIMILAR\s+TO\b/i.test(args.sqlStatement);
+          const hasCustomFunction = /\bWHERE\b[\s\S]*?\b[a-zA-Z0-9_]+\s*\([^)]*\)/i.test(args.sqlStatement);
+
+          if (hasRegex || hasCustomFunction) {
+            violations.push(
+              'NON_LEAKPROOF_PREDICATE_BLOCKADE: Query against security barrier view contains non-leakproof functions or regex operators, preventing predicate pushdown into the base table index scan.'
+            );
+            recommendations.push(
+              'Use built-in leakproof comparison operators (=, <, >, IN) aligned with composite B-Tree indexes on the base relation.'
+            );
+          }
+        }
+
+        const isCompliant = violations.length === 0;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              isCompliant,
+              isViewDDL: args.isViewDDL,
+              violations,
+              recommendations,
+              status: isCompliant ? 'certified_security_barrier_compliant' : 'security_barrier_violations_detected',
+            }, null, 2),
+          }],
+        };
+      }
+    );
+  }
   ```
 
 

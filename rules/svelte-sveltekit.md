@@ -6930,10 +6930,48 @@ In SvelteKit administrative consoles and system diagnostics:
   };
   ```
 
+- **SvelteKit Server Loaders & Security Barrier View Invariants (+page.server.ts)**:
+  - ❌ **Anti-Pattern: Unprotected Views & Leaky Functions in SvelteKit Loaders**:
+    - Querying multi-tenant views lacking `WITH (security_barrier = true)` with user-supplied search parameters, allowing malicious users to probe unauthorized rows via exception side-channels.
+    - Using non-leakproof functions in loader queries that block predicate pushdown and force full-table scans.
+  - ✅ **Production Invariant**:
+    - Enforce transaction-scoped session configuration (`SET LOCAL`) in database clients within `+page.server.ts`.
+    - Query through certified Security Barrier Views using leakproof equality predicates that push down to underlying composite indexes.
+  ```typescript
+  // src/routes/invoices/+page.server.ts
+  import type { PageServerLoad } from './$types';
+  import { db } from '$lib/server/db';
+  import { error } from '@sveltejs/kit';
+  import { sql } from 'kysely';
 
+  export const load: PageServerLoad = async ({ url, locals }) => {
+    const tenantId = locals.tenantId;
+    if (!tenantId) {
+      throw error(401, 'Unauthorized');
+    }
 
+    const invoiceNo = url.searchParams.get('no');
+    if (!invoiceNo) {
+      return { invoice: null };
+    }
 
+    // INVARIANT: Scoped transaction with SET LOCAL + Security Barrier View.
+    // Built-in '=' operator pushes down into the base index scan (Index Cond: invoice_no = $1).
+    const invoice = await db.transaction().execute(async (tx) => {
+      await sql`SET LOCAL app.current_tenant_id = ${tenantId}`.execute(tx);
 
+      return await tx
+        .selectFrom('v_secure_invoices')
+        .select(['id', 'tenant_id', 'invoice_no', 'amount_cents', 'status', 'created_at'])
+        .where('invoice_no', '=', invoiceNo)
+        .executeTakeFirst();
+    });
+
+    return {
+      invoice: invoice || null,
+    };
+  };
+  ```
 
 
 

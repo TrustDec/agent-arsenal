@@ -6225,6 +6225,47 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   });
   ```
 
+- **Nuxt Nitro Server Handlers & Security Barrier View Invariants (server/api)**:
+  - ❌ **Anti-Pattern: Unprotected Views & Leaky Functions in Nitro Event Handlers**:
+    - Writing Nitro API endpoints that query user-filtered views lacking `WITH (security_barrier = true)`, exposing multi-tenant databases to side-channel timing and error exfiltration attacks.
+    - Applying regex or custom UDFs in server route filters, triggering PostgreSQL's security barrier pushdown blockade.
+  - ✅ **Production Invariant**:
+    - Wrap tenant operations in `SET LOCAL` transactions, querying views marked `WITH (security_barrier = true)` using leakproof operators.
+  ```typescript
+  // server/api/invoices/[no].get.ts
+  import { db } from '~/server/utils/db';
+  import { sql } from 'kysely';
+
+  export default defineEventHandler(async (event) => {
+    const tenantId = event.context.auth?.tenantId;
+    const invoiceNo = getRouterParam(event, 'no');
+
+    if (!tenantId) {
+      throw createError({ statusCode: 401, message: 'Unauthorized' });
+    }
+    if (!invoiceNo) {
+      throw createError({ statusCode: 400, message: 'Missing invoice number' });
+    }
+
+    // INVARIANT: Scoped transaction with SET LOCAL + Security Barrier View.
+    // Built-in '=' operator is leakproof and pushes down into the base index scan.
+    const invoice = await db.transaction().execute(async (tx) => {
+      await sql`SET LOCAL app.current_tenant_id = ${tenantId}`.execute(tx);
+
+      return await tx
+        .selectFrom('v_secure_invoices')
+        .select(['id', 'tenant_id', 'invoice_no', 'amount_cents', 'status', 'created_at'])
+        .where('invoice_no', '=', invoiceNo)
+        .executeTakeFirst();
+    });
+
+    if (!invoice) {
+      throw createError({ statusCode: 404, message: 'Invoice not found' });
+    }
+
+    return invoice;
+  });
+  ```
 
 
 

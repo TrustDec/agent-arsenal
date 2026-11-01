@@ -4010,6 +4010,19 @@ alwaysApply: false
     - Enforce **Transaction-Scoped Advisory Locks**: replace all session-level `pg_advisory_lock()` with `pg_advisory_xact_lock()`, ensuring locks are automatically released at `COMMIT` or `ROLLBACK` and never leaked across pooled connections.
     - Enforce **Lock Table Saturation Sentinels**: monitor active lock utilization against total allocated slots $(\text{max\_connections} + \text{max\_prepared\_transactions}) \times \text{max\_locks\_per\_transaction}$, alerting if shared lock table usage exceeds 60%.
 
+- **Security Barrier Views, Predicate Pushdown & Leaky Function Side-Channels (PostgreSQL)**:
+  - ❌ **Anti-Pattern: Unprotected View Inlining, Leaky Functions & Pushdown Blockades**:
+    - Creating multi-tenant or row-filtering views without `WITH (security_barrier = true)` (e.g. `CREATE VIEW v_orders AS SELECT * FROM orders WHERE tenant_id = current_setting(...)`), allowing the query optimizer to reorder `WHERE` clauses and evaluate untrusted user functions or division-by-zero probes on unauthorized rows before security qualifications run (CVE-2012-3489).
+    - Relying on non-`LEAKPROOF` functions or complex regex filters in outer queries against security barrier views, which triggers the optimizer's pushdown blockade—preventing index condition pushdown into the base table scan and collapsing query plans into full sequential scans.
+    - Nesting `GROUP BY`, `DISTINCT`, `LIMIT`, or window functions inside security barrier views, creating unbreakable view inlining optimization fences that prevent tenant filters from penetrating to base tables.
+    - Stacking `security_barrier` views on top of tables already enforcing Row-Level Security (RLS), multiplying barrier evaluation overhead and blocking join flattening.
+  - ✅ **Production Invariant**:
+    - Enforce **Mandatory WITH (security_barrier = true)**: require all views designed to enforce row isolation or tenant boundaries to explicitly declare `WITH (security_barrier = true)`.
+    - Enforce **Leakproof Comparison Operators**: ensure outer filters on security barrier views use built-in leakproof comparison operators (`=`, `<`, `>`, `IN`) and align with composite B-Tree indexes `(tenant_id, search_col)` on the base table to guarantee index scans.
+    - Enforce **Pure 1-to-1 Projection Views**: separate security views (filtering and projection) from analytical aggregations (`GROUP BY`, `DISTINCT`), allowing outer queries to push filters directly into base scans.
+    - Enforce **Native Row-Level Security (RLS) First**: implement row isolation policies directly on base relations using PostgreSQL RLS (`ENABLE ROW LEVEL SECURITY`), reserving security views for column masking and presentation transforms.
+    - Enforce **Superuser Leakproof Auditing**: mandate superuser audit certification for any custom function tagged `LEAKPROOF`, ensuring zero side-channel error emissions or external I/O leaks.
+
 
 
 

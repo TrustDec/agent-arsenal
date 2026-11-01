@@ -9730,14 +9730,57 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **Security Barrier Views & Predicate Pushdown Invariants (`jackc/pgx/v5`)**:
+  - ❌ **Anti-Pattern: Unprotected Multi-Tenant Views & Leaky Function Side-Channels**:
+    - Querying multi-tenant views lacking `WITH (security_barrier = true)` with user-supplied search parameters, allowing PostgreSQL's optimizer to evaluate user filters on other tenants' data before security qualifications run (risking CVE-2012-3489 side-channel error leaks).
+    - Passing non-leakproof functions or dynamic casting in outer queries against security barrier views, which blocks predicate pushdown and turns an index seek into an expensive full-table `Subquery Scan`.
+  - ✅ **Production Invariant**:
+    - Enforce **Scoped SET LOCAL Context**: always set tenant/user session variables using `SET LOCAL` within a transaction boundary (`tx.Exec(ctx, "SET LOCAL app.current_tenant_id = $1", tenantID)`), preventing cross-connection bleed in PgBouncer.
+    - Enforce **Leakproof Operator Alignment**: ensure Go queries against security barrier views use built-in leakproof comparison operators (`=`, `<`, `>`, `IN`) matching base composite indexes `(tenant_id, search_field)`.
+  ```go
+  // INVARIANT: Execute secure query against Security Barrier View with transaction-scoped tenant isolation.
+  // The built-in '=' operator is provably LEAKPROOF, allowing the optimizer to push the filter down
+  // into the underlying base table index scan (Index Cond) rather than falling back to a full Seq Scan.
+  func (r *InvoiceRepository) FetchSecureInvoice(
+    ctx context.Context,
+    tenantID string,
+    invoiceNo string,
+  ) (*CustomerInvoice, error) {
+    tx, err := r.Pool.Begin(ctx)
+    if err != nil {
+      return nil, fmt.Errorf("begin transaction: %w", err)
+    }
+    defer tx.Rollback(context.WithoutCancel(ctx))
 
+    // 1. Transaction-scoped tenant setting (cleared on COMMIT/ROLLBACK)
+    if _, err := tx.Exec(ctx, "SET LOCAL app.current_tenant_id = $1", tenantID); err != nil {
+      return nil, fmt.Errorf("set tenant context: %w", err)
+    }
 
+    // 2. Query against Security Barrier View (WITH security_barrier = true)
+    const query = `
+      SELECT id, tenant_id, invoice_no, amount_cents, status, created_at
+      FROM v_secure_invoices
+      WHERE invoice_no = $1;
+    `
 
+    var inv CustomerInvoice
+    err = tx.QueryRow(ctx, query, invoiceNo).Scan(
+      &inv.ID,
+      &inv.TenantID,
+      &inv.InvoiceNo,
+      &inv.AmountCents,
+      &inv.Status,
+      &inv.CreatedAt,
+    )
+    if err != nil {
+      if err == pgx.ErrNoRows {
+        return nil, nil
+      }
+      return nil, fmt.Errorf("fetch secure invoice: %w", err)
+    }
 
-
-
-
-
-
-
+    return &inv, tx.Commit(ctx)
+  }
+  ```
 
