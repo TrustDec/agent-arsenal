@@ -8432,6 +8432,165 @@ When implementing database observability or schema migration admin interfaces wi
 </div>
 ```
 
+---
+
+## 16. Parallel Data Swarm & Autovacuum Horizon Pinning Sentinel (Svelte 5 Runes)
+
+When coordinating parallel bulk data exports, vector embedding backfills, or table migrations from SvelteKit:
+
+- **Cluster-Wide Horizon Visibility**:
+  - Pinned `backend_xmin` transactions prevent autovacuum from cleaning dead tuples across all tables. Provide clear real-time operator alerts when a snapshot export exceeds safety thresholds ($> 900\text{s}$).
+- **Svelte 5 State Hygiene**:
+  - Use `$state` for active snapshot sessions, `$derived` for calculating starvation risk counts and dead-tuple accumulation rates, and `$effect` for polling with proper cleanup.
+
+```svelte
+<!-- src/lib/components/SnapshotSwarmSentinel.svelte -->
+<script lang="ts">
+  interface PinnedHorizonSession {
+    pid: number;
+    user_name: string;
+    client_ip: string | null;
+    application_name: string;
+    backend_xmin: string;
+    duration_seconds: number;
+    state: string;
+    risk_tier: 'HEALTHY' | 'WARNING_ELEVATED_HORIZON' | 'DANGER_AUTOVACUUM_STARVATION';
+  }
+
+  interface SnapshotAuditData {
+    thresholdSeconds: number;
+    pinnedHorizonSessionsCount: number;
+    starvationAlertsCount: number;
+    pinnedHorizonSessions: PinnedHorizonSession[];
+  }
+
+  let { pollIntervalMs = 5000 }: { pollIntervalMs?: number } = $props();
+
+  let audit = $state<SnapshotAuditData | null>(null);
+  let isLoading = $state(false);
+  let errorMessage = $state<string | null>(null);
+
+  const dangerSessions = $derived(
+    audit?.pinnedHorizonSessions.filter((s) => s.risk_tier === 'DANGER_AUTOVACUUM_STARVATION') ?? []
+  );
+
+  async function fetchSnapshotHorizons() {
+    isLoading = true;
+    errorMessage = null;
+    try {
+      const res = await fetch('/api/admin/database/snapshots');
+      if (!res.ok) throw new Error(`Snapshot audit error: ${res.statusText}`);
+      audit = await res.json();
+    } catch (err: any) {
+      errorMessage = err.message ?? 'Unknown error';
+    } finally {
+      isLoading = false;
+    }
+  }
+
+  async function terminateRogueSnapshot(pid: number) {
+    if (!confirm(`Forcibly terminate backend PID ${pid} to relieve autovacuum starvation?`)) return;
+    try {
+      const res = await fetch(`/api/admin/database/snapshots/${pid}/terminate`, { method: 'POST' });
+      if (!res.ok) throw new Error('Failed to terminate backend');
+      await fetchSnapshotHorizons();
+    } catch (err: any) {
+      alert(`Error terminating backend: ${err.message}`);
+    }
+  }
+
+  $effect(() => {
+    fetchSnapshotHorizons();
+    const timer = setInterval(fetchSnapshotHorizons, pollIntervalMs);
+    return () => clearInterval(timer);
+  });
+</script>
+
+<div class="rounded-xl border border-zinc-800 bg-zinc-950 p-6 text-zinc-100 shadow-2xl">
+  <div class="flex items-center justify-between border-b border-zinc-800/80 pb-4">
+    <div class="flex items-center gap-3">
+      <div class="flex h-9 w-9 items-center justify-center rounded-lg bg-indigo-500/10 border border-indigo-500/20 text-indigo-400">
+        <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+        </svg>
+      </div>
+      <div>
+        <h3 class="text-sm font-semibold text-zinc-100">Transaction Snapshot & Horizon Sentinel</h3>
+        <p class="text-xs text-zinc-400">Autovacuum oldestxmin freeze and parallel swarm monitor</p>
+      </div>
+    </div>
+    <button
+      onclick={fetchSnapshotHorizons}
+      disabled={isLoading}
+      class="rounded-lg border border-zinc-700 bg-zinc-800/60 px-3 py-1.5 text-xs font-medium text-zinc-200 hover:bg-zinc-700 disabled:opacity-50 transition-colors"
+    >
+      {isLoading ? 'Polling...' : 'Refresh'}
+    </button>
+  </div>
+
+  {#if errorMessage}
+    <div class="mt-4 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-300">
+      {errorMessage}
+    </div>
+  {/if}
+
+  {#if dangerSessions.length > 0}
+    <div class="mt-4 rounded-lg border border-rose-500/40 bg-rose-500/10 p-3.5 text-xs text-rose-200">
+      <div class="flex items-center gap-2 font-semibold text-rose-300">
+        <svg class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+          <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.28 7.22a.75.75 0 00-1.06 1.06L8.94 10l-1.72 1.72a.75.75 0 101.06 1.06L10 11.06l1.72 1.72a.75.75 0 101.06-1.06L11.06 10l1.72-1.72a.75.75 0 00-1.06-1.06L10 8.94 8.28 7.22z" clip-rule="evenodd" />
+        </svg>
+        <span>Critical: {dangerSessions.length} Session(s) Pinning Autovacuum Horizon (&gt; 15 min)</span>
+      </div>
+      <p class="mt-1 text-rose-300/80">Cluster dead-tuple cleanup is blocked. Rapid heap and index bloat accumulating.</p>
+    </div>
+  {/if}
+
+  <div class="mt-5">
+    <h4 class="text-xs font-medium uppercase tracking-wider text-zinc-400">Active Snapshot Sessions</h4>
+    <div class="mt-2.5 divide-y divide-zinc-800/80 overflow-hidden rounded-lg border border-zinc-800/80">
+      {#if !audit || audit.pinnedHorizonSessions.length === 0}
+        <div class="p-3 text-center text-xs text-zinc-500">Zero pinned snapshot sessions. Cluster autovacuum healthy.</div>
+      {:else}
+        {#each audit.pinnedHorizonSessions as session (session.pid)}
+          <div class="flex items-center justify-between p-3 text-xs bg-zinc-900/40 hover:bg-zinc-900/70 transition-colors">
+            <div class="flex items-center gap-3">
+              <span
+                class="rounded px-2 py-0.5 font-mono text-[10px] font-semibold"
+                class:bg-rose-500/20={session.risk_tier === 'DANGER_AUTOVACUUM_STARVATION'}
+                class:text-rose-300={session.risk_tier === 'DANGER_AUTOVACUUM_STARVATION'}
+                class:border-rose-500/30={session.risk_tier === 'DANGER_AUTOVACUUM_STARVATION'}
+                class:bg-amber-500/20={session.risk_tier === 'WARNING_ELEVATED_HORIZON'}
+                class:text-amber-300={session.risk_tier === 'WARNING_ELEVATED_HORIZON'}
+                class:border-amber-500/30={session.risk_tier === 'WARNING_ELEVATED_HORIZON'}
+                class:bg-emerald-500/20={session.risk_tier === 'HEALTHY'}
+                class:text-emerald-300={session.risk_tier === 'HEALTHY'}
+                class:border-emerald-500/30={session.risk_tier === 'HEALTHY'}
+              >
+                PID {session.pid}
+              </span>
+              <div>
+                <p class="font-mono text-zinc-200 font-medium">xmin: {session.backend_xmin} ({session.application_name})</p>
+                <p class="text-[11px] text-zinc-500 font-mono">User: {session.user_name} | IP: {session.client_ip ?? 'local'} | {session.duration_seconds}s active</p>
+              </div>
+            </div>
+            {#if session.risk_tier === 'DANGER_AUTOVACUUM_STARVATION'}
+              <button
+                onclick={() => terminateRogueSnapshot(session.pid)}
+                class="rounded bg-rose-500/20 px-2.5 py-1 text-[11px] font-medium text-rose-300 border border-rose-500/30 hover:bg-rose-500/30 transition-colors"
+              >
+                Terminate
+              </button>
+            {/if}
+          </div>
+        {/each}
+      {/if}
+    </div>
+  </div>
+</div>
+```
+
+
 
 
 

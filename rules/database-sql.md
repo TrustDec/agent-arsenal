@@ -4151,6 +4151,15 @@ alwaysApply: false
       - Enforce **100% Index Coverage on Foreign Keys**: deploy an event trigger `ON ddl_command_end WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE')` verifying that every new foreign key constraint has a matching B-Tree index on referencing child columns.
       - Enforce **Append-Only DDL Audit Streaming**: stream all DDL commands to `public.ddl_audit_log` via `pg_event_trigger_ddl_commands()` recording LSN, timestamp, session user, client IP, command tag, and object identity.
       - Enforce **Hardened Trigger Isolation**: event trigger functions must always declare `SECURITY DEFINER SET search_path = pg_catalog, pg_temp;`, check `IF pg_is_in_recovery() THEN RETURN; END IF;`, and skip `IF cmd.in_extension THEN CONTINUE; END IF;`.
+  - **Transaction Snapshot Export, Parallel Worker Swarms & Autovacuum Starvation Invariants**:
+    - ❌ **Anti-Pattern**: Running parallel reader workers, batch table exporters, or vector embedding backfills using independent connection snapshots without coordination. Concurrent DML operations move rows between chunk boundaries, producing silent duplicate reads or missing records, and fracturing cross-table referential consistency. Holding coordinator transactions or exported snapshots open for hours during slow external network calls (e.g. LLM API inference), pinning PostgreSQL's cluster-wide `oldestxmin` / `backend_xmin` horizon, completely blocking autovacuum from reclaiming dead tuples, and inducing runaway table bloat and connection pool collapse. Invoking connection pooler warmup probes or preamble queries (`SELECT 1`) prior to `SET TRANSACTION SNAPSHOT`, aborting transactions with SQLSTATE `25P03` (`ERROR: SET TRANSACTION SNAPSHOT must be called before any query`).
+    - ✅ **Production Invariant**:
+      - Enforce **Dedicated Coordinator Lifecycle**: export the snapshot in an explicit `BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY; SELECT pg_export_snapshot();` transaction, keeping the coordinator connection active until all worker imports succeed.
+      - Enforce **Zero-Preamble Worker Attachment**: workers must execute `BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '<id>';` with zero intervening queries or driver warmup probes.
+      - Enforce **Strict Snapshot Horizon TTL Circuit Breaker**: enforce a maximum snapshot lifetime ($T_{\text{max}} \le 900\text{s}$ / 15 minutes) via a background watchdog sentinel querying `pg_stat_activity.backend_xmin`, terminating runaway coordinator transactions before autovacuum dead-tuple bloat threatens cluster stability.
+      - Enforce **Sargable Indexed Chunk Splitting**: partition table reads across workers strictly using immutable indexed monotonic columns (`WHERE id >= $1 AND id < $2`), never non-sargable offsets.
+      - Enforce **Replication Slot Snapshot Synchronization**: align initial CDC bulk loads with `CREATE_REPLICATION_SLOT ... EXPORT_SNAPSHOT`, ensuring zero missed and zero duplicated mutations.
+
 
 
 

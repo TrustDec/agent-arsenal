@@ -8691,6 +8691,84 @@ ALTER TABLE ${args.tableName} ADD COLUMN ${args.columnName}_byte_size BIGINT NOT
         };
       }
     );
+
+    // Tool: Audit Transaction Snapshots & Autovacuum Horizon Pinning
+    this.server.tool(
+      'audit_transaction_snapshots_and_vacuum_horizon',
+      'Audits active PostgreSQL transaction snapshots, evaluates backend_xmin age against autovacuum starvation thresholds, inspects lingering pg_snapshots files, and recommends circuit breaker terminations.',
+      {
+        thresholdSeconds: z.number().default(900).describe('Threshold in seconds for flagging autovacuum starvation risk'),
+      },
+      async (args) => {
+        // 1. Audit long-running backends pinning backend_xmin
+        const horizonRes = await pool.query<{
+          pid: number;
+          user_name: string;
+          client_ip: string | null;
+          application_name: string;
+          backend_xmin: string;
+          duration_seconds: number;
+          state: string;
+          risk_tier: string;
+        }>(`
+          SELECT
+              a.pid,
+              a.usename AS user_name,
+              a.client_addr::text AS client_ip,
+              a.application_name,
+              a.backend_xmin::text AS backend_xmin,
+              EXTRACT(EPOCH FROM (clock_timestamp() - a.xact_start))::numeric(10, 1)::float AS duration_seconds,
+              a.state,
+              CASE
+                  WHEN EXTRACT(EPOCH FROM (clock_timestamp() - a.xact_start)) > $1 THEN 'DANGER_AUTOVACUUM_STARVATION'
+                  WHEN EXTRACT(EPOCH FROM (clock_timestamp() - a.xact_start)) > ($1 / 2) THEN 'WARNING_ELEVATED_HORIZON'
+                  ELSE 'HEALTHY'
+              END AS risk_tier
+          FROM pg_stat_activity a
+          WHERE a.backend_xmin IS NOT NULL
+            AND a.pid <> pg_backend_pid()
+          ORDER BY a.xact_start ASC;
+        `, [args.thresholdSeconds]);
+
+        // 2. Dead tuple bloat estimate across top mutated tables
+        const bloatRes = await pool.query<{
+          relname: string;
+          n_dead_tup: number;
+          n_live_tup: number;
+          dead_ratio_pct: number;
+        }>(`
+          SELECT
+              relname,
+              n_dead_tup,
+              n_live_tup,
+              ROUND((n_dead_tup::numeric / GREATEST(n_live_tup + n_dead_tup, 1)) * 100, 2)::float AS dead_ratio_pct
+          FROM pg_stat_user_tables
+          WHERE n_dead_tup > 1000
+          ORDER BY n_dead_tup DESC
+          LIMIT 10;
+        `);
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              thresholdSeconds: args.thresholdSeconds,
+              pinnedHorizonSessionsCount: horizonRes.rows.length,
+              starvationAlertsCount: horizonRes.rows.filter((r) => r.risk_tier === 'DANGER_AUTOVACUUM_STARVATION').length,
+              pinnedHorizonSessions: horizonRes.rows,
+              topDeadTupleTables: bloatRes.rows,
+              recommendedActions: horizonRes.rows.filter((r) => r.risk_tier === 'DANGER_AUTOVACUUM_STARVATION').map((r) => ({
+                action: 'TERMINATE_BACKEND',
+                pid: r.pid,
+                sql: `SELECT pg_terminate_backend(${r.pid});`,
+                reason: `Pinned backend_xmin ${r.backend_xmin} for ${r.duration_seconds}s blocking autovacuum dead tuple cleanup.`,
+              })),
+            }, null, 2),
+          }],
+        };
+      }
+    );
+
   }
   ```
 

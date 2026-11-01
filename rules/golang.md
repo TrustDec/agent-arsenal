@@ -12045,6 +12045,269 @@ func (s *EventTriggerMigrationSentinel) FetchRecentDDLAudits(ctx context.Context
 }
 ```
 
+---
+
+## 17. PostgreSQL Transaction Snapshot Export, Parallel Worker Swarms & Horizon Sentinels
+
+When executing parallel data ingestion, distributed analytical dumps, or vector embedding backfills in Go (`jackc/pgx/v5`):
+
+- **Dedicated Coordinator Connection Lifecycle**:
+  - Never return the coordinator connection to the pool while worker goroutines are executing. The snapshot file in `$PGDATA/pg_snapshots/` is unlinked immediately when the exporting transaction terminates.
+- **Zero-Preamble Worker Attachment**:
+  - Worker goroutines must begin a `pgx.RepeatableRead` transaction and execute `SET TRANSACTION SNAPSHOT '<id>'` before issuing any other query. Preamble queries or connection ping probes will establish an internal transaction snapshot and trigger SQLSTATE `25P03`.
+- **Oldestxmin Horizon Watchdog (Autovacuum Starvation Defense)**:
+  - Bounded snapshot lifespan ($T_{\text{max}} \le 900\text{s}$) prevents long-running transactions from pinning cluster-wide `oldestxmin`, which halts dead-tuple cleanup and triggers rapid heap bloat.
+- **Production Snapshot Swarm Implementation**:
+
+```go
+package snapshot
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// PinnedHorizonRecord captures long-running transactions pinning oldestxmin.
+type PinnedHorizonRecord struct {
+	PID             int32         `json:"pid"`
+	UserName        string        `json:"user_name"`
+	ClientAddr      string        `json:"client_addr"`
+	ApplicationName string        `json:"application_name"`
+	BackendXmin     string        `json:"backend_xmin"`
+	Duration        time.Duration `json:"duration"`
+	State           string        `json:"state"`
+}
+
+// SwarmTask represents a discrete key-range slice for parallel extraction.
+type SwarmTask struct {
+	MinID int64 `json:"min_id"`
+	MaxID int64 `json:"max_id"`
+}
+
+// ParallelSwarmCoordinator coordinates point-in-time parallel reads across N goroutines.
+type ParallelSwarmCoordinator struct {
+	pool           *pgxpool.Pool
+	maxLifetime    time.Duration
+	workerCount    int
+	chunkSize      int64
+}
+
+// NewParallelSwarmCoordinator constructs a coordinator with strict lifetime bounds.
+func NewParallelSwarmCoordinator(pool *pgxpool.Pool, workerCount int, chunkSize int64, maxLifetime time.Duration) *ParallelSwarmCoordinator {
+	if maxLifetime <= 0 {
+		maxLifetime = 15 * time.Minute
+	}
+	return &ParallelSwarmCoordinator{
+		pool:        pool,
+		workerCount: workerCount,
+		chunkSize:   chunkSize,
+		maxLifetime: maxLifetime,
+	}
+}
+
+// ExportAndStream executes consistent parallel chunk reads without snapshot drift or data duplication.
+func (c *ParallelSwarmCoordinator) ExportAndStream(
+	ctx context.Context,
+	tableName string,
+	idColumn string,
+	chunkHandler func(ctx context.Context, rows []map[string]any, workerID int) error,
+) (int64, error) {
+	// 1. Establish coordinator context bounded by max snapshot lifetime
+	coordCtx, cancelCoord := context.WithTimeout(ctx, c.maxLifetime)
+	defer cancelCoord()
+
+	// 2. Acquire dedicated unshared connection for coordinator
+	coordConn, err := c.pool.Acquire(coordCtx)
+	if err != nil {
+		return 0, fmt.Errorf("acquire coordinator conn: %w", err)
+	}
+	defer coordConn.Release()
+
+	// 3. Begin Repeatable Read Read-Only transaction on coordinator
+	coordTx, err := coordConn.BeginTx(coordCtx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("begin coordinator tx: %w", err)
+	}
+	defer coordTx.Rollback(coordCtx)
+
+	// 4. Export PostgreSQL snapshot identifier
+	var snapshotID string
+	if err := coordTx.QueryRow(coordCtx, "SELECT pg_export_snapshot()").Scan(&snapshotID); err != nil {
+		return 0, fmt.Errorf("export snapshot: %w", err)
+	}
+	slog.Info("PostgreSQL snapshot exported successfully", "snapshot_id", snapshotID)
+
+	// 5. Query table ID range inside coordinator's snapshot
+	var minID, maxID int64
+	rangeSQL := fmt.Sprintf("SELECT COALESCE(MIN(%s), 0), COALESCE(MAX(%s), 0) FROM %s", idColumn, idColumn, tableName)
+	if err := coordTx.QueryRow(coordCtx, rangeSQL).Scan(&minID, &maxID); err != nil {
+		return 0, fmt.Errorf("fetch table range: %w", err)
+	}
+
+	if minID == 0 && maxID == 0 {
+		_ = coordTx.Commit(coordCtx)
+		return 0, nil
+	}
+
+	// 6. Enqueue chunk tasks
+	taskChan := make(chan SwarmTask, (maxID-minID)/c.chunkSize+1)
+	for cur := minID; cur <= maxID; cur += c.chunkSize {
+		taskChan <- SwarmTask{MinID: cur, MaxID: cur + c.chunkSize}
+	}
+	close(taskChan)
+
+	// 7. Dispatch worker swarm
+	var wg sync.WaitGroup
+	var totalRecords atomic.Int64
+	workerErrChan := make(chan error, c.workerCount)
+
+	for w := 0; w < c.workerCount; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+
+			wConn, err := c.pool.Acquire(coordCtx)
+			if err != nil {
+				workerErrChan <- fmt.Errorf("worker %d conn acquire: %w", workerID, err)
+				return
+			}
+			defer wConn.Release()
+
+			// ZERO-PREAMBLE INVARIANT:
+			// Begin Repeatable Read Tx and immediately SET TRANSACTION SNAPSHOT
+			wTx, err := wConn.BeginTx(coordCtx, pgx.TxOptions{
+				IsoLevel:   pgx.RepeatableRead,
+				AccessMode: pgx.ReadOnly,
+			})
+			if err != nil {
+				workerErrChan <- fmt.Errorf("worker %d tx begin: %w", workerID, err)
+				return
+			}
+			defer wTx.Rollback(coordCtx)
+
+			setSnapSQL := fmt.Sprintf("SET TRANSACTION SNAPSHOT '%s'", snapshotID)
+			if _, err := wTx.Exec(coordCtx, setSnapSQL); err != nil {
+				workerErrChan <- fmt.Errorf("worker %d set snapshot %s: %w", workerID, snapshotID, err)
+				return
+			}
+
+			// Process assigned tasks
+			for task := range taskChan {
+				select {
+				case <-coordCtx.Done():
+					workerErrChan <- fmt.Errorf("worker %d aborted by timeout: %w", workerID, coordCtx.Err())
+					return
+				default:
+				}
+
+				selectSQL := fmt.Sprintf(
+					"SELECT * FROM %s WHERE %s >= $1 AND %s < $2 ORDER BY %s ASC",
+					tableName, idColumn, idColumn, idColumn,
+				)
+				rows, err := wTx.Query(coordCtx, selectSQL, task.MinID, task.MaxID)
+				if err != nil {
+					workerErrChan <- fmt.Errorf("worker %d query range [%d, %d): %w", workerID, task.MinID, task.MaxID, err)
+					return
+				}
+
+				var chunkRows []map[string]any
+				for rows.Next() {
+					vals, err := rows.Values()
+					if err != nil {
+						rows.Close()
+						workerErrChan <- err
+						return
+					}
+					fds := rows.FieldDescriptions()
+					row := make(map[string]any, len(vals))
+					for i, fd := range fds {
+						row[fd.Name] = vals[i]
+					}
+					chunkRows = append(chunkRows, row)
+				}
+				rows.Close()
+
+				if len(chunkRows) > 0 {
+					if err := chunkHandler(coordCtx, chunkRows, workerID); err != nil {
+						workerErrChan <- fmt.Errorf("worker %d handler failed: %w", workerID, err)
+						return
+					}
+					totalRecords.Add(int64(len(chunkRows)))
+				}
+			}
+
+			if err := wTx.Commit(coordCtx); err != nil {
+				workerErrChan <- fmt.Errorf("worker %d commit: %w", workerID, err)
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	close(workerErrChan)
+
+	if len(workerErrChan) > 0 {
+		return totalRecords.Load(), <-workerErrChan
+	}
+
+	// 8. Safely commit coordinator transaction to release snapshot and unpin horizon
+	if err := coordTx.Commit(coordCtx); err != nil {
+		return totalRecords.Load(), fmt.Errorf("commit coordinator tx: %w", err)
+	}
+
+	return totalRecords.Load(), nil
+}
+
+// AuditPinnedHorizons scans for transactions holding backend_xmin beyond safety thresholds.
+func (c *ParallelSwarmCoordinator) AuditPinnedHorizons(ctx context.Context, threshold time.Duration) ([]PinnedHorizonRecord, error) {
+	query := `
+		SELECT
+			pid,
+			usename,
+			client_addr::text,
+			application_name,
+			backend_xmin::text,
+			now() - xact_start AS duration,
+			state
+		FROM pg_stat_activity
+		WHERE backend_xmin IS NOT NULL
+		  AND pid <> pg_backend_pid()
+		  AND now() - xact_start > $1
+		ORDER BY xact_start ASC;
+	`
+	rows, err := c.pool.Query(ctx, query, threshold)
+	if err != nil {
+		return nil, fmt.Errorf("query pinned horizons: %w", err)
+	}
+	defer rows.Close()
+
+	var records []PinnedHorizonRecord
+	for rows.Next() {
+		var r PinnedHorizonRecord
+		var clientAddr *string
+		if err := rows.Scan(&r.PID, &r.UserName, &clientAddr, &r.ApplicationName, &r.BackendXmin, &r.Duration, &r.State); err != nil {
+			return nil, fmt.Errorf("scan horizon record: %w", err)
+		}
+		if clientAddr != nil {
+			r.ClientAddr = *clientAddr
+		}
+		records = append(records, r)
+	}
+
+	return records, rows.Err()
+}
+```
+
+
 
 
 

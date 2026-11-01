@@ -7326,6 +7326,166 @@ onMounted(() => {
 </template>
 ```
 
+---
+
+## 16. Parallel Data Swarm & Autovacuum Horizon Pinning Sentinel (Vue 3.5 / Nuxt 3)
+
+When building database administration dashboards or ETL pipeline monitoring in Vue 3.5+ and Nuxt 3:
+
+- **Shallow State for High-Frequency Telemetry**:
+  - Pinned snapshot sessions can change rapidly during high-throughput parallel ingestion. Wrap session lists in `shallowRef` to eliminate unnecessary deep reactivity overhead.
+- **Computed Risk Aggregation**:
+  - Compute danger alert levels and starvation durations using standard Vue 3.5 `computed()`, and ensure timers are cleared via `onUnmounted()`.
+
+```vue
+<!-- components/admin/SnapshotHorizonSentinel.vue -->
+<script setup lang="ts">
+import { ref, shallowRef, computed, onMounted, onUnmounted } from 'vue';
+
+interface PinnedSession {
+  pid: number;
+  user_name: string;
+  client_ip: string | null;
+  application_name: string;
+  backend_xmin: string;
+  duration_seconds: number;
+  state: string;
+  risk_tier: 'HEALTHY' | 'WARNING_ELEVATED_HORIZON' | 'DANGER_AUTOVACUUM_STARVATION';
+}
+
+interface SnapshotAuditPayload {
+  thresholdSeconds: number;
+  pinnedHorizonSessionsCount: number;
+  starvationAlertsCount: number;
+  pinnedHorizonSessions: PinnedSession[];
+}
+
+const props = withDefaults(defineProps<{ pollIntervalMs?: number }>(), {
+  pollIntervalMs: 5000,
+});
+
+const auditData = shallowRef<SnapshotAuditPayload | null>(null);
+const isLoading = ref(false);
+const errorMessage = ref<string | null>(null);
+let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+const dangerSessions = computed(() => {
+  return auditData.value?.pinnedHorizonSessions.filter((s) => s.risk_tier === 'DANGER_AUTOVACUUM_STARVATION') ?? [];
+});
+
+async function refreshHorizonStatus() {
+  isLoading.value = true;
+  errorMessage.value = null;
+  try {
+    const data = await $fetch<SnapshotAuditPayload>('/api/admin/database/snapshots');
+    auditData.value = data;
+  } catch (err: any) {
+    errorMessage.value = err.message || 'Failed to fetch snapshot status';
+  } finally {
+    isLoading.value = false;
+  }
+}
+
+async function terminateSession(pid: number) {
+  if (!confirm(`Are you sure you want to terminate backend PID ${pid}? This will unpin the autovacuum horizon.`)) return;
+  try {
+    await $fetch(`/api/admin/database/snapshots/${pid}/terminate`, { method: 'POST' });
+    await refreshHorizonStatus();
+  } catch (err: any) {
+    alert(`Termination error: ${err.message}`);
+  }
+}
+
+onMounted(() => {
+  refreshHorizonStatus();
+  pollTimer = setInterval(refreshHorizonStatus, props.pollIntervalMs);
+});
+
+onUnmounted(() => {
+  if (pollTimer) clearInterval(pollTimer);
+});
+</script>
+
+<template>
+  <div class="rounded-xl border border-zinc-800 bg-zinc-950 p-6 text-zinc-100 shadow-2xl">
+    <div class="flex items-center justify-between border-b border-zinc-800/80 pb-4">
+      <div class="flex items-center gap-3">
+        <div class="flex h-9 w-9 items-center justify-center rounded-lg bg-indigo-500/10 border border-indigo-500/20 text-indigo-400">
+          <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+          </svg>
+        </div>
+        <div>
+          <h3 class="text-sm font-semibold text-zinc-100">Transaction Snapshot & Horizon Sentinel</h3>
+          <p class="text-xs text-zinc-400">Monitors oldestxmin freeze duration & autovacuum starvation</p>
+        </div>
+      </div>
+      <button
+        @click="refreshHorizonStatus"
+        :disabled="isLoading"
+        class="rounded-lg border border-zinc-700 bg-zinc-800/60 px-3 py-1.5 text-xs font-medium text-zinc-200 hover:bg-zinc-700 disabled:opacity-50 transition-colors"
+      >
+        {{ isLoading ? 'Refreshing...' : 'Refresh' }}
+      </button>
+    </div>
+
+    <div v-if="errorMessage" class="mt-4 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-300">
+      {{ errorMessage }}
+    </div>
+
+    <div v-if="dangerSessions.length > 0" class="mt-4 rounded-lg border border-rose-500/40 bg-rose-500/10 p-3.5 text-xs text-rose-200">
+      <div class="flex items-center gap-2 font-semibold text-rose-300">
+        <svg class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+          <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.28 7.22a.75.75 0 00-1.06 1.06L8.94 10l-1.72 1.72a.75.75 0 101.06 1.06L10 11.06l1.72 1.72a.75.75 0 101.06-1.06L11.06 10l1.72-1.72a.75.75 0 00-1.06-1.06L10 8.94 8.28 7.22z" clip-rule="evenodd" />
+        </svg>
+        <span>Critical: {{ dangerSessions.length }} Backend(s) Pinning Autovacuum Horizon (&gt; 15 min)</span>
+      </div>
+      <p class="mt-1 text-rose-300/80">Dead tuples cannot be cleaned by autovacuum across any cluster table. Bloat accumulating.</p>
+    </div>
+
+    <div class="mt-5">
+      <h4 class="text-xs font-medium uppercase tracking-wider text-zinc-400">Active Snapshot Sessions</h4>
+      <div class="mt-2.5 divide-y divide-zinc-800/80 overflow-hidden rounded-lg border border-zinc-800/80">
+        <div v-if="!auditData || auditData.pinnedHorizonSessions.length === 0" class="p-3 text-center text-xs text-zinc-500">
+          Zero pinned snapshot backends. Cluster autovacuum running freely.
+        </div>
+        <div
+          v-else
+          v-for="session in auditData.pinnedHorizonSessions"
+          :key="session.pid"
+          class="flex items-center justify-between p-3 text-xs bg-zinc-900/40 hover:bg-zinc-900/70 transition-colors"
+        >
+          <div class="flex items-center gap-3">
+            <span
+              class="rounded px-2 py-0.5 font-mono text-[10px] font-semibold"
+              :class="{
+                'bg-rose-500/20 text-rose-300 border border-rose-500/30': session.risk_tier === 'DANGER_AUTOVACUUM_STARVATION',
+                'bg-amber-500/20 text-amber-300 border border-amber-500/30': session.risk_tier === 'WARNING_ELEVATED_HORIZON',
+                'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30': session.risk_tier === 'HEALTHY',
+              }"
+            >
+              PID {{ session.pid }}
+            </span>
+            <div>
+              <p class="font-mono text-zinc-200 font-medium">xmin: {{ session.backend_xmin }} ({{ session.application_name }})</p>
+              <p class="text-[11px] text-zinc-500 font-mono">User: {{ session.user_name }} | IP: {{ session.client_ip || 'local' }} | {{ session.duration_seconds }}s active</p>
+            </div>
+          </div>
+          <button
+            v-if="session.risk_tier === 'DANGER_AUTOVACUUM_STARVATION'"
+            @click="terminateSession(session.pid)"
+            class="rounded bg-rose-500/20 px-2.5 py-1 text-[11px] font-medium text-rose-300 border border-rose-500/30 hover:bg-rose-500/30 transition-colors"
+          >
+            Terminate
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+```
+
 
 
 
