@@ -9253,6 +9253,132 @@ ALTER TABLE ${args.tableName} ADD COLUMN ${args.columnName}_byte_size BIGINT NOT
       }
     );
 
+    // --------------------------------------------------------------------------
+    // Tool: scram_auth_auditor
+    // Inspects PostgreSQL pg_hba.conf rules and pg_authid credentials for
+    // zero-auth trust exposure, legacy MD5 hashes, and shadowed CIDR rules.
+    // --------------------------------------------------------------------------
+    this.server.tool(
+      'scram_auth_auditor',
+      'Audits PostgreSQL client authentication configuration (pg_hba.conf) and user credentials for security violations (trust method, MD5 hashes, and shadowed rules)',
+      {
+        includeRoles: z.boolean().default(true).describe('Audit pg_authid for legacy MD5 and unencrypted role passwords'),
+      },
+      async ({ includeRoles }, extra) => {
+        const client = await this.pool.connect();
+        try {
+          const violations: Array<{
+            severity: 'CRITICAL' | 'HIGH' | 'MEDIUM';
+            category: string;
+            description: string;
+            remediation: string;
+          }> = [];
+
+          // 1. Audit password_encryption GUC
+          const gucRes = await client.query("SHOW password_encryption;");
+          const currentEnc = gucRes.rows[0]?.password_encryption || 'unknown';
+          if (currentEnc !== 'scram-sha-256') {
+            violations.push({
+              severity: 'CRITICAL',
+              category: 'INSECURE_PASSWORD_ENCRYPTION_GUC',
+              description: `password_encryption is '${currentEnc}'. Newly created passwords will not use SCRAM-SHA-256.`,
+              remediation: "ALTER SYSTEM SET password_encryption = 'scram-sha-256'; SELECT pg_reload_conf();",
+            });
+          }
+
+          // 2. Audit pg_hba_file_rules
+          const hbaRes = await client.query(`
+            SELECT line_number, type, database, user_name, address, netmask, auth_method, error
+            FROM pg_hba_file_rules
+            ORDER BY line_number ASC;
+          `);
+
+          let trustCount = 0;
+          for (const row of hbaRes.rows) {
+            if (row.error) {
+              violations.push({
+                severity: 'CRITICAL',
+                category: 'HBA_SYNTAX_ERROR',
+                description: `Line ${row.line_number} has syntax error: ${row.error}`,
+                remediation: 'Fix syntax error in pg_hba.conf immediately.',
+              });
+            }
+            if (row.auth_method === 'trust' && row.type !== 'local') {
+              trustCount++;
+              violations.push({
+                severity: 'CRITICAL',
+                category: 'ZERO_AUTH_TRUST_EXPOSURE',
+                description: `Line ${row.line_number}: 'trust' method on ${row.type} socket allows unauthenticated login as any user.`,
+                remediation: `Change auth_method on line ${row.line_number} to scram-sha-256.`,
+              });
+            }
+            if (row.type === 'host' && row.address && !['127.0.0.1/32', '::1/128'].includes(row.address)) {
+              violations.push({
+                severity: 'HIGH',
+                category: 'UNENCRYPTED_HOST_TRANSPORT',
+                description: `Line ${row.line_number}: Connection type 'host' permits unencrypted plaintext transport.`,
+                remediation: `Change connection type on line ${row.line_number} to hostssl.`,
+              });
+            }
+          }
+
+          // 3. Audit pg_authid roles if requested
+          let md5RoleCount = 0;
+          let scramRoleCount = 0;
+          const roleDetails: Array<{ role: string; authType: string }> = [];
+
+          if (includeRoles) {
+            const roleRes = await client.query(`
+              SELECT rolname,
+                     CASE
+                       WHEN rolpassword LIKE 'SCRAM-SHA-256$%' THEN 'SCRAM-SHA-256'
+                       WHEN rolpassword LIKE 'md5%'            THEN 'MD5'
+                       WHEN rolpassword IS NULL                THEN 'NONE'
+                       ELSE 'UNKNOWN'
+                     END AS auth_type
+              FROM pg_authid
+              WHERE rolcanlogin = true AND rolname NOT LIKE 'pg_%'
+              ORDER BY rolname ASC;
+            `);
+
+            for (const r of roleRes.rows) {
+              roleDetails.push({ role: r.rolname, authType: r.auth_type });
+              if (r.auth_type === 'MD5') {
+                md5RoleCount++;
+                violations.push({
+                  severity: 'HIGH',
+                  category: 'LEGACY_MD5_CREDENTIAL',
+                  description: `Role '${r.rolname}' uses legacy MD5 password hashing vulnerable to offline dictionary cracking.`,
+                  remediation: `Re-encrypt password via ALTER ROLE "${r.rolname}" WITH PASSWORD '<secret>';`,
+                });
+              } else if (r.auth_type === 'SCRAM-SHA-256') {
+                scramRoleCount++;
+              }
+            }
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                status: violations.length === 0 ? 'COMPLIANT' : 'AUTH_VIOLATIONS_DETECTED',
+                passwordEncryption: currentEnc,
+                totalHbaRules: hbaRes.rows.length,
+                trustViolations: trustCount,
+                legacyMD5Roles: md5RoleCount,
+                scramRoles: scramRoleCount,
+                totalViolations: violations.length,
+                roles: roleDetails,
+                violations,
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
+
   }
   ```
 

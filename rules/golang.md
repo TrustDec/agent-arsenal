@@ -13018,6 +13018,199 @@ func NewSecurePostgresConnector(
 }
 ```
 
+---
+
+## 24. PostgreSQL Client Authentication (pg_hba.conf), SCRAM-SHA-256-PLUS Channel Binding & Credential Invariants
+
+When configuring client authentication and connections in Go microservices using `jackc/pgx/v5`:
+
+- **Mandatory SCRAM-SHA-256-PLUS Channel Binding**:
+  - Always enforce `poolConfig.ConnConfig.ChannelBinding = "require"`. This activates RFC 5929 `tls-server-end-point` cryptographic binding, preventing active Man-in-the-Middle (MITM) proxies from terminating TLS and relaying SASL proofs.
+- **Zero Legacy MD5 Passwords**:
+  - Never allow application accounts to retain `md5...` verifiers in `pg_authid`. Enforce password rotation under `password_encryption = 'scram-sha-256'` before updating `pg_hba.conf`.
+- **First-Match `pg_hba.conf` Audit**:
+  - Validate that specific CIDR blocks precede broad subnet masks to prevent rule shadowing.
+
+```go
+package scramguard
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type SCRAMConfig struct {
+	Host             string
+	Port             uint16
+	Database         string
+	User             string
+	Password         string
+	CABundlePath     string
+	RequireChannel   bool
+	MaxConns         int32
+	MinConns         int32
+}
+
+// SCRAMAuditResult holds in-database credential audit status.
+type SCRAMAuditResult struct {
+	TotalLoginRoles int
+	SCRAMRoles      int
+	LegacyMD5Roles  int
+	Violations      []string
+}
+
+// HardenedSCRAMConnector manages authenticated pgx pools with channel binding.
+type HardenedSCRAMConnector struct {
+	pool *pgxpool.Pool
+}
+
+// NewHardenedSCRAMConnector initializes a hardened pool enforcing channel binding and verify-full.
+func NewHardenedSCRAMConnector(ctx context.Context, cfg SCRAMConfig) (*HardenedSCRAMConnector, error) {
+	connStr := fmt.Sprintf(
+		"host=%s port=%d dbname=%s user=%s password=%s sslmode=verify-full",
+		cfg.Host, cfg.Port, cfg.Database, cfg.User, cfg.Password,
+	)
+
+	poolConfig, err := pgxpool.ParseConfig(connStr)
+	if err != nil {
+		return nil, fmt.Errorf("scramguard: failed to parse config: %w", err)
+	}
+
+	// 1. Channel Binding Enforcement (RFC 5929 tls-server-end-point)
+	if cfg.RequireChannel {
+		poolConfig.ConnConfig.ChannelBinding = "require"
+	} else {
+		poolConfig.ConnConfig.ChannelBinding = "prefer"
+	}
+
+	// 2. Dual-Root / Corporate CA Loading
+	caPEM, err := os.ReadFile(cfg.CABundlePath)
+	if err != nil {
+		return nil, fmt.Errorf("scramguard: failed to read CA bundle: %w", err)
+	}
+	rootPool := x509.NewCertPool()
+	if !rootPool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("scramguard: failed to parse CA bundle PEM")
+	}
+
+	poolConfig.ConnConfig.TLSConfig = &tls.Config{
+		RootCAs:            rootPool,
+		ServerName:         cfg.Host,
+		MinVersion:         tls.VersionTLS13,
+		InsecureSkipVerify: false,
+	}
+
+	if cfg.MaxConns > 0 {
+		poolConfig.MaxConns = cfg.MaxConns
+	} else {
+		poolConfig.MaxConns = 25
+	}
+	if cfg.MinConns > 0 {
+		poolConfig.MinConns = cfg.MinConns
+	} else {
+		poolConfig.MinConns = 5
+	}
+	poolConfig.MaxConnLifetime = 30 * time.Minute
+	poolConfig.MaxConnIdleTime = 5 * time.Minute
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	if err != nil {
+		return nil, fmt.Errorf("scramguard: pool creation failed: %w", err)
+	}
+
+	// 3. Healthcheck ping
+	pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if err := pool.Ping(pingCtx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("scramguard: ping failed (check SCRAM credentials or TLS cert): %w", err)
+	}
+
+	return &HardenedSCRAMConnector{pool: pool}, nil
+}
+
+// AuditClusterCredentials inspects pg_authid for non-compliant MD5 verifiers.
+func (c *HardenedSCRAMConnector) AuditClusterCredentials(ctx context.Context) (*SCRAMAuditResult, error) {
+	query := `
+		SELECT
+			rolname,
+			CASE
+				WHEN rolpassword LIKE 'SCRAM-SHA-256$%' THEN 'SCRAM'
+				WHEN rolpassword LIKE 'md5%'            THEN 'MD5'
+				ELSE 'OTHER'
+			END AS auth_type
+		FROM pg_authid
+		WHERE rolcanlogin = true AND rolname NOT LIKE 'pg_%';
+	`
+
+	rows, err := c.pool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("scramguard: query pg_authid failed: %w", err)
+	}
+	defer rows.Close()
+
+	result := &SCRAMAuditResult{}
+	for rows.Next() {
+		var roleName, authType string
+		if err := rows.Scan(&roleName, &authType); err != nil {
+			return nil, err
+		}
+		result.TotalLoginRoles++
+		switch authType {
+		case "SCRAM":
+			result.SCRAMRoles++
+		case "MD5":
+			result.LegacyMD5Roles++
+			result.Violations = append(result.Violations, fmt.Sprintf("Role '%s' uses legacy MD5 password hash", roleName))
+		default:
+			result.Violations = append(result.Violations, fmt.Sprintf("Role '%s' uses unencrypted or unknown password format", roleName))
+		}
+	}
+
+	return result, nil
+}
+
+// ReencryptRolePassword updates a role's password under SCRAM-SHA-256 with parameter sanitization.
+func (c *HardenedSCRAMConnector) ReencryptRolePassword(ctx context.Context, roleName, newPassword string) error {
+	if strings.ContainsAny(roleName, " \t\n\r;\"'\\") {
+		return fmt.Errorf("scramguard: invalid role name identifier")
+	}
+
+	// Explicit transaction setting password_encryption = 'scram-sha-256'
+	tx, err := c.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, "SET LOCAL password_encryption = 'scram-sha-256';"); err != nil {
+		return fmt.Errorf("scramguard: failed to set password_encryption: %w", err)
+	}
+
+	// Sanitized ALTER ROLE execution
+	stmt := fmt.Sprintf("ALTER ROLE %s WITH PASSWORD $1;", pgx.Identifier{roleName}.Sanitize())
+	if _, err := tx.Exec(ctx, stmt, newPassword); err != nil {
+		return fmt.Errorf("scramguard: failed to alter role password: %w", err)
+	}
+
+	return tx.Commit(ctx)
+}
+
+func (c *HardenedSCRAMConnector) Close() {
+	if c.pool != nil {
+		c.pool.Close()
+	}
+}
+```
+
 
 
 

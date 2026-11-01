@@ -293,3 +293,17 @@ Modern reasoning models (Anthropic Claude 3.7 Sonnet, OpenAI o1/o3-mini, DeepSee
 - [ ] When context exceeds 75% capacity, is the session compacted into a structured 4-part ground-truth checkpoint?
 - [ ] Are reasoning/thinking token budgets calibrated to task complexity, and are swarm agent prefixes unified for RadixAttention sharing?
 
+---
+
+## 10. Claude Code CLAUDE.md Hierarchical Memory & Anti-Thrashing Invariants
+
+In agent CLI environments such as Claude Code, Cursor, and Pi, hierarchical context files (`CLAUDE.md`, `.cursorrules`, `AGENTS.md`) directly determine prompt caching efficiency and context window stability:
+
+### 1. Hierarchical Directory Memory Cascading
+- **Root Invariants vs Local Scope**: Keep root `CLAUDE.md` strictly focused on global engineering discipline, verification loops, and non-negotiable architectural boundaries. Place sub-package details in local `packages/<pkg>/CLAUDE.md` to ensure context is only hydrated when the agent navigates into that subdirectory.
+- **Prefix Invariance Across Sessions**: Avoid dynamic placeholders (e.g., date stamps, git branch names, ephemeral process IDs) in `CLAUDE.md`. Dynamic tokens at the top of instructions invalidate prompt cache prefixes on every invocation.
+
+### 2. Context Window Anti-Thrashing & Command Economy
+- **Bounded Tool Discovery Over Dumps**: Never issue commands that emit unbounded terminal output (`find .`, `ls -laR`, `cat package-lock.json`). Always pipe through head/tail or use targeted file search tools (`rg --files`, `rg -n "pattern" -g "!node_modules"`).
+- **Compaction Checkpoint Triggers**: When session turns reach 25 turns or token usage exceeds 60% of window capacity, initiate an explicit memory checkpoint into `.agents/memory/ACTIVE_CONTEXT.md`, summarizing verified ground truth and immediate next actions before discarding raw bash observations.
+
