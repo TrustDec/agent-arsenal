@@ -8726,6 +8726,119 @@ When visualizing PostgreSQL logical replication publication health, row filter s
 </div>
 ```
 
+---
+
+## 18. PostgreSQL Extension Governance & Version Drift Sentinel (Svelte 5 Runes)
+
+When building database administration dashboards in Svelte 5, monitor extension lifecycles, detect version drift, and alert on un-preloaded shared libraries using Svelte 5 runes (`$state`, `$derived`, `$props`):
+
+```svelte
+<script lang="ts">
+  interface ExtensionItem {
+    name: string;
+    installedVersion: string;
+    defaultVersion: string;
+    schema: string;
+    isPreloaded: boolean;
+    requiresPreload: boolean;
+  }
+
+  interface Props {
+    extensions: ExtensionItem[];
+    onUpdate?: (name: string, targetVersion: string) => void;
+  }
+
+  const { extensions = [], onUpdate }: Props = $props();
+
+  let filterText = $state('');
+
+  const filteredExtensions = $derived(
+    extensions.filter((ext) =>
+      ext.name.toLowerCase().includes(filterText.toLowerCase()) ||
+      ext.schema.toLowerCase().includes(filterText.toLowerCase())
+    )
+  );
+
+  const driftCount = $derived(
+    extensions.filter((ext) => ext.installedVersion !== ext.defaultVersion).length
+  );
+
+  const missingPreloadCount = $derived(
+    extensions.filter((ext) => ext.requiresPreload && !ext.isPreloaded).length
+  );
+</script>
+
+<div class="rounded-xl border border-zinc-800 bg-zinc-950 p-6 text-zinc-100 shadow-2xl">
+  <div class="flex items-center justify-between border-b border-zinc-850 pb-4">
+    <div>
+      <h3 class="text-sm font-semibold tracking-wide text-zinc-200">PostgreSQL Extension Sentinel</h3>
+      <p class="text-xs text-zinc-400">Audit shared_preload_libraries, schema isolation & version drift</p>
+    </div>
+    <div class="flex items-center gap-2">
+      {#if missingPreloadCount > 0}
+        <span class="rounded-full bg-rose-500/10 px-2.5 py-1 text-xs font-medium text-rose-400 border border-rose-500/20">
+          {missingPreloadCount} Missing Preload
+        </span>
+      {/if}
+      {#if driftCount > 0}
+        <span class="rounded-full bg-amber-500/10 px-2.5 py-1 text-xs font-medium text-amber-400 border border-amber-500/20">
+          {driftCount} Version Drift
+        </span>
+      {:else}
+        <span class="rounded-full bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-400 border border-emerald-500/20">
+          All Synced
+        </span>
+      {/if}
+    </div>
+  </div>
+
+  <div class="mt-4">
+    <input
+      type="text"
+      placeholder="Filter extensions or schemas..."
+      bind:value={filterText}
+      class="w-full rounded-lg border border-zinc-800 bg-zinc-900/60 px-3.5 py-2 text-xs text-zinc-200 placeholder-zinc-500 focus:border-zinc-700 focus:outline-none"
+    />
+  </div>
+
+  <div class="mt-4 divide-y divide-zinc-850">
+    {#each filteredExtensions as ext (ext.name)}
+      <div class="flex items-center justify-between py-3">
+        <div class="space-y-1">
+          <div class="flex items-center gap-2">
+            <span class="font-mono text-xs font-semibold text-zinc-200">{ext.name}</span>
+            <span class="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-[10px] text-zinc-400">{ext.schema}</span>
+          </div>
+          <div class="text-[11px] text-zinc-400">
+            Installed: <span class="font-mono text-zinc-300">{ext.installedVersion}</span>
+            {#if ext.installedVersion !== ext.defaultVersion}
+              <span class="ml-1 text-amber-400 font-mono">(Available: {ext.defaultVersion})</span>
+            {/if}
+          </div>
+        </div>
+
+        <div class="flex items-center gap-2">
+          {#if ext.requiresPreload && !ext.isPreloaded}
+            <span class="rounded bg-rose-950/60 px-2 py-0.5 text-[10px] text-rose-400 border border-rose-800/40">
+              Unpreloaded
+            </span>
+          {/if}
+          {#if ext.installedVersion !== ext.defaultVersion && onUpdate}
+            <button
+              onclick={() => onUpdate(ext.name, ext.defaultVersion)}
+              class="rounded bg-zinc-800 px-2.5 py-1 text-xs font-medium text-zinc-200 hover:bg-zinc-700 transition"
+            >
+              Update
+            </button>
+          {/if}
+        </div>
+      </div>
+    {/each}
+  </div>
+</div>
+```
+
+
 
 
 

@@ -7606,7 +7606,134 @@ onMounted(() => {
 </template>
 ```
 
+---
+
+## 18. PostgreSQL Extension Governance & Version Drift Sentinel (Vue 3.5 / Nuxt 3)
+
+When building database observability interfaces in Vue 3.5 / Nuxt 3, audit extension versions, preloaded libraries, and schema isolation with reactive primitives and `useTemplateRef`:
+
+```vue
+<script setup lang="ts">
+import { ref, computed, useTemplateRef } from 'vue';
+
+interface ExtensionItem {
+  name: string;
+  installedVersion: string;
+  defaultVersion: string;
+  schema: string;
+  isPreloaded: boolean;
+  requiresPreload: boolean;
+}
+
+const props = defineProps<{
+  extensions: ExtensionItem[];
+}>();
+
+const emit = defineEmits<{
+  (e: 'update', name: string, targetVersion: string): void;
+}>();
+
+const searchInputRef = useTemplateRef<HTMLInputElement>('searchInput');
+const searchFilter = ref('');
+
+const filteredExtensions = computed(() => {
+  const query = searchFilter.value.toLowerCase().trim();
+  if (!query) return props.extensions;
+  return props.extensions.filter(
+    (ext) =>
+      ext.name.toLowerCase().includes(query) ||
+      ext.schema.toLowerCase().includes(query)
+  );
+});
+
+const driftCount = computed(() =>
+  props.extensions.filter((ext) => ext.installedVersion !== ext.defaultVersion).length
+);
+
+const missingPreloadCount = computed(() =>
+  props.extensions.filter((ext) => ext.requiresPreload && !ext.isPreloaded).length
+);
+</script>
+
+<template>
+  <div class="rounded-xl border border-zinc-800 bg-zinc-950 p-6 text-zinc-100 shadow-2xl">
+    <div class="flex items-center justify-between border-b border-zinc-800 pb-4">
+      <div>
+        <h3 class="text-sm font-semibold tracking-wide text-zinc-200">PostgreSQL Extension Sentinel</h3>
+        <p class="text-xs text-zinc-400">Audit shared_preload_libraries, schema isolation & version drift</p>
+      </div>
+      <div class="flex items-center gap-2">
+        <span
+          v-if="missingPreloadCount > 0"
+          class="rounded-full bg-rose-500/10 px-2.5 py-1 text-xs font-medium text-rose-400 border border-rose-500/20"
+        >
+          {{ missingPreloadCount }} Missing Preload
+        </span>
+        <span
+          v-if="driftCount > 0"
+          class="rounded-full bg-amber-500/10 px-2.5 py-1 text-xs font-medium text-amber-400 border border-amber-500/20"
+        >
+          {{ driftCount }} Version Drift
+        </span>
+        <span
+          v-else
+          class="rounded-full bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-400 border border-emerald-500/20"
+        >
+          All Synced
+        </span>
+      </div>
+    </div>
+
+    <div class="mt-4">
+      <input
+        ref="searchInput"
+        v-model="searchFilter"
+        type="text"
+        placeholder="Filter extensions or schemas..."
+        class="w-full rounded-lg border border-zinc-800 bg-zinc-900/60 px-3.5 py-2 text-xs text-zinc-200 placeholder-zinc-500 focus:border-zinc-700 focus:outline-none"
+      />
+    </div>
+
+    <div class="mt-4 divide-y divide-zinc-800/80">
+      <div
+        v-for="ext in filteredExtensions"
+        :key="ext.name"
+        class="flex items-center justify-between py-3"
+      >
+        <div class="space-y-1">
+          <div class="flex items-center gap-2">
+            <span class="font-mono text-xs font-semibold text-zinc-200">{{ ext.name }}</span>
+            <span class="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-[10px] text-zinc-400">{{ ext.schema }}</span>
+          </div>
+          <div class="text-[11px] text-zinc-400">
+            Installed: <span class="font-mono text-zinc-300">{{ ext.installedVersion }}</span>
+            <span v-if="ext.installedVersion !== ext.defaultVersion" class="ml-1 text-amber-400 font-mono">
+              (Available: {{ ext.defaultVersion }})
+            </span>
+          </div>
+        </div>
+
+        <div class="flex items-center gap-2">
+          <span
+            v-if="ext.requiresPreload && !ext.isPreloaded"
+            class="rounded bg-rose-950/60 px-2 py-0.5 text-[10px] text-rose-400 border border-rose-800/40"
+          >
+            Unpreloaded
+          </span>
+          <button
+            v-if="ext.installedVersion !== ext.defaultVersion"
+            @click="emit('update', ext.name, ext.defaultVersion)"
+            class="rounded bg-zinc-800 px-2.5 py-1 text-xs font-medium text-zinc-200 hover:bg-zinc-700 transition"
+          >
+            Update
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
 ```
+
 
 
 

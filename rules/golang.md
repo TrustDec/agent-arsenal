@@ -12455,6 +12455,95 @@ func (s *PublicationGovernanceSentinel) RemediateReplicaIdentityFull(ctx context
 }
 ```
 
+---
+
+## 19. PostgreSQL Extension Lifecycle, Shared Preload Verification & Safe Migration Invariants
+
+When managing PostgreSQL extensions (`pgvector`, `pg_stat_statements`, `timescaledb`, `pg_trgm`, `postgis`) in Go (`jackc/pgx/v5`):
+
+- **Pre-Flight `shared_preload_libraries` Verification**:
+  - Always verify that extensions requiring shared memory hooks (`pg_stat_statements`, `pg_cron`, `timescaledb`, `auto_explain`) are declared in `shared_preload_libraries` before executing `CREATE EXTENSION`. Attempting dynamic creation without preload throws `SQLSTATE 55000` or fails to initialize background workers.
+- **Dedicated Schema Isolation & CVE-2018-1058 Defense**:
+  - Never install extensions into the `public` schema. Pre-create and target an isolated `extensions` schema (`CREATE EXTENSION ... SCHEMA extensions;`) and set `search_path = extensions, pg_catalog, pg_temp;`.
+- **Relational Dependency Blast Radius & Anti-CASCADE Fencing**:
+  - Strictly prohibit `DROP EXTENSION ... CASCADE`. Query `pg_depend` to verify zero application table columns depend on extension types before executing maintenance.
+- **In-Database Version Drift Reconciliation**:
+  - Compare `pg_extension.extversion` against `pg_available_extensions.default_version` during health checks, executing safe `ALTER EXTENSION ... UPDATE` under `lock_timeout <= 2000ms`.
+
+```go
+package extension
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type ExtensionPreFlight struct {
+	pool *pgxpool.Pool
+}
+
+func NewExtensionPreFlight(pool *pgxpool.Pool) *ExtensionPreFlight {
+	return &ExtensionPreFlight{pool: pool}
+}
+
+// AssertPreloaded verifies that required libraries are present in shared_preload_libraries.
+func (e *ExtensionPreFlight) AssertPreloaded(ctx context.Context, requiredLibs ...string) error {
+	var setting string
+	err := e.pool.QueryRow(ctx, "SELECT setting FROM pg_settings WHERE name = 'shared_preload_libraries';").Scan(&setting)
+	if err != nil {
+		return fmt.Errorf("query shared_preload_libraries: %w", err)
+	}
+
+	preloaded := make(map[string]struct{})
+	for _, lib := range strings.Split(setting, ",") {
+		s := strings.TrimSpace(strings.ToLower(lib))
+		if s != "" {
+			preloaded[s] = struct{}{}
+		}
+	}
+
+	for _, req := range requiredLibs {
+		if _, ok := preloaded[strings.ToLower(req)]; !ok {
+			return fmt.Errorf("shared_preload_libraries invariant breached: library %q must be loaded at startup", req)
+		}
+	}
+	return nil
+}
+
+// SafeInstallExtension installs an extension into the isolated 'extensions' schema with a strict timeout.
+func (e *ExtensionPreFlight) SafeInstallExtension(ctx context.Context, extName string, timeout time.Duration) error {
+	tx, err := e.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin install tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	ms := int(timeout.Milliseconds())
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = '%dms';", ms)); err != nil {
+		return fmt.Errorf("set lock_timeout: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS extensions;"); err != nil {
+		return fmt.Errorf("create extensions schema: %w", err)
+	}
+
+	installSQL := fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %s SCHEMA extensions;", pgx.Identifier{extName}.Sanitize())
+	if _, err := tx.Exec(ctx, installSQL); err != nil {
+		return fmt.Errorf("create extension %q: %w", extName, err)
+	}
+
+	slog.Info("Successfully ensured extension in dedicated schema", "extension", extName, "schema", "extensions")
+	return tx.Commit(ctx)
+}
+```
+
+
 
 
 

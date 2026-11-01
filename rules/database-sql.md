@@ -4168,6 +4168,15 @@ alwaysApply: false
       - Enforce **Transitive Foreign Key Co-Filtering**: ensure child relations referencing filtered parent tables declare subsuming filter predicates to prevent orphaned subscriber inserts.
       - Enforce **Partition Root Harmonization**: always declare `CREATE PUBLICATION ... WITH (publish_via_partition_root = true)` on partitioned relations to insulate subscribers from physical partition re-sharding.
       - Enforce **Staged Tablesync Rate-Limiting**: stagger initial synchronization of multiple tables during subscription refreshes, bounding parallel tablesync workers (`max_sync_workers_per_subscription <= 2`) to protect OLTP latency.
+  - **Extension Lifecycle, shared_preload_libraries, Version Drift & Relational Cascades Invariants**:
+    - ❌ **Anti-Pattern**: Executing `CREATE EXTENSION` for libraries requiring C shared memory allocations (`pg_stat_statements`, `pg_cron`, `timescaledb`, `auto_explain`) without first declaring them in `shared_preload_libraries` in `postgresql.conf`, causing immediate `SQLSTATE 55000` execution crashes or server restart panics. Executing `DROP EXTENSION ... CASCADE`, triggering PostgreSQL's internal `pg_depend` engine to silently drop all user tables, columns, generated defaults, and foreign keys referencing extension types in milliseconds. Upgrading host container OS packages or PostgreSQL minor versions while neglecting in-database `ALTER EXTENSION ... UPDATE`, resulting in ABI desynchronization and missing operator classes. Installing extensions without schema isolation directly into the `public` schema, exposing applications to CVE-2018-1058 `search_path` hijacking and permission errors in PostgreSQL 15+. Adding custom extension types (`vector`, `citext`, `geometry`) on logical replication publisher tables without pre-provisioning the exact extensions on subscribers, causing apply workers to crash-loop with `SQLSTATE 42704 (type does not exist)`.
+    - ✅ **Production Invariant**:
+      - Enforce **Dedicated Schema Isolation**: install all relocatable extensions into a dedicated, unprivileged `extensions` schema (`CREATE SCHEMA IF NOT EXISTS extensions; CREATE EXTENSION <name> SCHEMA extensions;`) and set `search_path = extensions, pg_catalog, pg_temp;`.
+      - Enforce **Pre-Flight Shared Preload Verification**: verify `pg_settings` for `shared_preload_libraries` prior to invoking `CREATE EXTENSION` on modules with background workers or shared-memory hooks.
+      - Enforce **Strict Anti-CASCADE Drop Circuit Breakers**: permanently ban `DROP EXTENSION ... CASCADE`; verify `pg_depend` for dependent relation columns (`deptype = 'e'`) prior to any extension decommissioning.
+      - Enforce **Automated In-Database Version Reconciliation**: continuously compare `pg_extension.extversion` against `pg_available_extensions.default_version`, executing Canary `ALTER EXTENSION <name> UPDATE TO '<version>'` under `lock_timeout <= 2000ms`.
+      - Enforce **Heterogeneous Replication Parity**: pre-provision all publisher extension types and operator classes on 100% of logical replication subscribers prior to subscription activation.
+
 
 
 

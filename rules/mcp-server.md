@@ -8871,6 +8871,92 @@ ALTER TABLE ${args.tableName} ADD COLUMN ${args.columnName}_byte_size BIGINT NOT
       }
     );
 
+    // MCP Tool: Audit PostgreSQL Extensions & shared_preload_libraries Compliance
+    server.tool(
+      'audit_pg_extensions',
+      'Audits installed PostgreSQL extensions for version drift, missing shared_preload_libraries, public schema pollution, and dependent objects.',
+      {},
+      async () => {
+        const client = await pool.connect();
+        try {
+          const preloadRes = await client.query<{ setting: string }>(
+            "SELECT setting FROM pg_settings WHERE name = 'shared_preload_libraries';"
+          );
+          const preloaded = new Set(
+            (preloadRes.rows[0]?.setting || '')
+              .split(',')
+              .map((s) => s.trim().toLowerCase())
+              .filter(Boolean)
+          );
+
+          const extRes = await client.query(`
+            SELECT 
+              e.extname,
+              e.extversion,
+              COALESCE(a.default_version, e.extversion) AS default_version,
+              n.nspname AS installed_schema,
+              e.extrelocatable AS relocatable
+            FROM pg_extension e
+            JOIN pg_namespace n ON e.extnamespace = n.oid
+            LEFT JOIN pg_available_extensions a ON e.extname = a.name;
+          `);
+
+          const knownPreload: Record<string, string> = {
+            pg_stat_statements: 'pg_stat_statements',
+            pg_cron: 'pg_cron',
+            timescaledb: 'timescaledb',
+            auto_explain: 'auto_explain',
+          };
+
+          const hazards: Array<{ extension: string; severity: string; issue: string; remediation: string }> = [];
+
+          for (const row of extRes.rows) {
+            const req = knownPreload[row.extname];
+            if (req && !preloaded.has(req)) {
+              hazards.push({
+                extension: row.extname,
+                severity: 'CRITICAL',
+                issue: `Missing from shared_preload_libraries: ${req}`,
+                remediation: `Add '${req}' to shared_preload_libraries in postgresql.conf and restart.`,
+              });
+            }
+
+            if (row.extversion !== row.default_version) {
+              hazards.push({
+                extension: row.extname,
+                severity: 'HIGH',
+                issue: `Version drift: installed ${row.extversion} != binary ${row.default_version}`,
+                remediation: `ALTER EXTENSION "${row.extname}" UPDATE TO '${row.default_version}';`,
+              });
+            }
+
+            if (row.installed_schema === 'public' && row.relocatable) {
+              hazards.push({
+                extension: row.extname,
+                severity: 'MEDIUM',
+                issue: 'Installed in public schema (CVE-2018-1058 search_path hijacking risk)',
+                remediation: `ALTER EXTENSION "${row.extname}" SET SCHEMA extensions;`,
+              });
+            }
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                totalInstalled: extRes.rows.length,
+                totalHazards: hazards.length,
+                hazards,
+                extensions: extRes.rows,
+              }, null, 2),
+            }],
+          };
+        } finally {
+          client.release();
+        }
+      }
+    );
+
   }
   ```
 
