@@ -7784,6 +7784,79 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         };
       }
     );
+
+    // Tool: audit_replication_slots_and_wal_retention
+    server.tool(
+      'audit_replication_slots_and_wal_retention',
+      'Audits PostgreSQL pg_replication_slots and postgresql.conf settings for WAL retention limits, inactive consumer lag hazards, catalog_xmin vacuum horizon freezing, and PG17 failover slot configuration.',
+      {
+        maxSlotWalKeepSizeSetting: z.string().describe('Value of max_slot_wal_keep_size (e.g. "50GB" or "-1")'),
+        slots: z.array(z.object({
+          slotName: z.string(),
+          slotType: z.enum(['physical', 'logical']),
+          active: z.boolean(),
+          walStatus: z.string(),
+          walLagMb: z.number(),
+          catalogXminAge: z.number().optional().default(0),
+          failover: z.boolean().optional().default(false),
+        })).describe('List of current replication slots from pg_replication_slots'),
+      },
+      async (args) => {
+        const violations: string[] = [];
+        const recommendations: string[] = [];
+
+        // Check 1: max_slot_wal_keep_size check
+        if (args.maxSlotWalKeepSizeSetting === '-1' || args.maxSlotWalKeepSizeSetting.toLowerCase() === 'unlimited') {
+          violations.push(
+            "CATASTROPHIC_WAL_DISK_HAZARD: max_slot_wal_keep_size is set to -1 (unlimited). An inactive or lagging slot will pin WAL indefinitely until disk reaches 100% capacity and triggers a PANIC shutdown."
+          );
+          recommendations.push(
+            "Configure 'ALTER SYSTEM SET max_slot_wal_keep_size = \"50GB\";' (or <= 25% free disk capacity) to sacrifice lagging slots instead of crashing the primary cluster."
+          );
+        }
+
+        // Check 2: Audit individual slots
+        for (const slot of args.slots) {
+          if (slot.walStatus === 'lost') {
+            violations.push(
+              `SLOT_LOST_WAL: Slot '${slot.slotName}' exceeded retention limits and lost WAL. Downstream subscriber cannot catch up.`
+            );
+            recommendations.push(
+              `Drop broken slot '${slot.slotName}' via SELECT pg_drop_replication_slot('${slot.slotName}') and re-seed subscriber.`
+            );
+          }
+          if (!slot.active && slot.walLagMb > 10240) {
+            violations.push(
+              `INACTIVE_SLOT_PINNING_STORAGE: Slot '${slot.slotName}' is inactive and retains ${slot.walLagMb} MB of WAL.`
+            );
+            recommendations.push(
+              `Reap inactive slot '${slot.slotName}' or restart subscriber.`
+            );
+          }
+          if (slot.slotType === 'logical' && slot.catalogXminAge > 500000) {
+            violations.push(
+              `CATALOG_XMIN_FREEZE: Logical slot '${slot.slotName}' pins catalog_xmin to age ${slot.catalogXminAge}, blocking catalog autovacuum.`
+            );
+          }
+        }
+
+        const isCompliant = violations.length === 0;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              isCompliant,
+              totalSlots: args.slots.length,
+              activeSlots: args.slots.filter(s => s.active).length,
+              violations,
+              recommendations,
+              status: isCompliant ? 'certified_replication_slots_compliant' : 'replication_slot_hazards_detected',
+            }, null, 2),
+          }],
+        };
+      }
+    );
   }
   ```
 

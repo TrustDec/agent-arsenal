@@ -6462,6 +6462,57 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   });
   ```
 
+- **Replication Slot Health Sentinel & Orphan Reaper Nitro Routes (Nuxt 3)**:
+  - ❌ **Anti-Pattern: Unchecked Drop Operations in API Handlers**:
+    - Dropping replication slots without active checks or lock timeouts, hanging backend worker threads.
+  - ✅ **Production Invariant**:
+    - Audit `pg_replication_slots` for inactive consumers holding WAL.
+    - Execute cleanup with transaction-scoped `SET LOCAL lock_timeout = '2000ms'`.
+  ```typescript
+  // server/api/admin/storage/replication-slots/reap.post.ts
+  import { primaryDb } from '~/server/utils/db';
+  import { sql } from 'kysely';
+
+  export default defineEventHandler(async (event) => {
+    const { slotName } = await readBody<{ slotName: string }>(event);
+
+    if (!slotName || !/^[a-zA-Z0-9_]+$/.test(slotName)) {
+      throw createError({ statusCode: 400, message: 'Invalid or missing slot name' });
+    }
+
+    try {
+      let dropped = false;
+      await primaryDb.transaction().execute(async (tx) => {
+        await sql`SET LOCAL lock_timeout = '2000ms'`.execute(tx);
+        const check = await sql<{ active: boolean }>`
+          SELECT active FROM pg_replication_slots WHERE slot_name = ${slotName}
+        `.execute(tx);
+
+        if (check.rows.length === 0) {
+          throw new Error(`Slot '${slotName}' does not exist.`);
+        }
+        if (check.rows[0].active) {
+          throw new Error(`Slot '${slotName}' is active; cannot reap connected consumer.`);
+        }
+
+        await sql`SELECT pg_drop_replication_slot(${slotName})`.execute(tx);
+        dropped = true;
+      });
+
+      return {
+        success: true,
+        slotName,
+        reaped: dropped,
+      };
+    } catch (err: any) {
+      throw createError({
+        statusCode: 500,
+        message: `Failed reaping replication slot: ${err.message}`,
+      });
+    }
+  });
+  ```
+
 
 
 

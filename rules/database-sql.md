@@ -4064,6 +4064,14 @@ alwaysApply: false
       - Enforce **Batch Extension Coalescing**: vectorize concurrent appends using unnested arrays (`INSERT ... SELECT * FROM UNNEST(...)`) or PostgreSQL `COPY` to leverage PostgreSQL 16+ bulk relation extension (allocating up to 512 blocks per lock acquisition).
       - Enforce **Modern Autovacuum Cost Limits**: raise `autovacuum_vacuum_cost_limit = 2000-5000` and lower delay to 2ms on modern NVMe storage to prune dead tuples and defragment line pointers before blocks become unfillable.
       - Enforce **Zero-Downtime Fillfactor Repack**: apply fillfactor modifications via `ALTER TABLE <table> SET (fillfactor = X);` under `lock_timeout = '1500ms'`, followed by online defragmentation via `pg_repack` (never `VACUUM FULL`).
+  - **Replication Slots, WAL Retention & Orphaned Consumer Defense Invariants**:
+    - ❌ **Anti-Pattern**: Default `max_slot_wal_keep_size = -1` (unlimited), allowing an unmonitored disconnected read replica, crashed Debezium/Kafka CDC subscriber, or orphaned test slot to pin WAL segments indefinitely until primary filesystem fills 100% and crashes with `PANIC: could not write to log file: No space left on device`. Ignoring inactive slots (`active = false`) holding tens of gigabytes of WAL. Ignoring logical slot `catalog_xmin` pinning, preventing autovacuum from cleaning dead catalog tuples (`pg_class`, `pg_attribute`) and degrading query planning. Omitting `pg_drop_replication_slot()` in test fixture teardown, creating permanent zombie slots.
+    - ✅ **Production Invariant**:
+      - Enforce **Bounded WAL Retention Limit**: always configure `ALTER SYSTEM SET max_slot_wal_keep_size = '50GB'` (or $\le 25\%$ available disk space) to automatically invalidate runaway slots (`wal_status = 'lost'`) before host disk fills to capacity.
+      - Enforce **Inactive Slot Watchdog Reaping**: audit `pg_replication_slots` every 60 seconds; automatically drop or alert on inactive slots (`NOT active` for $> 15\text{m}$) or slots with byte lag `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) > 10GB`.
+      - Enforce **System Catalog Vacuum Horizon Fencing**: continuously monitor `SELECT max(age(catalog_xmin)) FROM pg_replication_slots WHERE slot_type = 'logical'` to guarantee catalog horizon age $\le 500,000$ transactions.
+      - Enforce **PostgreSQL 17+ HA Failover Synchronization**: configure logical slots with `failover = true` and standbys with `sync_replication_slots = on` to guarantee uninterrupted CDC failover.
+      - Enforce **Zero-Orphaned-Slot CI Teardown**: audit CI test clusters to ensure all test-generated slots (`^(test|tmp|agent)_`) are dropped in `defer` / `afterEach` blocks via `SELECT pg_drop_replication_slot(slot_name)`.
 
 
 

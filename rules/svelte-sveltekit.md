@@ -7227,6 +7227,76 @@ In SvelteKit administrative consoles and system diagnostics:
   };
   ```
 
+- **Replication Slot Health & WAL Lag Sentinel Dashboard (`+page.server.ts`)**:
+  - ❌ **Anti-Pattern: Blind Replication Lag & Missing Storage Protection**:
+    - Monitoring replica queries without tracking byte lag on the primary, allowing stalled subscribers to fill disk.
+    - Dropping slots without `lock_timeout` or dropping active slots.
+  - ✅ **Production Invariant**:
+    - Surface active slots, WAL lag bytes, and logical `catalog_xmin` age.
+    - Provide actions to safely reap inactive slots under transaction-scoped `lock_timeout = '2000ms'`.
+  ```typescript
+  // src/routes/admin/storage/replication-slots/+page.server.ts
+  import type { PageServerLoad, Actions } from './$types';
+  import { fail } from '@sveltejs/kit';
+  import { primaryDb } from '$lib/server/db';
+  import { sql } from 'kysely';
+
+  export const load: PageServerLoad = async () => {
+    const slots = await sql<{
+      slotName: string;
+      plugin: string;
+      slotType: string;
+      active: boolean;
+      walStatus: string;
+      walLagMb: number;
+      catalogXminAge: number;
+    }>`
+      SELECT 
+        slot_name AS "slotName",
+        COALESCE(plugin, 'physical') AS "plugin",
+        slot_type AS "slotType",
+        active,
+        COALESCE(wal_status, 'normal') AS "walStatus",
+        ROUND(COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::numeric / (1024 * 1024)::numeric, 2)::float8 AS "walLagMb",
+        COALESCE(age(catalog_xmin), 0)::int AS "catalogXminAge"
+      FROM pg_replication_slots
+    `.execute(primaryDb);
+
+    return {
+      slots: slots.rows,
+    };
+  };
+
+  export const actions: Actions = {
+    reapSlot: async ({ request }) => {
+      const data = await request.formData();
+      const slotName = data.get('slotName')?.toString();
+
+      if (!slotName || !/^[a-zA-Z0-9_]+$/.test(slotName)) {
+        return fail(400, { message: 'Invalid slot name' });
+      }
+
+      try {
+        await primaryDb.transaction().execute(async (tx) => {
+          await sql`SET LOCAL lock_timeout = '2000ms'`.execute(tx);
+          const check = await sql<{ active: boolean }>`
+            SELECT active FROM pg_replication_slots WHERE slot_name = ${slotName}
+          `.execute(tx);
+
+          if (check.rows[0]?.active) {
+            throw new Error(`Slot '${slotName}' is active; cannot drop active consumer.`);
+          }
+
+          await sql`SELECT pg_drop_replication_slot(${slotName})`.execute(tx);
+        });
+        return { success: true, dropped: slotName };
+      } catch (err: any) {
+        return fail(500, { message: 'Failed to reap slot: ' + err.message });
+      }
+    },
+  };
+  ```
+
 
 
 

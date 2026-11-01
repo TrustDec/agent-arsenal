@@ -10098,4 +10098,107 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **Replication Slot Telemetry, Inactive Slot Watchdog & Orphan Reaper (`jackc/pgx/v5`)**:
+  - ❌ **Anti-Pattern: Unbounded Test Slots & Missing Inactivity Guards**:
+    - Creating temporary replication slots for integration tests or CDC ingestion without `defer pg_drop_replication_slot()`.
+    - Leaving disconnected subscribers unmonitored until WAL fills the host filesystem and primary panics.
+  - ✅ **Production Invariant**:
+    - Continuously audit `pg_replication_slots` for byte lag and `wal_status != 'normal'`.
+    - Automatically drop inactive slots exceeding inactivity lease or lag threshold under bounded `lock_timeout`.
+  ```go
+  // INVARIANT: Replication Slot Health Sentinel & Orphan Reaper in Go (pgx/v5).
+  // Verifies that no inactive slot threatens primary storage with WAL bloat,
+  // and enforces bounded lock timeouts during cleanup operations.
+  type ReplicationSlotSentinel struct {
+    pool        *pgxpool.Pool
+    maxLagBytes int64
+  }
+
+  func NewReplicationSlotSentinel(pool *pgxpool.Pool, maxLagBytes int64) (*ReplicationSlotSentinel, error) {
+    if pool == nil {
+      return nil, errors.New("pgx pool must not be nil")
+    }
+    if maxLagBytes <= 0 {
+      maxLagBytes = 10 * 1024 * 1024 * 1024 // 10GB default
+    }
+    return &ReplicationSlotSentinel{pool: pool, maxLagBytes: maxLagBytes}, nil
+  }
+
+  type SlotStatus struct {
+    SlotName    string
+    Active      bool
+    WalStatus   string
+    WalLagBytes int64
+  }
+
+  // AuditSlots scans pg_replication_slots and identifies dangerous lag or lost WAL.
+  func (s *ReplicationSlotSentinel) AuditSlots(ctx context.Context) ([]SlotStatus, []string, error) {
+    query := `
+      SELECT 
+        slot_name,
+        active,
+        COALESCE(wal_status, 'normal'),
+        COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::bigint
+      FROM pg_replication_slots;
+    `
+    rows, err := s.pool.Query(ctx, query)
+    if err != nil {
+      return nil, nil, fmt.Errorf("query replication slots: %w", err)
+    }
+    defer rows.Close()
+
+    var slots []SlotStatus
+    var alerts []string
+    for rows.Next() {
+      var st SlotStatus
+      if err := rows.Scan(&st.SlotName, &st.Active, &st.WalStatus, &st.WalLagBytes); err != nil {
+        return nil, nil, fmt.Errorf("scan slot: %w", err)
+      }
+      slots = append(slots, st)
+
+      if !st.Active && st.WalLagBytes > s.maxLagBytes {
+        alerts = append(alerts, fmt.Sprintf("INACTIVE_SLOT_LAG: slot %s is inactive and retaining %d bytes of WAL", st.SlotName, st.WalLagBytes))
+      }
+      if st.WalStatus == "lost" {
+        alerts = append(alerts, fmt.Sprintf("SLOT_LOST_WAL: slot %s has lost WAL segments and cannot recover", st.SlotName))
+      }
+    }
+    return slots, alerts, rows.Err()
+  }
+
+  // ReapInactiveSlot drops an unconsumed slot under strict lock timeout.
+  func (s *ReplicationSlotSentinel) ReapInactiveSlot(ctx context.Context, slotName string) error {
+    conn, err := s.pool.Acquire(ctx)
+    if err != nil {
+      return fmt.Errorf("acquire conn: %w", err)
+    }
+    defer conn.Release()
+
+    tx, err := conn.Begin(ctx)
+    if err != nil {
+      return fmt.Errorf("begin tx: %w", err)
+    }
+    defer tx.Rollback(ctx)
+
+    if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '2000ms';"); err != nil {
+      return fmt.Errorf("set lock_timeout: %w", err)
+    }
+
+    var isActive bool
+    err = tx.QueryRow(ctx, "SELECT active FROM pg_replication_slots WHERE slot_name = $1", slotName).Scan(&isActive)
+    if err != nil {
+      return fmt.Errorf("verify slot %s: %w", slotName, err)
+    }
+    if isActive {
+      return fmt.Errorf("slot %s is currently active; refusing to reap", slotName)
+    }
+
+    if _, err := tx.Exec(ctx, "SELECT pg_drop_replication_slot($1);", slotName); err != nil {
+      return fmt.Errorf("drop slot %s: %w", slotName, err)
+    }
+
+    return tx.Commit(ctx)
+  }
+  ```
+
 
