@@ -7465,6 +7465,87 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
       }
     );
   }
+
+  public registerAuditSynchronousCommitAndDurabilityTool(): void {
+    this.server.tool(
+      'audit_synchronous_commit_and_durability_ladders',
+      'Audits PostgreSQL synchronous_commit settings, replication quorum configurations, group commit parameters (commit_delay, commit_siblings), and queries for durability anti-patterns or connection pool session leaks.',
+      {
+        synchronousCommit: z.string().describe('The active synchronous_commit setting (off, local, remote_write, on, remote_apply)'),
+        synchronousStandbyNames: z.string().optional().describe('Value of synchronous_standby_names, e.g. "ANY 1 (node1, node2)" or "FIRST 1 (node1)"'),
+        commitDelay: z.number().optional().describe('Configured commit_delay in microseconds'),
+        commitSiblings: z.number().optional().describe('Configured commit_siblings integer'),
+        sqlQuery: z.string().optional().describe('Optional SQL statement to inspect for session-level SET leakage'),
+      },
+      async (args) => {
+        const violations: string[] = [];
+        const recommendations: string[] = [];
+
+        const syncVal = args.synchronousCommit.toLowerCase().trim();
+
+        if (syncVal === 'off') {
+          violations.push(
+            'GLOBAL_ASYNC_COMMIT_DANGER: Global synchronous_commit is set to "off". Hardware failure or power cuts risk unrecoverable loss of committed financial, auth, and state data.'
+          );
+          recommendations.push(
+            'Keep global synchronous_commit = "on" (or "local") in postgresql.conf. Use "SET LOCAL synchronous_commit = off" strictly inside individual non-critical transactions.'
+          );
+        }
+
+        if (args.synchronousStandbyNames) {
+          const names = args.synchronousStandbyNames.trim();
+          if (names.length > 0 && !/^ANY\s+\d+/i.test(names)) {
+            violations.push(
+              `STANDBY_PRIORITY_HAZARD: synchronous_standby_names uses priority matching ("${names}"). If the primary standby lags or disconnects, all write transactions will stall in WaitEvent: SyncRep.`
+            );
+            recommendations.push(
+              'Migrate to quorum replication: synchronous_standby_names = "ANY 1 (node1, node2, ...)".'
+            );
+          }
+        }
+
+        if (args.commitDelay && args.commitDelay > 0) {
+          const siblings = args.commitSiblings ?? 0;
+          if (siblings < 5) {
+            violations.push(
+              `GROUP_COMMIT_STALL: commit_delay is ${args.commitDelay}µs but commit_siblings is ${siblings} (< 5). Transactions will incur artificial sleep delays without sufficient concurrent committers.`
+            );
+            recommendations.push(
+              'Set commit_siblings >= 5 when commit_delay > 0, or reset commit_delay = 0.'
+            );
+          }
+        }
+
+        if (args.sqlQuery) {
+          const hasSessionSet = /^\s*SET\s+synchronous_commit\s*=/i.test(args.sqlQuery);
+          const hasSetLocal = /^\s*SET\s+LOCAL\s+synchronous_commit\s*=/i.test(args.sqlQuery);
+          if (hasSessionSet && !hasSetLocal) {
+            violations.push(
+              'CONNECTION_POOL_BLEED: Query executes session-level "SET synchronous_commit", which will leak across borrowed connections in PgBouncer.'
+            );
+            recommendations.push(
+              'Always use "SET LOCAL synchronous_commit" inside an explicit transaction block (BEGIN ... COMMIT).'
+            );
+          }
+        }
+
+        const isCompliant = violations.length === 0;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              isCompliant,
+              synchronousCommit: syncVal,
+              violations,
+              recommendations,
+              status: isCompliant ? 'certified_durability_compliant' : 'durability_ladder_violations_detected',
+            }, null, 2),
+          }],
+        };
+      }
+    );
+  }
   ```
 
 

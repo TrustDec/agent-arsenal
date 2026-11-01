@@ -9784,3 +9784,55 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **Synchronous Commit & Durability Ladder Invariants (`jackc/pgx/v5`)**:
+  - ❌ **Anti-Pattern: Global Asynchronous Blind Meltdown & Unscoped Connection Bleed**:
+    - Disabling durability cluster-wide or issuing session-level `SET synchronous_commit = off`, which leaks across pooled connections in PgBouncer and causes financial records to evaporate on crash.
+    - Blindly using default `synchronous_commit = on` on high-throughput event logging, choking backend goroutines on 2ms NVMe fsync barriers and capping write performance.
+  - ✅ **Production Invariant**:
+    - Enforce **Transaction-Scoped Durability Ladder via `SET LOCAL`**: dynamically apply durability per transaction within explicit transaction blocks.
+    - Use `SET LOCAL synchronous_commit = off` for high-throughput batch telemetry and staging ingest, and `SET LOCAL synchronous_commit = on` (or `remote_apply`) for critical ledgers and auth tokens.
+  ```go
+  // INVARIANT: Differentiated durability pipeline in Go using jackc/pgx/v5.
+  // Critical financial mutations enforce Tier 3 synchronous standby persistence,
+  // while high-velocity telemetry writes bypass fsync via Tier 0 asynchronous commit.
+  type DurabilityTier string
+
+  const (
+    DurabilityAsync       DurabilityTier = "off"
+    DurabilityLocal       DurabilityTier = "local"
+    DurabilitySyncStandby DurabilityTier = "on"
+    DurabilityRemoteApply DurabilityTier = "remote_apply"
+  )
+
+  func (r *LedgerRepository) ExecuteWithDurability(
+    ctx context.Context,
+    tier DurabilityTier,
+    timeout time.Duration,
+    fn func(tx pgx.Tx) error,
+  ) error {
+    txCtx, cancel := context.WithTimeout(ctx, timeout)
+    defer cancel()
+
+    tx, err := r.Pool.Begin(txCtx)
+    if err != nil {
+      return fmt.Errorf("begin transaction: %w", err)
+    }
+    defer tx.Rollback(context.WithoutCancel(txCtx))
+
+    // INVARIANT: Scoped SET LOCAL guarantees no session bleed into connection pool
+    setQuery := fmt.Sprintf("SET LOCAL synchronous_commit = '%s'", tier)
+    if _, err := tx.Exec(txCtx, setQuery); err != nil {
+      return fmt.Errorf("set synchronous_commit (%s): %w", tier, err)
+    }
+
+    if err := fn(tx); err != nil {
+      return err
+    }
+
+    if err := tx.Commit(txCtx); err != nil {
+      return fmt.Errorf("commit with durability %s: %w", tier, err)
+    }
+    return nil
+  }
+  ```
+

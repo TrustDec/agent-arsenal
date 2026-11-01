@@ -4023,6 +4023,24 @@ alwaysApply: false
     - Enforce **Native Row-Level Security (RLS) First**: implement row isolation policies directly on base relations using PostgreSQL RLS (`ENABLE ROW LEVEL SECURITY`), reserving security views for column masking and presentation transforms.
     - Enforce **Superuser Leakproof Auditing**: mandate superuser audit certification for any custom function tagged `LEAKPROOF`, ensuring zero side-channel error emissions or external I/O leaks.
 
+- **Synchronous Commit, Replication Quorum Durability Ladders & Group Commit (PostgreSQL)**:
+  - ❌ **Anti-Pattern: Global Asynchronous Blind Meltdowns & Fsync Bottlenecks**:
+    - Disabling durability globally via `ALTER SYSTEM SET synchronous_commit = 'off'`, creating an unrecoverable data loss window ($\approx 35\text{ms}$) where committed financial transactions vanish upon hardware crash or cause split-brain failover disasters.
+    - Defaulting to `synchronous_commit = on` on high-frequency event streaming, log ingestion, or telemetry workloads, forcing an operating system `fsync()` storage barrier on every commit that caps write throughput at 300 TPS and exhausts NVMe IOPS queues.
+    - Configuring synchronous replication using fragile priority matching (`synchronous_standby_names = 'FIRST 1 (node1)'`), causing all database writes to stall indefinitely in `WaitEvent: SyncRep` when node1 suffers transient network jitter or replay lag.
+    - Querying read replicas immediately after write acknowledgments under `synchronous_commit = on`, causing read-after-write anomalies because the standby has flushed the WAL record to disk but has not yet replayed it into its buffer cache.
+    - Executing session-level `SET synchronous_commit = 'off'` without transaction scoping, causing relaxed durability to bleed into subsequent pooled connections in PgBouncer.
+  - ✅ **Production Invariant**:
+    - Enforce **5-Tier Differentiated Durability**: maintain global `synchronous_commit = on` (or `local`), and dynamically apply `SET LOCAL synchronous_commit` per transaction based on criticality:
+      - `off`: for high-throughput batch ingest, logs, telemetry, and unlogged staging tables (bypassing fsync, 10x–50x throughput gain, $\le 35\text{ms}$ bounded crash loss).
+      - `local`: for single-node crash durability without waiting for replication networks.
+      - `remote_write`: for low-latency distributed durability (waits for standby OS cache write).
+      - `on`: for double-entry financial ledgers, auth tokens, and idempotency key locks across synchronous standbys.
+      - `remote_apply`: for linearizable read-after-write consistency across read replicas.
+    - Enforce **Standby Quorum Matching**: always configure quorum replication (`synchronous_standby_names = 'ANY M (node1, node2, node3)'`) with statement timeout ladders to eliminate cluster paralysis.
+    - Enforce **Group Commit Tuning**: on high-concurrency systems, configure `commit_delay = 20-50` and `commit_siblings >= 5` to coalesce hundreds of concurrent transaction commits into single physical storage flush barriers.
+    - Enforce **Transaction-Scoped SET LOCAL**: always execute durability overrides using `SET LOCAL synchronous_commit` inside explicit `BEGIN ... COMMIT` blocks to prevent connection pool contamination.
+
 
 
 

@@ -6973,6 +6973,55 @@ In SvelteKit administrative consoles and system diagnostics:
   };
   ```
 
+- **SvelteKit Server Actions & Differentiated Durability Invariants (+page.server.ts)**:
+  - ❌ **Anti-Pattern: Fsync Write Stalls & Session Leaks in Form Actions**:
+    - Executing un-scoped `SET synchronous_commit = off` in server actions, corrupting pooled database connections.
+    - Defaulting to `synchronous_commit = on` on bulk import actions, stalling users on multi-second page loads.
+  - ✅ **Production Invariant**:
+    - Wrap database operations in explicit transactions specifying `SET LOCAL synchronous_commit` matched to data criticality.
+  ```typescript
+  // src/routes/checkout/+page.server.ts
+  import type { Actions } from './$types';
+  import { db } from '$lib/server/db';
+  import { fail } from '@sveltejs/kit';
+  import { sql } from 'kysely';
+
+  export const actions: Actions = {
+    completePayment: async ({ request, locals }) => {
+      const data = await request.formData();
+      const orderId = data.get('orderId') as string;
+      const amountCents = Number(data.get('amountCents'));
+
+      if (!orderId || isNaN(amountCents)) {
+        return fail(400, { message: 'Invalid payment parameters' });
+      }
+
+      try {
+        // INVARIANT: Tier 4 remote_apply ensures read replicas immediately reflect
+        // the paid order status upon redirection to the order confirmation view.
+        await db.transaction().execute(async (tx) => {
+          await sql`SET LOCAL synchronous_commit = 'remote_apply'`.execute(tx);
+          await sql`SET LOCAL statement_timeout = '4000'`.execute(tx);
+
+          await tx
+            .updateTable('orders')
+            .set({
+              status: 'PAID',
+              amount_paid_cents: amountCents,
+              updated_at: new Date(),
+            })
+            .where('id', '=', orderId)
+            .execute();
+        });
+
+        return { success: true };
+      } catch (err: any) {
+        return fail(500, { message: 'Payment processing failed: ' + err.message });
+      }
+    },
+  };
+  ```
+
 
 
 
