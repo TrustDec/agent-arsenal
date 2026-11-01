@@ -7069,6 +7069,85 @@ In SvelteKit administrative consoles and system diagnostics:
   };
   ```
 
+- **Database Concurrent Index & Invalid Zombie Index Telemetry Card (`+page.server.ts`)**:
+  - ❌ **Anti-Pattern: Executing Synchronous DROP or Unmonitored Reindexes in Server Actions**:
+    - Triggering raw `DROP INDEX` from admin UI, holding `ACCESS EXCLUSIVE` table locks and freezing user-facing requests.
+    - Ignoring invalid zombie indexes (`indisvalid = false`) that waste IOPS on every write mutation.
+  - ✅ **Production Invariant**:
+    - Audit `pg_index` for `indisvalid = false` and abandoned `_ccnew` / `_ccold` relations.
+    - Expose live `pg_stat_progress_create_index` phases and provide safe `DROP INDEX CONCURRENTLY` actions.
+  ```typescript
+  // src/routes/admin/indexes/+page.server.ts
+  import type { PageServerLoad, Actions } from './$types';
+  import { fail } from '@sveltejs/kit';
+  import { primaryDb } from '$lib/server/db';
+  import { sql } from 'kysely';
+
+  export const load: PageServerLoad = async () => {
+    // Audit invalid indexes across production schemas
+    const invalidIndexes = await sql<{
+      tableName: string;
+      indexName: string;
+      indisready: boolean;
+      sizeBytes: number;
+    }>`
+      SELECT 
+        t.relname AS "tableName",
+        c.relname AS "indexName",
+        i.indisready,
+        pg_relation_size(c.oid) AS "sizeBytes"
+      FROM pg_index i
+      JOIN pg_class c ON c.oid = i.indexrelid
+      JOIN pg_class t ON t.oid = i.indrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE i.indisvalid = false
+        AND n.nspname NOT IN ('pg_catalog', 'information_schema');
+    `.execute(primaryDb);
+
+    // Query active concurrent index build progress
+    const activeBuilds = await sql<{
+      phase: string;
+      blocksDone: number;
+      blocksTotal: number;
+      indexName: string;
+    }>`
+      SELECT 
+        p.phase,
+        p.blocks_done AS "blocksDone",
+        p.blocks_total AS "blocksTotal",
+        c.relname AS "indexName"
+      FROM pg_stat_progress_create_index p
+      JOIN pg_class c ON c.oid = p.index_relid;
+    `.execute(primaryDb);
+
+    return {
+      invalidIndexes: invalidIndexes.rows,
+      activeBuilds: activeBuilds.rows,
+    };
+  };
+
+  export const actions: Actions = {
+    dropInvalidIndexConcurrently: async ({ request }) => {
+      const data = await request.formData();
+      const indexName = data.get('indexName')?.toString();
+
+      if (!indexName || !/^[a-zA-Z0-9_]+$/.test(indexName)) {
+        return fail(400, { message: 'Invalid index name' });
+      }
+
+      try {
+        // INVARIANT: Always drop concurrently with lock timeout
+        await sql`SET lock_timeout = '3000ms'`.execute(primaryDb);
+        await sql`DROP INDEX CONCURRENTLY IF EXISTS ${sql.raw(`"${indexName}"`)}`.execute(primaryDb);
+        return { success: true, dropped: indexName };
+      } catch (err: any) {
+        return fail(500, { message: 'Concurrent drop failed: ' + err.message });
+      }
+    },
+  };
+  ```
+
+
 
 
 

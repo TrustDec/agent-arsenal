@@ -4048,6 +4048,15 @@ alwaysApply: false
       - Enforce **Zero-Catalog-Churn Pre-Created Unlogged Tables**: pre-create permanent `UNLOGGED` tables with composite keys `(batch_id UUID, row_index)` or hash/range partitions instead of dynamic `CREATE TEMP TABLE`.
       - Enforce **Aggressive Autovacuum & Atomic TRUNCATE**: configure `autovacuum_vacuum_scale_factor = 0.01` and `autovacuum_vacuum_threshold = 100` on unlogged tables, and use `TRUNCATE` (or partition drops) rather than monolithic `DELETE` for batch lifecycle purges.
       - Enforce **Logical Decoupling**: never declare cross-boundary `FOREIGN KEY` constraints between unlogged and logged relations; enforce referential integrity logically in application code via batch IDs.
+  - **Concurrent Index Builds, Invalid Index Recovery & Online Reindexing Swapping Invariants**:
+    - ❌ **Anti-Pattern**: Wrapping `CREATE INDEX CONCURRENTLY` (CIC) inside migration transaction blocks (`BEGIN ... COMMIT`), causing fatal `SQLSTATE 25001` crashes and leading developers to drop `CONCURRENTLY` and lock tables with `SHARE` locks. Leaving aborted builds with `indisvalid = false` but `indisready = true`, forcing every `INSERT`, `UPDATE`, and `DELETE` to continuously write to an index that the query planner can NEVER use for reads. Dropping invalid indexes with raw `DROP INDEX` without `CONCURRENTLY` (which acquires table-wide `ACCESS EXCLUSIVE` locks). Running `REINDEX CONCURRENTLY` without cleaning aborted `<index>_ccnew` or `<index>_ccold` shadow indexes (`SQLSTATE 42P07`). Adding unique constraints directly via `ALTER TABLE ... ADD CONSTRAINT UNIQUE` on multi-million row tables.
+    - ✅ **Production Invariant**:
+      - Enforce **Non-Transactional Runner Decoupling**: configure migration runners (Liquibase `runInTransaction="false"`, Flyway, golang-migrate, Drizzle, Prisma) to execute concurrent index creation outside transactional wrappers.
+      - Enforce **Zero-Invalid-Index Invariant**: continuously audit schemas for `indisvalid = false` via `SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE i.indisvalid = false;` and remediate exclusively using `DROP INDEX CONCURRENTLY IF EXISTS`.
+      - Enforce **Shadow Index Cleaning Before Reindexing**: inspect and drop any lingering `%_ccnew` or `%_ccold` indexes left by interrupted `REINDEX CONCURRENTLY` before retrying maintenance.
+      - Enforce **Multi-Phase Timeout Fencing**: always set `SET lock_timeout = '3000ms'` and `SET statement_timeout = '0'` prior to concurrent index builds to eliminate `WaitForOlderSnapshots` lock convoys while avoiding premature statement timeouts.
+      - Enforce **2-Step Decoupled Unique Constraints**: on large tables, always build `CREATE UNIQUE INDEX CONCURRENTLY <name>_idx ON <table> (<cols>)` first, followed by `ALTER TABLE <table> ADD CONSTRAINT <name> UNIQUE USING INDEX <name>_idx` for instant sub-millisecond promotion.
+
 
 
 

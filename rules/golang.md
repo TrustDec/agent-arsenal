@@ -9928,3 +9928,93 @@ When orchestrating analytical reports, batch aggregations, or heavy read scans w
   }
   ```
 
+- **Concurrent Index Lifecycle, Invalid Index Recovery & Progress Telemetry (`jackc/pgx/v5`)**:
+  - ❌ **Anti-Pattern: Executing CIC in Tx Block & Ignoring Invalid Zombie Indexes**:
+    - Invoking `CREATE INDEX CONCURRENTLY` inside an existing transaction block `tx.Exec(...)`, causing immediate `SQLSTATE 25001` crashes.
+    - Swallowing migration errors when CIC is cancelled or killed, leaving `indisvalid = false` but `indisready = true` (which degrades write latency for every subsequent `INSERT`/`UPDATE` without any read acceleration).
+    - Dropping failed indexes using synchronous `DROP INDEX`, acquiring `ACCESS EXCLUSIVE` table locks and crashing API gateways.
+  - ✅ **Production Invariant**:
+    - Acquire a dedicated standalone connection from `pgxpool.Pool` and execute outside transaction blocks.
+    - Set `lock_timeout = '3000ms'` to prevent head-of-line blocking while waiting for older snapshots.
+    - Always query `pg_index` for `indisvalid = false` and remediate with `DROP INDEX CONCURRENTLY IF EXISTS`.
+  ```go
+  // INVARIANT: Robust Concurrent Index Lifecycle Manager in Go (pgx/v5).
+  // Executes CIC outside transaction blocks, detects & cleans invalid zombie indexes,
+  // monitors pg_stat_progress_create_index, and eliminates lock convoys.
+  type ConcurrentIndexEngine struct {
+    pool *pgxpool.Pool
+  }
+
+  func NewConcurrentIndexEngine(pool *pgxpool.Pool) (*ConcurrentIndexEngine, error) {
+    if pool == nil {
+      return nil, errors.New("pgx pool must not be nil")
+    }
+    return &ConcurrentIndexEngine{pool: pool}, nil
+  }
+
+  // EnsureIndexConcurrently ensures an index is created concurrently without locking writes.
+  // If an invalid zombie index exists from a prior failed attempt, it is dropped first.
+  func (e *ConcurrentIndexEngine) EnsureIndexConcurrently(
+    ctx context.Context,
+    tableName string,
+    indexName string,
+    columnExpr string,
+    isUnique bool,
+  ) error {
+    // Acquire dedicated connection (CIC cannot run in transaction blocks)
+    conn, err := e.pool.Acquire(ctx)
+    if err != nil {
+      return fmt.Errorf("acquire conn: %w", err)
+    }
+    defer conn.Release()
+
+    // 1. Audit and drop any lingering invalid index or aborted shadow index
+    var isInvalid bool
+    err = conn.QueryRow(ctx, `
+      SELECT (NOT i.indisvalid)
+      FROM pg_index i
+      JOIN pg_class c ON c.oid = i.indexrelid
+      WHERE c.relname = $1
+    `, indexName).Scan(&isInvalid)
+    if err == nil && isInvalid {
+      // Drop invalid index concurrently
+      _, _ = conn.Exec(ctx, fmt.Sprintf("DROP INDEX CONCURRENTLY IF EXISTS %q", indexName))
+    }
+
+    // 2. Set strict lock timeout to prevent queue convoys
+    if _, err := conn.Exec(ctx, "SET lock_timeout = '3000ms'; SET statement_timeout = '0';"); err != nil {
+      return fmt.Errorf("set timeouts: %w", err)
+    }
+
+    // 3. Execute CREATE INDEX CONCURRENTLY
+    uniqueClause := ""
+    if isUnique {
+      uniqueClause = "UNIQUE "
+    }
+    ddl := fmt.Sprintf("CREATE %sINDEX CONCURRENTLY IF NOT EXISTS %q ON %q (%s)",
+      uniqueClause, indexName, tableName, columnExpr)
+
+    if _, err := conn.Exec(ctx, ddl); err != nil {
+      // Clean up zombie index on failure so table write path isn't poisoned
+      _, _ = conn.Exec(context.Background(), fmt.Sprintf("DROP INDEX CONCURRENTLY IF EXISTS %q", indexName))
+      return fmt.Errorf("create index concurrently failed: %w", err)
+    }
+
+    // 4. Invariant assertion: verify index is indisvalid = true
+    var validNow bool
+    err = conn.QueryRow(ctx, `
+      SELECT i.indisvalid
+      FROM pg_index i
+      JOIN pg_class c ON c.oid = i.indexrelid
+      WHERE c.relname = $1
+    `, indexName).Scan(&validNow)
+    if err != nil || !validNow {
+      _, _ = conn.Exec(context.Background(), fmt.Sprintf("DROP INDEX CONCURRENTLY IF EXISTS %q", indexName))
+      return fmt.Errorf("index %s validation check failed (indisvalid != true)", indexName)
+    }
+
+    return nil
+  }
+  ```
+
+

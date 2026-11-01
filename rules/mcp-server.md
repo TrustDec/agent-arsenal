@@ -7627,6 +7627,89 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         };
       }
     );
+
+    // Tool: audit_concurrent_index_and_invalid_state
+    server.tool(
+      'audit_concurrent_index_and_invalid_state',
+      'Audits PostgreSQL CREATE/DROP/REINDEX INDEX DDL, migration files, and runtime catalog states for invalid zombie indexes (indisvalid = false), transaction block wrapping (SQLSTATE 25001), orphaned _ccnew/_ccold shadow indexes, and lock convoy hazards.',
+      {
+        ddlOrMigration: z.string().describe('The SQL DDL or migration file content to audit'),
+        isWrappedInTransaction: z.boolean().optional().default(false).describe('Whether the migration runner executes this DDL within a BEGIN ... COMMIT block'),
+        targetTableRows: z.number().optional().default(0).describe('Estimated row count of the target relation'),
+      },
+      async (args) => {
+        const violations: string[] = [];
+        const recommendations: string[] = [];
+
+        const sql = args.ddlOrMigration.trim();
+
+        // Check 1: CREATE INDEX CONCURRENTLY inside transaction block
+        const isConcurrentBuild = /CREATE\s+(UNIQUE\s+)?INDEX\s+CONCURRENTLY/i.test(sql) || /REINDEX\s+.*CONCURRENTLY/i.test(sql);
+        if (isConcurrentBuild && args.isWrappedInTransaction) {
+          violations.push(
+            'TRANSACTIONAL_CIC_PROHIBITION: Attempting to run CREATE/REINDEX INDEX CONCURRENTLY inside a transaction block. PostgreSQL will immediately fail with SQLSTATE 25001.'
+          );
+          recommendations.push(
+            'Configure your migration framework (Flyway, Liquibase runInTransaction="false", Drizzle, Prisma) to execute this statement non-transactionally.'
+          );
+        }
+
+        // Check 2: Non-concurrent index creation on large tables
+        const isNonConcurrentBuild = /CREATE\s+(UNIQUE\s+)?INDEX\s+(?!CONCURRENTLY)[a-zA-Z0-9_]+\s+ON/i.test(sql);
+        if (isNonConcurrentBuild && args.targetTableRows > 100_000) {
+          violations.push(
+            `BLOCKING_INDEX_BUILD_LOCKOUT: Creating index synchronously on table with ${args.targetTableRows.toLocaleString()} rows. Acquires SHARE lock and blocks all production writes until completion.`
+          );
+          recommendations.push(
+            'Change to "CREATE INDEX CONCURRENTLY" and execute outside transaction blocks.'
+          );
+        }
+
+        // Check 3: Raw DROP INDEX without CONCURRENTLY
+        if (/DROP\s+INDEX\s+(?!CONCURRENTLY)[a-zA-Z0-9_."]+/i.test(sql)) {
+          violations.push(
+            'ACCESS_EXCLUSIVE_DROP_INDEX: Found raw "DROP INDEX". Synchronous drop acquires ACCESS EXCLUSIVE table lock, blocking concurrent reads and writes.'
+          );
+          recommendations.push(
+            'Use "DROP INDEX CONCURRENTLY IF EXISTS <name>" with SET lock_timeout = "3000ms".'
+          );
+        }
+
+        // Check 4: Missing lock_timeout fencing
+        if (isConcurrentBuild && !/lock_timeout/i.test(sql)) {
+          violations.push(
+            'MISSING_LOCK_TIMEOUT_FENCE: Concurrent index builds must be protected with explicit "SET lock_timeout = 3000ms" to eliminate head-of-line lock convoys.'
+          );
+          recommendations.push(
+            'Prepend "SET lock_timeout = \'3000ms\';" and "SET statement_timeout = \'0\';" before initiating CIC.'
+          );
+        }
+
+        // Check 5: Direct ADD CONSTRAINT UNIQUE on large tables
+        if (/ALTER\s+TABLE\s+.*ADD\s+CONSTRAINT\s+.*UNIQUE\s*\(/i.test(sql) && args.targetTableRows > 100_000) {
+          violations.push(
+            'SYNCHRONOUS_UNIQUE_CONSTRAINT_LOCKOUT: Adding UNIQUE constraint directly via ALTER TABLE performs a synchronous table scan under ACCESS EXCLUSIVE.'
+          );
+          recommendations.push(
+            'Decouple into two steps: 1. CREATE UNIQUE INDEX CONCURRENTLY, 2. ALTER TABLE ... ADD CONSTRAINT ... UNIQUE USING INDEX.'
+          );
+        }
+
+        const isCompliant = violations.length === 0;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              isCompliant,
+              violations,
+              recommendations,
+              status: isCompliant ? 'certified_concurrent_index_compliant' : 'concurrent_index_violations_detected',
+            }, null, 2),
+          }],
+        };
+      }
+    );
   }
   ```
 

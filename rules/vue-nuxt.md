@@ -6367,6 +6367,59 @@ When building administrative, DevOps, or system health portals in Nuxt 3:
   });
   ```
 
+- **Concurrent Index Audit & Safe Remediation Route Invariants (Nuxt 3 / Nitro)**:
+  - ❌ **Anti-Pattern: Synchronous Reindexing & Unindexed Constraint Addition in Nitro**:
+    - Triggering `REINDEX TABLE` or synchronous `ALTER TABLE ADD CONSTRAINT UNIQUE` directly from API routes, causing connection pool exhaustion and 504 timeouts.
+    - Neglecting orphaned `_ccnew` / `_ccold` indexes left behind by failed reindexes.
+  - ✅ **Production Invariant**:
+    - Query `pg_index` for `indisvalid = false` to surface invalid zombie indexes.
+    - Remediate invalid indexes exclusively via `DROP INDEX CONCURRENTLY IF EXISTS` with bounded `lock_timeout`.
+  ```typescript
+  // server/api/admin/indexes/remediate-invalid.post.ts
+  import { primaryDb } from '~/server/utils/db';
+  import { sql } from 'kysely';
+
+  export default defineEventHandler(async (event) => {
+    const { indexName } = await readBody<{ indexName: string }>(event);
+
+    if (!indexName || !/^[a-zA-Z0-9_]+$/.test(indexName)) {
+      throw createError({ statusCode: 400, message: 'Invalid or missing index name' });
+    }
+
+    // Step 1: Verify the target index is actually invalid or an orphaned shadow index
+    const check = await sql<{ indisvalid: boolean; relname: string }>`
+      SELECT i.indisvalid, c.relname
+      FROM pg_index i
+      JOIN pg_class c ON c.oid = i.indexrelid
+      WHERE c.relname = ${indexName};
+    `.execute(primaryDb);
+
+    if (check.rows.length === 0) {
+      throw createError({ statusCode: 404, message: 'Index not found' });
+    }
+
+    if (check.rows[0].indisvalid === true && !indexName.includes('_ccnew') && !indexName.includes('_ccold')) {
+      throw createError({
+        statusCode: 400,
+        message: 'Index is valid and healthy. Refusing to drop valid production index.',
+      });
+    }
+
+    // Step 2: Safely drop invalid index concurrently with bounded lock timeout
+    try {
+      await sql`SET lock_timeout = '3000ms'`.execute(primaryDb);
+      await sql`DROP INDEX CONCURRENTLY IF EXISTS ${sql.raw(`"${indexName}"`)}`.execute(primaryDb);
+      return { success: true, remediatedIndex: indexName };
+    } catch (err: any) {
+      throw createError({
+        statusCode: 500,
+        message: `Failed dropping invalid index concurrently: ${err.message}`,
+      });
+    }
+  });
+  ```
+
+
 
 
 
