@@ -7626,6 +7626,118 @@ In SvelteKit 2 administrative consoles, displaying dynamic lock dependency trees
 </div>
 ```
 
+### Svelte 5 Runes & Streaming SSR Load Discipline for Database Continuous WAL Archiving Telemetry
+
+In SvelteKit 2 administrative consoles, displaying real-time WAL archiver health, unarchived `.ready` file backlogs, and dynamic time-to-exhaustion projections requires high UI fidelity and fine-grained reactivity using Svelte 5 Runes (`$state`, `$derived`):
+
+1. **Component-Scoped Reactive Runes**: Track metrics via `$state` without leaking global references.
+2. **Derived Health & Urgency Badges**: Compute urgency level ('healthy', 'warning', 'emergency') and time-to-exhaustion thresholds cleanly via `$derived`.
+3. **Dynamic Headroom Visualizer**: Render a proportional disk headroom capacity gauge with accessible ARIA labeling.
+
+```svelte
+<!-- src/routes/admin/wal-archiver/+page.svelte -->
+<script lang="ts">
+  import type { PageData } from './$types';
+
+  interface ArchiverMetrics {
+    archivedCount: number;
+    failedCount: number;
+    lastArchivedWal: string | null;
+    lastFailedWal: string | null;
+    lastFailedTime: string | null;
+    readyCount: number;
+    currentLsn: string;
+    diskFreeBytes: number;
+    diskTotalBytes: number;
+    estimatedWalRateMBps: number;
+  }
+
+  let { data }: { data: PageData } = $props();
+
+  let metrics = $state<ArchiverMetrics>(data.archiverMetrics);
+
+  // Derived: Time to disk exhaustion in minutes
+  let timeToExhaustionMinutes = $derived(() => {
+    if (metrics.readyCount === 0 || metrics.estimatedWalRateMBps <= 0) return null;
+    const freeMB = metrics.diskFreeBytes / (1024 * 1024);
+    return Math.floor(freeMB / metrics.estimatedWalRateMBps / 60);
+  });
+
+  // Derived: Headroom percentage
+  let diskUsedPercent = $derived(() => {
+    if (metrics.diskTotalBytes === 0) return 0;
+    return Math.round(((metrics.diskTotalBytes - metrics.diskFreeBytes) / metrics.diskTotalBytes) * 100);
+  });
+
+  // Derived: Health status
+  let healthLevel = $derived(() => {
+    if (metrics.readyCount >= 50 || (timeToExhaustionMinutes() !== null && timeToExhaustionMinutes()! < 30)) {
+      return 'emergency';
+    }
+    if (metrics.readyCount >= 10 || metrics.failedCount > 0) {
+      return 'warning';
+    }
+    return 'optimal';
+  });
+</script>
+
+<div class="space-y-6 max-w-5xl mx-auto p-6">
+  <div class="flex items-center justify-between border-b pb-4">
+    <div>
+      <h1 class="text-2xl font-bold tracking-tight">PostgreSQL Continuous WAL Archiver Telemetry</h1>
+      <p class="text-sm text-slate-500 font-mono mt-0.5">Current LSN: {metrics.currentLsn}</p>
+    </div>
+    <div class="flex items-center space-x-2">
+      <span class="inline-block w-3 h-3 rounded-full {healthLevel() === 'optimal' ? 'bg-emerald-500' : healthLevel() === 'warning' ? 'bg-amber-500 animate-pulse' : 'bg-rose-600 animate-ping'}"></span>
+      <span class="text-xs font-semibold uppercase tracking-wider font-mono">
+        {healthLevel() === 'optimal' ? 'Archiving Optimal' : healthLevel() === 'warning' ? 'Archiver Warning' : 'PANIC RISK: Exhaustion Imminent'}
+      </span>
+    </div>
+  </div>
+
+  <!-- Metric Overview Cards -->
+  <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+    <div class="bg-white border rounded-xl p-4 shadow-sm">
+      <span class="text-xs text-slate-500 uppercase font-semibold">Ready Backlog</span>
+      <p class="text-2xl font-bold font-mono mt-1 {metrics.readyCount > 10 ? 'text-amber-600' : 'text-slate-900'}">{metrics.readyCount} files</p>
+      <span class="text-xs text-slate-400">pg_wal/archive_status/*.ready</span>
+    </div>
+
+    <div class="bg-white border rounded-xl p-4 shadow-sm">
+      <span class="text-xs text-slate-500 uppercase font-semibold">Failed Archives</span>
+      <p class="text-2xl font-bold font-mono mt-1 {metrics.failedCount > 0 ? 'text-rose-600' : 'text-slate-900'}">{metrics.failedCount}</p>
+      <span class="text-xs text-slate-400">Lifetime pg_stat_archiver errors</span>
+    </div>
+
+    <div class="bg-white border rounded-xl p-4 shadow-sm">
+      <span class="text-xs text-slate-500 uppercase font-semibold">Disk Headroom</span>
+      <p class="text-2xl font-bold font-mono mt-1 text-slate-900">{(metrics.diskFreeBytes / (1024 * 1024 * 1024)).toFixed(1)} GB free</p>
+      <span class="text-xs text-slate-400">{diskUsedPercent()}% partition used</span>
+    </div>
+
+    <div class="bg-white border rounded-xl p-4 shadow-sm">
+      <span class="text-xs text-slate-500 uppercase font-semibold">Time to Exhaustion</span>
+      <p class="text-2xl font-bold font-mono mt-1 {timeToExhaustionMinutes() !== null && timeToExhaustionMinutes()! < 60 ? 'text-rose-600 font-extrabold' : 'text-slate-900'}">
+        {timeToExhaustionMinutes() !== null ? `~${timeToExhaustionMinutes()} mins` : 'Stable (> 24h)'}
+      </p>
+      <span class="text-xs text-slate-400">At {metrics.estimatedWalRateMBps.toFixed(1)} MB/s rate</span>
+    </div>
+  </div>
+
+  {#if healthLevel() !== 'optimal'}
+    <div class="p-4 rounded-xl border {healthLevel() === 'emergency' ? 'bg-rose-50 border-rose-200 text-rose-800' : 'bg-amber-50 border-amber-200 text-amber-800'}">
+      <h3 class="font-bold text-sm">Archiver Attention Required</h3>
+      <p class="text-xs mt-1">
+        {#if metrics.lastFailedWal}
+          Last failed WAL segment: <span class="font-mono font-semibold">{metrics.lastFailedWal}</span> at {metrics.lastFailedTime || 'recently'}.
+        {/if}
+        Check cloud backup storage credentials, S3 rate limiting, and ensure PostgreSQL checkpoints are not blocked.
+      </p>
+    </div>
+  {/if}
+</div>
+```
+
 
 
 

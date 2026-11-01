@@ -10846,6 +10846,236 @@ func (s *AutonomousLockConvoySentinel) InspectAndPreempt(ctx context.Context) (*
 }
 ```
 
+### Continuous WAL Archiving Sentinel, Backlog Telemetry & Dynamic Disk Headroom Fencing in Go
+
+In PostgreSQL architectures running continuous archiving (`archive_mode = on`), checkpoints can NEVER remove or recycle unarchived WAL segments (`XLogArchiveCheckDone()`). When `archive_command` fails due to network partitions, expired cloud IAM tokens, or storage rate limits, the single-threaded archiver daemon (`pgarch`) enters an infinite retry loop without skipping. Under high write load (50–200 MB/s), `pg_wal` rapidly consumes remaining disk capacity until PostgreSQL crashes with `PANIC: could not write to file "pg_wal/...": No space left on device`.
+
+Always enforce two critical invariants in Go persistence services:
+
+1. **Continuous `pg_stat_archiver` & Queue Backlog Telemetry**: Actively sample `failed_count`, `last_failed_time`, and pending `.ready` status files in `pg_wal/archive_status/`.
+2. **Dynamic Time-to-Exhaustion & Headroom Circuit Breaking**: Interrogate host filesystem free space on the WAL mount (`syscall.Statfs`), compute projected time to disk exhaustion ($T_{\text{exhaust}} = D_{\text{free}} / \text{Rate}_{\text{wal}}$), and dynamically signal write throttling before disk headroom breaches safety thresholds.
+
+```go
+package storage
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// ArchiverTelemetry captures real-time continuous archiving health.
+type ArchiverTelemetry struct {
+	ArchivedCount    int64
+	LastArchivedWal  sql.NullString
+	LastArchivedTime sql.NullTime
+	FailedCount      int64
+	LastFailedWal    sql.NullString
+	LastFailedTime   sql.NullTime
+	CurrentWalLSN    string
+	ReadyFileCount   int64
+	DiskFreeBytes    uint64
+	DiskTotalBytes   uint64
+	SampledAt        time.Time
+}
+
+// ArchiverHealthVerdict represents the assessed operational risk.
+type ArchiverHealthVerdict struct {
+	IsHealthy               bool
+	Severity                string // "OK", "WARNING", "CRITICAL", "EMERGENCY"
+	ReadyBacklog            int64
+	RecentFailures          int64
+	TimeToExhaustionSeconds int64
+	ViolationDetails        []string
+	Recommendation          string
+}
+
+// WALArchiverSentinel periodically audits pg_stat_archiver and guards disk headroom.
+type WALArchiverSentinel struct {
+	pool             *pgxpool.Pool
+	walMountPath     string
+	maxAllowedReady  int64
+	minHeadroomBytes uint64
+	logger           *slog.Logger
+
+	mu           sync.Mutex
+	lastSample   *ArchiverTelemetry
+	throttleMode bool
+}
+
+// NewWALArchiverSentinel initializes a production archiver sentinel.
+func NewWALArchiverSentinel(
+	pool *pgxpool.Pool,
+	walMountPath string,
+	maxAllowedReady int64,
+	minHeadroomBytes uint64,
+	logger *slog.Logger,
+) *WALArchiverSentinel {
+	if maxAllowedReady <= 0 {
+		maxAllowedReady = 15
+	}
+	if minHeadroomBytes == 0 {
+		minHeadroomBytes = 15 * 1024 * 1024 * 1024 // 15 GB safety floor
+	}
+	return &WALArchiverSentinel{
+		pool:             pool,
+		walMountPath:     walMountPath,
+		maxAllowedReady:  maxAllowedReady,
+		minHeadroomBytes: minHeadroomBytes,
+		logger:           logger,
+	}
+}
+
+// CollectTelemetry queries PostgreSQL archiver catalog views and reads filesystem metrics.
+func (s *WALArchiverSentinel) CollectTelemetry(ctx context.Context) (*ArchiverTelemetry, error) {
+	query := `
+		SELECT
+			a.archived_count,
+			a.last_archived_wal,
+			a.last_archived_time,
+			a.failed_count,
+			a.last_failed_wal,
+			a.last_failed_time,
+			pg_current_wal_lsn()::text,
+			COALESCE((
+				SELECT count(*)
+				FROM pg_ls_archive_statusdir()
+				WHERE name LIKE '%.ready'
+			), 0) AS ready_count
+		FROM pg_stat_archiver a;
+	`
+
+	var t ArchiverTelemetry
+	t.SampledAt = time.Now()
+
+	err := s.pool.QueryRow(ctx, query).Scan(
+		&t.ArchivedCount,
+		&t.LastArchivedWal,
+		&t.LastArchivedTime,
+		&t.FailedCount,
+		&t.LastFailedWal,
+		&t.LastFailedTime,
+		&t.CurrentWalLSN,
+		&t.ReadyFileCount,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, errors.New("pg_stat_archiver returned no records; verify archive_mode != off")
+		}
+		return nil, fmt.Errorf("query pg_stat_archiver: %w", err)
+	}
+
+	// Inspect host filesystem disk space for the pg_wal mount
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(s.walMountPath, &stat); err == nil {
+		t.DiskFreeBytes = stat.Bavail * uint64(stat.Bsize)
+		t.DiskTotalBytes = stat.Blocks * uint64(stat.Bsize)
+	} else {
+		s.logger.WarnContext(ctx, "Failed to read statfs on WAL mount path", "path", s.walMountPath, "err", err)
+	}
+
+	return &t, nil
+}
+
+// Evaluate performs health analysis and evaluates dynamic time-to-exhaustion.
+func (s *WALArchiverSentinel) Evaluate(ctx context.Context) (*ArchiverHealthVerdict, error) {
+	current, err := s.CollectTelemetry(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	prev := s.lastSample
+	s.lastSample = current
+	s.mu.Unlock()
+
+	verdict := &ArchiverHealthVerdict{
+		IsHealthy:               true,
+		Severity:                "OK",
+		ReadyBacklog:            current.ReadyFileCount,
+		TimeToExhaustionSeconds: -1,
+	}
+
+	// 1. Audit Failure Counts in Window
+	if prev != nil {
+		verdict.RecentFailures = current.FailedCount - prev.FailedCount
+		if verdict.RecentFailures > 0 {
+			verdict.Severity = "WARNING"
+			verdict.IsHealthy = false
+			verdict.ViolationDetails = append(verdict.ViolationDetails,
+				fmt.Sprintf("Archiver experienced %d failures in last %v window. Last failed WAL: %s",
+					verdict.RecentFailures, current.SampledAt.Sub(prev.SampledAt), current.LastFailedWal.String))
+			verdict.Recommendation = "Inspect archive_command execution logs and destination storage credentials."
+		}
+	}
+
+	// 2. Audit Pending .ready Backlog
+	if current.ReadyFileCount >= s.maxAllowedReady {
+		verdict.Severity = "CRITICAL"
+		verdict.IsHealthy = false
+		verdict.ViolationDetails = append(verdict.ViolationDetails,
+			fmt.Sprintf("WAL Archiver backlog queue is elevated: %d .ready segments (threshold: %d)",
+				current.ReadyFileCount, s.maxAllowedReady))
+		verdict.Recommendation = "Verify archive destination throughput and migrate to C archive_library if using shell commands."
+	}
+
+	// 3. Dynamic Time-to-Exhaustion Calculus
+	if prev != nil && current.DiskFreeBytes > 0 {
+		deltaSec := current.SampledAt.Sub(prev.SampledAt).Seconds()
+		if deltaSec > 0 && current.ReadyFileCount > prev.ReadyFileCount {
+			newSegments := current.ReadyFileCount - prev.ReadyFileCount
+			bytesPerSec := float64(newSegments*16*1024*1024) / deltaSec
+
+			if bytesPerSec > 0 {
+				remainSec := int64(float64(current.DiskFreeBytes) / bytesPerSec)
+				verdict.TimeToExhaustionSeconds = remainSec
+
+				if remainSec < 1800 { // Under 30 minutes
+					verdict.Severity = "EMERGENCY"
+					verdict.IsHealthy = false
+					verdict.ViolationDetails = append(verdict.ViolationDetails,
+						fmt.Sprintf("IMMINENT DISK PANIC: Available disk (%d GB) will exhaust in %d seconds (%.1f mins) at %.2f MB/s accumulation",
+							current.DiskFreeBytes/(1024*1024*1024), remainSec, float64(remainSec)/60.0, bytesPerSec/(1024*1024)))
+					verdict.Recommendation = "EMERGENCY: Halt non-essential write ingestion immediately and expand disk volume."
+				}
+			}
+		}
+	}
+
+	// 4. Absolute Disk Headroom Floor Check
+	if current.DiskFreeBytes > 0 && current.DiskFreeBytes < s.minHeadroomBytes {
+		verdict.Severity = "EMERGENCY"
+		verdict.IsHealthy = false
+		verdict.ViolationDetails = append(verdict.ViolationDetails,
+			fmt.Sprintf("Free disk space (%d GB) breached safety headroom floor (%d GB)",
+				current.DiskFreeBytes/(1024*1024*1024), s.minHeadroomBytes/(1024*1024*1024)))
+		verdict.Recommendation = "Immediately attach additional storage or divert archiving to temporary overflow volume."
+	}
+
+	// Update internal throttling state
+	s.mu.Lock()
+	s.throttleMode = (verdict.Severity == "EMERGENCY" || verdict.Severity == "CRITICAL")
+	s.mu.Unlock()
+
+	return verdict, nil
+}
+
+// ShouldThrottleWriteTraffic returns true if application ingestion must pause or shed load.
+func (s *WALArchiverSentinel) ShouldThrottleWriteTraffic() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.throttleMode
+}
+```
+
 
 
 

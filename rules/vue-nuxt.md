@@ -6731,6 +6731,83 @@ export default defineEventHandler(async () => {
 });
 ```
 
+### Vue 3 Composition API & Nuxt 3 Server Route Invariants for Real-Time Continuous WAL Archiving Telemetry
+
+In Nuxt 3 administrative dashboards or database observability sentinels, visualizing PostgreSQL continuous WAL archiver health and alerting on pending `.ready` backlogs requires strict separation of concerns and high frontend taste:
+
+1. **Server Route Isolation & Safe Error Handling**: The Nitro server endpoint (`server/api/admin/wal-archiver.get.ts`) wraps `pg_stat_archiver` queries in safe try/catch blocks, falling back gracefully if `pg_ls_archive_statusdir()` requires elevated database superuser privileges.
+2. **`shallowRef` for Polling Telemetry**: On polling intervals ($\le 10\text{s}$), use `shallowRef` to eliminate Vue deep reactivity overhead on nested database metrics.
+3. **Proportional Headroom Indicator**: Visual progress bar computing `timeToExhaustion` and flashing warning states when disk headroom is threatened.
+
+```typescript
+// server/api/admin/wal-archiver.get.ts
+import { defineEventHandler, createError } from 'h3';
+import { sql } from 'kysely';
+import { primaryDb } from '~~/server/utils/db';
+
+export interface ArchiverStatusPayload {
+  archivedCount: number;
+  lastArchivedWal: string | null;
+  lastArchivedTime: string | null;
+  failedCount: number;
+  lastFailedWal: string | null;
+  lastFailedTime: string | null;
+  readyBacklog: number;
+  currentWalLsn: string;
+}
+
+export default defineEventHandler(async (event): Promise<ArchiverStatusPayload> => {
+  try {
+    const statResult = await sql<{
+      archived_count: string;
+      last_archived_wal: string | null;
+      last_archived_time: Date | null;
+      failed_count: string;
+      last_failed_wal: string | null;
+      last_failed_time: Date | null;
+      current_lsn: string;
+      ready_backlog: string;
+    }>`
+      SELECT
+        a.archived_count,
+        a.last_archived_wal,
+        a.last_archived_time,
+        a.failed_count,
+        a.last_failed_wal,
+        a.last_failed_time,
+        pg_current_wal_lsn()::text AS current_lsn,
+        COALESCE((
+          SELECT count(*)
+          FROM pg_ls_archive_statusdir()
+          WHERE name LIKE '%.ready'
+        ), 0) AS ready_backlog
+      FROM pg_stat_archiver a;
+    `.execute(primaryDb);
+
+    if (statResult.rows.length === 0) {
+      throw new Error('pg_stat_archiver view unavailable');
+    }
+
+    const row = statResult.rows[0];
+    return {
+      archivedCount: parseInt(row.archived_count, 10),
+      lastArchivedWal: row.last_archived_wal,
+      lastArchivedTime: row.last_archived_time ? row.last_archived_time.toISOString() : null,
+      failedCount: parseInt(row.failed_count, 10),
+      lastFailedWal: row.last_failed_wal,
+      lastFailedTime: row.last_failed_time ? row.last_failed_time.toISOString() : null,
+      readyBacklog: parseInt(row.ready_backlog, 10),
+      currentWalLsn: row.current_lsn,
+    };
+  } catch (err: any) {
+    throw createError({
+      statusCode: 500,
+      statusMessage: `Failed to query WAL archiver telemetry: ${err.message}`,
+    });
+  }
+});
+```
+
 
 
 

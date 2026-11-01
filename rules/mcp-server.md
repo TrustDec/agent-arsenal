@@ -8148,6 +8148,92 @@ SELECT ${col} FROM loose_index_scan WHERE ${col} IS NOT NULL;
         };
       }
     );
+
+    // Tool: PostgreSQL Continuous WAL Archiving & Disk Headroom Sentinel
+    this.server.tool(
+      'audit_wal_archiving_and_retention',
+      'Audits PostgreSQL continuous WAL archiving health, detects pending .ready file backlogs in pg_wal/archive_status, inspects pg_stat_archiver, and evaluates dynamic time-to-exhaustion against disk headroom safety thresholds.',
+      {
+        archivedCount: z.number().nonnegative().describe('Total number of WAL segments successfully archived'),
+        failedCount: z.number().nonnegative().describe('Total number of failed archival attempts'),
+        lastFailedTime: z.string().nullable().describe('ISO timestamp of the most recent archival failure'),
+        lastFailedWal: z.string().nullable().describe('Filename of the WAL segment that failed archiving'),
+        readyFilesCount: z.number().nonnegative().describe('Number of .ready status files currently pending in pg_wal/archive_status/'),
+        diskFreeBytes: z.number().nonnegative().describe('Available free bytes on partition hosting pg_wal'),
+        walGenerationRateMBps: z.number().nonnegative().describe('Estimated WAL generation rate in MB/s over last sampling window'),
+        archiveCommandIsShell: z.boolean().describe('True if using shell-based archive_command, false if using C archive_library'),
+        archiveTimeoutSeconds: z.number().nonnegative().describe('Value of archive_timeout setting in seconds (0 if disabled)'),
+      },
+      async (args) => {
+        const violations: string[] = [];
+        const recommendations: string[] = [];
+        let severity: 'OK' | 'WARNING' | 'CRITICAL' | 'EMERGENCY' = 'OK';
+
+        // Check 1: Pending Backlog Queue
+        if (args.readyFilesCount >= 50) {
+          severity = 'EMERGENCY';
+          violations.push(`CRITICAL ARCHIVER QUEUE OVERFLOW: ${args.readyFilesCount} WAL segments (.ready) queued. Archiving is completely stalled!`);
+          recommendations.push('Immediate action required: Check remote storage availability, S3 rate limits, network connectivity, and credentials.');
+        } else if (args.readyFilesCount >= 10) {
+          severity = 'WARNING';
+          violations.push(`ELEVATED WAL BACKLOG: ${args.readyFilesCount} segments queued (threshold: 10).`);
+          recommendations.push('Inspect archiver transfer latency and verify storage throughput.');
+        }
+
+        // Check 2: Recent Archival Failures
+        if (args.lastFailedTime) {
+          const failureAgeMs = Date.now() - new Date(args.lastFailedTime).getTime();
+          if (failureAgeMs < 180_000) { // Failed in last 3 minutes
+            if (severity === 'OK') severity = 'WARNING';
+            violations.push(`ACTIVE ARCHIVAL FAILURES: Most recent failure occurred ${(failureAgeMs / 1000).toFixed(0)}s ago on WAL segment ${args.lastFailedWal || 'unknown'}.`);
+            recommendations.push('Inspect PostgreSQL log for archive_command exit code and stderr output.');
+          }
+        }
+
+        // Check 3: Dynamic Time-to-Exhaustion Calculation
+        let timeToExhaustionSeconds: number | null = null;
+        if (args.readyFilesCount > 0 && args.walGenerationRateMBps > 0) {
+          const freeMB = args.diskFreeBytes / (1024 * 1024);
+          timeToExhaustionSeconds = Math.floor(freeMB / args.walGenerationRateMBps);
+
+          if (timeToExhaustionSeconds < 1800) { // Under 30 minutes
+            severity = 'EMERGENCY';
+            violations.push(`IMMINENT DISK EXHAUSTION: Disk will reach 100% capacity in ${(timeToExhaustionSeconds / 60).toFixed(1)} minutes at current WAL rate (${args.walGenerationRateMBps.toFixed(1)} MB/s)!`);
+            recommendations.push('EMERGENCY: Pause write-heavy bulk jobs, attach temporary storage volume, or configure archive_command to local staging disk to prevent engine PANIC shutdown.');
+          }
+        }
+
+        // Check 4: Shell archive_command vs C archive_library under High Write Rate
+        if (args.archiveCommandIsShell && args.walGenerationRateMBps > 50) {
+          violations.push('SHELL FORK/EXEC OVERHEAD: High write throughput (>50 MB/s) with shell-based archive_command risks Linux PID table exhaustion.');
+          recommendations.push('Migrate to PostgreSQL 15+ C archive_library (e.g. pgBackRest) to eradicate process fork/exec overhead.');
+        }
+
+        // Check 5: archive_timeout Zero-Padding Amplification Trap
+        if (args.archiveTimeoutSeconds > 0 && args.archiveTimeoutSeconds < 300 && args.walGenerationRateMBps < 0.1) {
+          violations.push(`ZERO-PADDING AMPLIFICATION: archive_timeout = ${args.archiveTimeoutSeconds}s on low-activity database forces 16MB zero-padding per interval, multiplying S3 PUT costs.`);
+          recommendations.push('Set archive_timeout = 0 (or >= 300s) and deploy pg_receivewal streaming replication for sub-minute RPO.');
+        }
+
+        const isCompliant = violations.length === 0;
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              isCompliant,
+              severity,
+              readyFilesCount: args.readyFilesCount,
+              failedCount: args.failedCount,
+              timeToExhaustionSeconds,
+              violations,
+              recommendations,
+              status: isCompliant ? 'certified_wal_archiving_optimal' : 'wal_archiving_remediation_required',
+            }, null, 2),
+          }],
+        };
+      }
+    );
   }
   ```
 
