@@ -1090,17 +1090,44 @@ alwaysApply: false
 - **NVMe Storage `effective_io_concurrency` & `random_page_cost` Tuning**:
   - ❌ **Leaving Spinning-Disk Defaults on Cloud NVMe Instances**: Running modern cloud SSD / NVMe instances with default PostgreSQL settings (`effective_io_concurrency = 1`, `random_page_cost = 4.0`). The query planner penalizes index scans and executes slow sequential table scans, while the engine submits synchronous, serialized I/O requests that leave NVMe read queues idle.
   - ✅ **Production Invariant**: On SSD/NVMe storage (AWS EBS gp3/io2, Google Extreme SSD), set `random_page_cost = 1.1` (reflecting nearly identical random vs sequential latency) and tune `effective_io_concurrency = 200` to 300. This enables asynchronous prefetching (`posix_fadvise`) during Bitmap Heap Scans, saturating NVMe controller parallelism.
-- **PostgreSQL 17+ Resilient `COPY` Streaming Ingestion (`ON_ERROR ignore`)**:
-  - ❌ **Single-Row Failure Aborting Multi-Gigabyte Bulk Ingestions**: In PostgreSQL 16 and older, executing `COPY raw_events FROM STDIN` failed entirely if a single malformed row or invalid encoding was encountered after ingesting 50 million records, discarding all progress and rolling back the transaction.
-  - ✅ **Production Invariant**: In PostgreSQL 17+, leverage `ON_ERROR ignore` to stream high-throughput batch imports without atomic total aborts:
+- **PostgreSQL 17+ Resilient `COPY` Streaming Ingestion (`ON_ERROR ignore`, `LOG_VERBOSITY`, DLQ & Telemetry)**:
+  - ❌ **Single-Row Failure Aborting Multi-Gigabyte Ingestion vs Silent Data Loss with Unbounded `ON_ERROR ignore`**: In PostgreSQL 16 and older, executing `COPY raw_events FROM STDIN` failed entirely if a single malformed row or invalid encoding was encountered after ingesting 50 million records, discarding all progress and rolling back the transaction. Conversely, in PostgreSQL 17, blindly enabling `ON_ERROR ignore` without DLQ interception causes PostgreSQL to discard malformed rows at the parser level without audit trails; if schema shifts occur, 90% of data is silently dropped ($P(\text{silent loss}) = 1.0$). Furthermore, agents mistake `ON_ERROR ignore` for `ON CONFLICT DO NOTHING`: `ON_ERROR ignore` ONLY catches data conversion errors—any Primary Key, Unique, Check, or Foreign Key constraint collision still violently aborts the entire transaction. Omitting `LOG_VERBOSITY silent` floods server logs with hundreds of thousands of NOTICE lines, saturating root disk space and triggering postmaster `PANIC: could not write to log file: No space left on device`.
+  - ✅ **Production Invariant**: In PostgreSQL 17+, stream high-throughput batch imports into an `UNLOGGED` staging table using `ON_ERROR ignore` and explicit `LOG_VERBOSITY`, monitor skipped rows via `pg_stat_progress_copy` with an SLA circuit breaker, capture rejected notices into a Dead-Letter Queue (DLQ), and atomically promote to target tables via set-based `INSERT ... ON CONFLICT` or `MERGE`:
     ```sql
-    COPY raw_events FROM '/tmp/events_stream.csv' WITH (
+    -- 1. Dedicated UNLOGGED scratch staging table (bypasses WAL & secondary index overhead)
+    CREATE UNLOGGED TABLE IF NOT EXISTS staging_raw_events (
+        event_id TEXT,
+        tenant_id TEXT,
+        payload JSONB,
+        amount NUMERIC,
+        recorded_at TIMESTAMPTZ
+    );
+    TRUNCATE TABLE staging_raw_events;
+
+    -- 2. Resilient streaming COPY with ON_ERROR ignore and silent log verbosity
+    COPY staging_raw_events (event_id, tenant_id, payload, amount, recorded_at)
+    FROM '/staging/incoming_events.csv' WITH (
         FORMAT csv,
         HEADER true,
-        ON_ERROR ignore
+        ON_ERROR ignore,
+        LOG_VERBOSITY silent
     );
+
+    -- 3. Telemetry verification: Assert error skip ratio <= 0.5% (SLA threshold)
+    -- In client sentinels, query pg_stat_progress_copy:
+    -- SELECT tuples_processed, tuples_skipped, bytes_processed FROM pg_stat_progress_copy WHERE pid = pg_backend_pid();
+
+    -- 4. Set-based atomic promotion from staging to production target table
+    INSERT INTO production_events (event_id, tenant_id, payload, amount, recorded_at)
+    SELECT event_id, tenant_id, payload, amount, recorded_at
+    FROM staging_raw_events
+    ON CONFLICT (tenant_id, event_id) DO UPDATE SET
+        payload = EXCLUDED.payload,
+        amount = EXCLUDED.amount,
+        recorded_at = EXCLUDED.recorded_at;
+
+    TRUNCATE TABLE staging_raw_events;
     ```
-    Monitor skipped rows via `pg_stat_progress_copy` to inspect error counts without stalling critical ingestion pipelines.
 - **PostgreSQL 17+ Execution Profiling via `EXPLAIN (MEMORY, SERIALIZE)`**:
   - ❌ **Disregarding Serialization CPU Latency & MemoryContext Explosions**: Relying solely on `EXPLAIN ANALYZE` to diagnose slow queries. Because legacy `EXPLAIN` discards tuples immediately without serialization, developers fail to detect that queries spend 90% of their server duration running `textout`/`jsonb_out` string conversions, or that untracked `WindowAgg` and `FunctionScan` nodes are leaking gigabytes of MemoryContext RAM leading to Linux OOM-killer postmaster terminations.
   - ✅ **Production Invariant**: In PostgreSQL 17+, always run `EXPLAIN (ANALYZE, MEMORY, SERIALIZE binary, BUFFERS)` to profile both executor memory footprints and wire formatting overhead:

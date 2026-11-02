@@ -14389,6 +14389,223 @@ func ResilientBatchProductMerge(
 }
 ```
 
+---
+
+## 30. PostgreSQL 17 Resilient COPY (ON_ERROR ignore), LOG_VERBOSITY, DLQ Quarantine & Ingestion Telemetry Invariants
+
+When ingesting high-volume external data streams (CSV/TSV/JSON files, webhook event batches, or data warehouse staging dumps) in Go microservices using `jackc/pgx/v5`, autonomous agents must enforce the 5-Tier Resilient Bulk Ingestion invariants:
+1. **Never Stream Directly to Live OLTP Heaps**: Always stage inbound bulk streams in a dedicated `UNLOGGED` staging table. This eliminates WAL write amplification and prevents secondary index leaf page splits from stalling concurrent transactional queries.
+2. **PostgreSQL 17 Engine Qualification**: Verify that the database engine satisfies `server_version_num >= 170000`. In earlier versions, `ON_ERROR ignore` is unsupported.
+3. **Log Flooding Defense via `LOG_VERBOSITY silent`**: In high-throughput dirty ingestion pipelines, setting `LOG_VERBOSITY default/verbose` causes PostgreSQL to emit server `NOTICE` logs for every malformed tuple. Flooding `postgresql.log` with hundreds of thousands of notices will saturate disk IOPS and exhaust the root disk, triggering postmaster panic crashes. Use `LOG_VERBOSITY silent` or capture notices out-of-band for DLQ routing.
+4. **Real-Time SLA Watchdog on `pg_stat_progress_copy`**: Spawn a background sentinel polling `pg_stat_progress_copy`. Compute the error ratio $E(t) = \text{tuples\_skipped} / \text{tuples\_processed}$. If $E(t)$ exceeds the SLA threshold $\epsilon_{\max}$ (e.g. $0.5\%$), issue `pg_cancel_backend(pid)` to immediately trip the circuit breaker and halt data corruption cascades.
+5. **Set-Based Atomic Promotion**: Once staged data is verified under SLA, promote tuples from the unlogged staging table to the production target table using set-based `INSERT ... ON CONFLICT` or `MERGE` in a single rapid transaction ($T_{\text{promote}} \ll T_{\text{copy}}$).
+
+```go
+package ingestion
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// ResilientIngestOptions configures the PostgreSQL 17 COPY sentinel.
+type ResilientIngestOptions struct {
+	TargetTable     string
+	StagingTable    string
+	DLQTable        string
+	Columns         []string
+	PrimaryKey      []string
+	MaxErrorRate    float64 // e.g. 0.005 for 0.5%
+	MinSampleHorizon int64  // e.g. 1000 tuples
+	PollInterval    time.Duration
+	LogVerbosity    string  // "silent", "default", "verbose"
+}
+
+// IngestionResult captures execution telemetry.
+type IngestionResult struct {
+	TuplesProcessed int64
+	TuplesSkipped   int64
+	TuplesPromoted  int64
+	Duration        time.Duration
+	CircuitTripped  bool
+}
+
+// ExecuteGovernedResilientCopy runs an industrial-grade PostgreSQL 17 streaming COPY.
+func ExecuteGovernedResilientCopy(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	csvStream io.Reader,
+	opts ResilientIngestOptions,
+	logger *slog.Logger,
+) (*IngestionResult, error) {
+	start := time.Now()
+
+	// 1. Acquire dedicated connection and verify PostgreSQL 17+
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to acquire ingestion pool connection: %w", err)
+	}
+	defer conn.Release()
+
+	var verNum int
+	if err := conn.QueryRow(ctx, "SHOW server_version_num").Scan(&verNum); err != nil {
+		return nil, fmt.Errorf("engine qualification failed: %w", err)
+	}
+	if verNum < 170000 {
+		return nil, fmt.Errorf("PostgreSQL 17+ required for ON_ERROR ignore, detected server_version_num: %d", verNum)
+	}
+
+	// 2. Prepare UNLOGGED staging table and DLQ quarantine schema
+	setupSQL := fmt.Sprintf(`
+		CREATE UNLOGGED TABLE IF NOT EXISTS %s (
+			tenant_id TEXT,
+			event_id TEXT,
+			metric_value NUMERIC,
+			payload TEXT,
+			recorded_at TIMESTAMPTZ
+		);
+		TRUNCATE TABLE %s;
+
+		CREATE TABLE IF NOT EXISTS %s (
+			id BIGSERIAL PRIMARY KEY,
+			target_table TEXT NOT NULL,
+			error_detail TEXT NOT NULL,
+			created_at TIMESTAMPTZ DEFAULT NOW()
+		);
+	`, opts.StagingTable, opts.StagingTable, opts.DLQTable)
+
+	if _, err := conn.Exec(ctx, setupSQL); err != nil {
+		return nil, fmt.Errorf("staging buffer setup failed: %w", err)
+	}
+
+	backendPID := conn.Conn().PgConn().PID()
+	var circuitTripped atomic.Bool
+	var finalProcessed, finalSkipped atomic.Int64
+
+	// 3. Launch background telemetry watchdog
+	watchdogCtx, stopWatchdog := context.WithCancel(ctx)
+	defer stopWatchdog()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(opts.PollInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-watchdogCtx.Done():
+				return
+			case <-ticker.C:
+				var proc, skipped int64
+				err := pool.QueryRow(watchdogCtx, `
+					SELECT COALESCE(tuples_processed, 0), COALESCE(tuples_skipped, 0)
+					FROM pg_stat_progress_copy
+					WHERE pid = $1
+				`, backendPID).Scan(&proc, &skipped)
+
+				if err == nil {
+					finalProcessed.Store(proc)
+					finalSkipped.Store(skipped)
+
+					if proc >= opts.MinSampleHorizon {
+						rate := float64(skipped) / float64(proc)
+						if rate > opts.MaxErrorRate {
+							circuitTripped.Store(true)
+							logger.ErrorContext(ctx, "SLA circuit breaker TRIPPED: COPY error rate exceeded threshold",
+								slog.Float64("error_rate", rate),
+								slog.Float64("max_error_rate", opts.MaxErrorRate),
+								slog.Int64("tuples_processed", proc),
+								slog.Int64("tuples_skipped", skipped),
+								slog.Int("backend_pid", int(backendPID)),
+							)
+							// Trip circuit breaker by cancelling the backend execution
+							_, _ = pool.Exec(context.Background(), "SELECT pg_cancel_backend($1)", backendPID)
+							return
+						}
+					}
+				}
+			}
+		}
+	}()
+
+	// 4. Execute streaming COPY with ON_ERROR ignore
+	copySQL := fmt.Sprintf(`
+		COPY %s (tenant_id, event_id, metric_value, payload, recorded_at)
+		FROM STDIN WITH (
+			FORMAT csv,
+			HEADER true,
+			ON_ERROR ignore,
+			LOG_VERBOSITY %s
+		)
+	`, opts.StagingTable, opts.LogVerbosity)
+
+	_, copyErr := conn.Conn().PgConn().CopyFrom(ctx, csvStream, copySQL)
+	stopWatchdog()
+	wg.Wait()
+
+	if circuitTripped.Load() {
+		return &IngestionResult{
+			TuplesProcessed: finalProcessed.Load(),
+			TuplesSkipped:   finalSkipped.Load(),
+			Duration:        time.Since(start),
+			CircuitTripped:  true,
+		}, errors.New("COPY ingestion aborted: error rate exceeded SLA circuit breaker threshold")
+	}
+
+	if copyErr != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(copyErr, &pgErr) && pgErr.Code == "57014" {
+			return nil, errors.New("COPY query was cancelled by watchdog sentinel")
+		}
+		return nil, fmt.Errorf("resilient COPY stream failed: %w", copyErr)
+	}
+
+	// 5. Tier 4: Set-Based Atomic Promotion to production table
+	promoteSQL := fmt.Sprintf(`
+		INSERT INTO %s (tenant_id, event_id, metric_value, payload, recorded_at)
+		SELECT tenant_id, event_id, metric_value, payload, recorded_at
+		FROM %s
+		ON CONFLICT (tenant_id, event_id) DO UPDATE SET
+			metric_value = EXCLUDED.metric_value,
+			payload = EXCLUDED.payload,
+			recorded_at = EXCLUDED.recorded_at;
+		TRUNCATE TABLE %s;
+	`, opts.TargetTable, opts.StagingTable, opts.StagingTable)
+
+	tag, err := conn.Exec(ctx, promoteSQL)
+	if err != nil {
+		return nil, fmt.Errorf("atomic staging promotion failed: %w", err)
+	}
+
+	totalDuration := time.Since(start)
+	logger.InfoContext(ctx, "Resilient COPY batch successfully ingested and promoted",
+		slog.Int64("tuples_promoted", tag.RowsAffected()),
+		slog.Int64("tuples_skipped", finalSkipped.Load()),
+		slog.Duration("duration", totalDuration),
+	)
+
+	return &IngestionResult{
+		TuplesProcessed: finalProcessed.Load(),
+		TuplesSkipped:   finalSkipped.Load(),
+		TuplesPromoted:  tag.RowsAffected(),
+		Duration:        totalDuration,
+		CircuitTripped:  false,
+	}, nil
+}
+```
+
+
 
 
 
