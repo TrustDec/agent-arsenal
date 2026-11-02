@@ -1028,6 +1028,33 @@ alwaysApply: false
     WHERE e.created_at >= NOW() - INTERVAL '1 day';
     ```
     Back all JSON path query filters (`JSON_EXISTS`) with dedicated `jsonb_path_ops` GIN indexes (`CREATE INDEX ON raw_order_events USING gin (payload jsonb_path_ops)`), and disallow sibling `NESTED PATH` combinations that trigger Cartesian cross-products.
+- **PostgreSQL 17+ `pg_createsubscriber` Physical Standby to Logical Subscriber Transition Invariants**:
+  - ❌ **The Active Running Target Standby Lockout & Premature Promotion Catastrophe**: Invoking `pg_createsubscriber` while the target physical standby is still running (`FATAL: target server is running`), or terminating it abruptly via `pg_ctl stop -m immediate`, which corrupts the standby's buffer cache and recovery state. Attempting to convert tables that lack a `PRIMARY KEY` or `REPLICA IDENTITY FULL` causes the subscriber's apply workers to crash in an infinite loop upon the first `UPDATE` or `DELETE` with `SQLSTATE 55000 (cannot update table because it does not have a replica identity)`, completely freezing logical replication cluster-wide.
+  - ✅ **Production Invariant**: In PostgreSQL 17+, convert physical streaming standbys into standalone logical subscribers using `pg_createsubscriber` with mandatory pre-flight audits. Cleanly shut down the standby with `pg_ctl stop -m fast`, audit 100% of tables for Primary Keys or `REPLICA IDENTITY FULL`, ensure zero uncommitted two-phase transactions in `pg_prepared_xacts`, verify `wal_level = logical` and `max_slot_wal_keep_size` on publisher, and execute `--dry-run` verification before live cutover:
+    ```sql
+    -- Step 1: Pre-flight audit on Publisher:
+    -- Verify wal_level is logical:
+    SHOW wal_level; -- Must return 'logical'
+
+    -- Fence publisher disk space against stalled cutover slots:
+    ALTER SYSTEM SET max_slot_wal_keep_size = '50GB';
+    SELECT pg_reload_conf();
+
+    -- Audit tables lacking Primary Key or REPLICA IDENTITY FULL:
+    SELECT n.nspname AS schema_name, c.relname AS table_name
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'r'
+      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+      AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conrelid = c.oid AND con.contype = 'p')
+      AND c.relreplident != 'f';
+    -- Fix non-compliant tables before transition:
+    -- ALTER TABLE schema_name.table_name REPLICA IDENTITY FULL;
+
+    -- Step 2: Audit Zero Prepared 2PC Transactions:
+    SELECT count(*) FROM pg_prepared_xacts; -- Must return 0 on both nodes
+    ```
+    Execute `pg_createsubscriber --dry-run -D <datadir> -P <publisher_conn> -d <db>` prior to live execution. After promotion, verify active message receipt in `pg_stat_subscription` and confirm zero entries in `pg_stat_subscription_errors`.
 - **Logical Replication Standby Failover Slots (`failover = true` & `sync_replication_slots`)**:
   - ❌ **The Post-Failover Replication Slot Desynchronization Disaster**: Promoting a physical read replica to primary during high-availability failover (e.g. Patroni) when downstream logical subscribers (ETL pipelines, analytics, microservices) consume logical slots from the old primary. The newly promoted primary lacks the subscriber's confirmed flush LSN, resulting in broken subscriptions (`replication slot does not exist`) and requiring catastrophic full table re-syncs.
   - ✅ **Production Invariant**: In PostgreSQL 17+, enable logical replication slot synchronization on physical standbys:

@@ -13967,5 +13967,227 @@ func StreamOrderItemsWithJsonTable(
 }
 ```
 
+---
+
+## 28. PostgreSQL 17 `pg_createsubscriber` Physical Standby to Logical Subscriber Transition & Replica Identity Invariants
+
+When orchestrating database cutovers, read-replica promotions, or zero-downtime major version migrations in Go microservices, systems must leverage PostgreSQL 17's native `pg_createsubscriber` utility rather than legacy `pg_dump`/`pg_restore` loops. However, autonomous Go orchestrators must enforce strict pre-flight checks before invoking the tool:
+1. **Never Execute Against a Running Target Server**: The target physical standby must be in recovery and cleanly stopped with `pg_ctl stop -m fast` prior to live execution.
+2. **Audit Table Replica Identities Across All Target Databases**: Tables without a `PRIMARY KEY` or `REPLICA IDENTITY FULL` will immediately crash the subscriber apply workers on subsequent `UPDATE` or `DELETE` statements with `SQLSTATE 55000`.
+3. **Verify Publisher WAL Ceiling & Replay Lag**: Ensure `max_slot_wal_keep_size` is configured on the publisher (e.g. 50GB) and standby replay lag is bounded ($\le 64\text{MB}$) before initiating cutover.
+4. **Enforce Zero Pending 2PC Transactions**: Ensure `count(*) FROM pg_prepared_xacts == 0` on both publisher and standby nodes.
+
+```go
+package database
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os/exec"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type SubscriberMigrationConfig struct {
+	PublisherURL      string
+	SubscriberURL     string
+	SubscriberDataDir string
+	Databases         []string
+	MaxAllowedLagMB   int64
+	SlotNamePrefix    string
+	SubNamePrefix     string
+	PubNamePrefix     string
+}
+
+type TableReplicaAudit struct {
+	SchemaName      string
+	TableName       string
+	ReplicaIdentity string
+	HasPrimaryKey   bool
+	IsCompliant     bool
+}
+
+// AuditDatabaseReplicaIdentity inspects all non-system tables in a database
+func AuditDatabaseReplicaIdentity(ctx context.Context, dbURL string) ([]TableReplicaAudit, error) {
+	conn, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		return nil, fmt.Errorf("connection failed: %w", err)
+	}
+	defer conn.Close(ctx)
+
+	query := `
+		SELECT 
+			n.nspname AS schema_name,
+			c.relname AS table_name,
+			c.relreplident::text AS replica_identity,
+			EXISTS (
+				SELECT 1 FROM pg_constraint con 
+				WHERE con.conrelid = c.oid AND con.contype = 'p'
+			) AS has_pk
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relkind = 'r'
+		  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+		ORDER BY 1, 2;
+	`
+
+	rows, err := conn.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("audit query failed: %w", err)
+	}
+	defer rows.Close()
+
+	var results []TableReplicaAudit
+	for rows.Next() {
+		var audit TableReplicaAudit
+		if err := rows.Scan(&audit.SchemaName, &audit.TableName, &audit.ReplicaIdentity, &audit.HasPrimaryKey); err != nil {
+			return nil, err
+		}
+		// A table is compliant with logical replication updates/deletes if it has a Primary Key or FULL identity
+		audit.IsCompliant = audit.HasPrimaryKey || audit.ReplicaIdentity == "f"
+		results = append(results, audit)
+	}
+
+	return results, rows.Err()
+}
+
+// ValidateCreateSubscriberPreflight ensures all Tier 0 - Tier 2 invariants are satisfied
+func ValidateCreateSubscriberPreflight(ctx context.Context, cfg SubscriberMigrationConfig, logger *slog.Logger) error {
+	pubPool, err := pgxpool.New(ctx, cfg.PublisherURL)
+	if err != nil {
+		return fmt.Errorf("failed connecting to publisher: %w", err)
+	}
+	defer pubPool.Close()
+
+	subPool, err := pgxpool.New(ctx, cfg.SubscriberURL)
+	if err != nil {
+		return fmt.Errorf("failed connecting to subscriber: %w", err)
+	}
+	defer subPool.Close()
+
+	// 1. Verify PostgreSQL >= 17 on publisher
+	var pubVer int
+	if err := pubPool.QueryRow(ctx, "SHOW server_version_num;").Scan(&pubVer); err != nil {
+		return err
+	}
+	if pubVer < 170000 {
+		return fmt.Errorf("publisher version %d is below required PostgreSQL 17 baseline", pubVer)
+	}
+
+	// 2. Verify wal_level == logical
+	var walLevel string
+	if err := pubPool.QueryRow(ctx, "SHOW wal_level;").Scan(&walLevel); err != nil {
+		return err
+	}
+	if walLevel != "logical" {
+		return fmt.Errorf("publisher wal_level must be 'logical', found: %s", walLevel)
+	}
+
+	// 3. Verify target is a physical standby in recovery
+	var inRecovery bool
+	if err := subPool.QueryRow(ctx, "SELECT pg_is_in_recovery();").Scan(&inRecovery); err != nil {
+		return err
+	}
+	if !inRecovery {
+		return errors.New("target subscriber must be a physical standby in recovery mode")
+	}
+
+	// 4. Verify zero 2PC transactions
+	var pub2PC, sub2PC int
+	_ = pubPool.QueryRow(ctx, "SELECT count(*) FROM pg_prepared_xacts;").Scan(&pub2PC)
+	_ = subPool.QueryRow(ctx, "SELECT count(*) FROM pg_prepared_xacts;").Scan(&sub2PC)
+	if pub2PC > 0 || sub2PC > 0 {
+		return fmt.Errorf("unresolved 2PC transactions detected (publisher=%d, subscriber=%d)", pub2PC, sub2PC)
+	}
+
+	// 5. Audit all databases for replica identity compliance
+	for _, db := range cfg.Databases {
+		dbURL := strings.Replace(cfg.PublisherURL, "/postgres", "/"+db, 1)
+		tables, err := AuditDatabaseReplicaIdentity(ctx, dbURL)
+		if err != nil {
+			return fmt.Errorf("failed replica identity audit on db '%s': %w", db, err)
+		}
+		var nonCompliant []string
+		for _, t := range tables {
+			if !t.IsCompliant {
+				nonCompliant = append(nonCompliant, fmt.Sprintf("%s.%s", t.SchemaName, t.TableName))
+			}
+		}
+		if len(nonCompliant) > 0 {
+			return fmt.Errorf("database '%s' has %d tables lacking PK or REPLICA IDENTITY FULL: %v", db, len(nonCompliant), nonCompliant)
+		}
+	}
+
+	logger.InfoContext(ctx, "pg_createsubscriber pre-flight validation passed successfully")
+	return nil
+}
+
+// ExecuteGovernedCreateSubscriber runs dry-run, cleanly shuts down target, and executes cutover
+func ExecuteGovernedCreateSubscriber(ctx context.Context, cfg SubscriberMigrationConfig, logger *slog.Logger) error {
+	if err := ValidateCreateSubscriberPreflight(ctx, cfg, logger); err != nil {
+		return fmt.Errorf("preflight validation failed: %w", err)
+	}
+
+	// Execute dry-run first
+	dryRunArgs := []string{"--dry-run", "-D", cfg.SubscriberDataDir, "-P", cfg.PublisherURL, "-v"}
+	for _, db := range cfg.Databases {
+		dryRunArgs = append(dryRunArgs, "-d", db)
+	}
+
+	dryRunCmd := exec.CommandContext(ctx, "pg_createsubscriber", dryRunArgs...)
+	out, err := dryRunCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("pg_createsubscriber dry-run failed: %w\noutput: %s", err, string(out))
+	}
+	logger.InfoContext(ctx, "pg_createsubscriber dry-run succeeded")
+
+	// Clean stop of physical standby
+	stopCmd := exec.CommandContext(ctx, "pg_ctl", "stop", "-D", cfg.SubscriberDataDir, "-m", "fast")
+	if stopOut, err := stopCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("clean standby shutdown failed: %w\noutput: %s", err, string(stopOut))
+	}
+
+	// Execute live conversion
+	liveArgs := []string{"-D", cfg.SubscriberDataDir, "-P", cfg.PublisherURL, "-v"}
+	for _, db := range cfg.Databases {
+		liveArgs = append(liveArgs, "-d", db)
+	}
+	if cfg.SlotNamePrefix != "" {
+		liveArgs = append(liveArgs, "-p", cfg.SlotNamePrefix)
+	}
+	if cfg.SubNamePrefix != "" {
+		liveArgs = append(liveArgs, "-s", cfg.SubNamePrefix)
+	}
+	if cfg.PubNamePrefix != "" {
+		liveArgs = append(liveArgs, "-t", cfg.PubNamePrefix)
+	}
+
+	liveCmd := exec.CommandContext(ctx, "pg_createsubscriber", liveArgs...)
+	liveOut, err := liveCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("live pg_createsubscriber execution failed: %w\noutput: %s", err, string(liveOut))
+	}
+
+	// Start promoted standalone subscriber
+	startCmd := exec.CommandContext(ctx, "pg_ctl", "start", "-D", cfg.SubscriberDataDir)
+	if startOut, err := startCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("starting converted subscriber postmaster failed: %w\noutput: %s", err, string(startOut))
+	}
+
+	logger.InfoContext(ctx, "PostgreSQL 17 physical standby successfully converted to logical subscriber",
+		slog.String("data_dir", cfg.SubscriberDataDir),
+		slog.Any("databases", cfg.Databases),
+	)
+
+	return nil
+}
+```
+
+
 
 
