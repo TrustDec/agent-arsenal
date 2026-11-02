@@ -1031,6 +1031,18 @@ alwaysApply: false
     );
     ```
     Monitor skipped rows via `pg_stat_progress_copy` to inspect error counts without stalling critical ingestion pipelines.
+- **PostgreSQL 17+ Execution Profiling via `EXPLAIN (MEMORY, SERIALIZE)`**:
+  - ❌ **Disregarding Serialization CPU Latency & MemoryContext Explosions**: Relying solely on `EXPLAIN ANALYZE` to diagnose slow queries. Because legacy `EXPLAIN` discards tuples immediately without serialization, developers fail to detect that queries spend 90% of their server duration running `textout`/`jsonb_out` string conversions, or that untracked `WindowAgg` and `FunctionScan` nodes are leaking gigabytes of MemoryContext RAM leading to Linux OOM-killer postmaster terminations.
+  - ✅ **Production Invariant**: In PostgreSQL 17+, always run `EXPLAIN (ANALYZE, MEMORY, SERIALIZE binary, BUFFERS)` to profile both executor memory footprints and wire formatting overhead:
+    ```sql
+    EXPLAIN (ANALYZE, MEMORY, SERIALIZE binary, BUFFERS, FORMAT JSON)
+    SELECT id, tenant_id, status, payload
+    FROM audit_logs
+    WHERE tenant_id = $1
+    ORDER BY created_at DESC
+    LIMIT 1000;
+    ```
+    If serialization time accounts for $> 25\%$ of total time, switch client drivers from text mode to PostgreSQL binary protocol and strictly prune unnecessary columns from `SELECT` projections.
 - **`idle_in_transaction_session_timeout` & Vacuum Freeze Starvation Defense**:
   - ❌ **Abandoned Transactions Blocking Autovacuum & Fueling Wraparound**: A client opens a transaction (`BEGIN`), performs a query, and either stalls on a slow network call or crashes without calling `COMMIT` or `ROLLBACK`. The idle transaction holds the database-wide transaction horizon ($x_{\text{min}}$) hostage, preventing `VACUUM` from cleaning dead tuples across all tables, leading to catastrophic table bloat and emergency shutdowns from transaction ID wraparound.
   - ✅ **Production Invariant**: Always enforce a strict `idle_in_transaction_session_timeout` (e.g. `SET idle_in_transaction_session_timeout = '30s';` globally in `postgresql.conf` or per connection pool). Any connection idling inside an open transaction is forcibly terminated, reclaiming locks and advancing the vacuum horizon.
