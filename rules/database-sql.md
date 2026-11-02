@@ -1001,6 +1001,33 @@ alwaysApply: false
     WHERE relid = 'core_events'::regclass;
     ```
     Assert `index_vacuum_count <= 1` at all times. In container environments, mount `/dev/shm >= 2GB` to ensure parallel vacuum workers successfully allocate shared `TidStore` Dynamic Shared Memory (DSM) segments. In acute disk saturation emergencies (>95% disk), execute `VACUUM (INDEX_CLEANUP FALSE, TRUNCATE TRUE)` to reclaim trailing heap pages immediately, then immediately schedule `REINDEX CONCURRENTLY` before returning to normal traffic.
+- **PostgreSQL 17+ ISO SQL:2023 `JSON_TABLE`, JSON Path & Relational Projection Invariants**:
+  - ❌ **Legacy Lateral Unnesting Cartesian Explosion & WorkMem Temp Spills**: Unnesting nested JSON arrays using legacy `CROSS JOIN LATERAL jsonb_array_elements()` or `jsonb_to_recordset()`. The executor generates combinatorial nested-loop intermediate tuples, allocates unbounded memory in unmonitored `MemoryContexts`, spills megabytes of uncompressed JSON buffers to temporary scratch disks, and spikes query latency by $20\times–50\times$. Leaving default `NULL ON ERROR` silently converts schema drift, missing mandatory attributes, or type mismatch errors into `NULL` values, causing silent data corruption in accounting ledgers.
+  - ✅ **Production Invariant**: In PostgreSQL 17+, transform semi-structured JSONB documents using native `JSON_TABLE` with explicit schemas. Enforce `strict` mode path expressions to eliminate semantic drift and silent singleton unwrapping. Mandate `ERROR ON ERROR` on all identity, numeric, and foreign key columns, provide explicit defaults on optional attributes (`DEFAULT '0.00' ON EMPTY ERROR ON ERROR`), and use `FOR ORDINALITY` to maintain deterministic sequence ordering:
+    ```sql
+    -- High-performance, single-pass SQL/JSON relational unnesting on PostgreSQL 17+:
+    SELECT 
+      e.id AS event_id,
+      jt.line_num,
+      jt.sku,
+      jt.quantity,
+      jt.unit_price,
+      jt.discount_pct
+    FROM raw_order_events e,
+    JSON_TABLE(
+      e.payload,
+      'strict $.orders[*]'
+      COLUMNS (
+        line_num     FOR ORDINALITY,
+        sku          TEXT            PATH '$.sku' ERROR ON ERROR,
+        quantity     INT             PATH '$.qty' ERROR ON ERROR,
+        unit_price   NUMERIC(12, 4)  PATH '$.price' ERROR ON ERROR,
+        discount_pct NUMERIC(5, 2)   PATH '$.discount' DEFAULT '0.00' ON EMPTY ERROR ON ERROR
+      )
+    ) AS jt
+    WHERE e.created_at >= NOW() - INTERVAL '1 day';
+    ```
+    Back all JSON path query filters (`JSON_EXISTS`) with dedicated `jsonb_path_ops` GIN indexes (`CREATE INDEX ON raw_order_events USING gin (payload jsonb_path_ops)`), and disallow sibling `NESTED PATH` combinations that trigger Cartesian cross-products.
 - **Logical Replication Standby Failover Slots (`failover = true` & `sync_replication_slots`)**:
   - ❌ **The Post-Failover Replication Slot Desynchronization Disaster**: Promoting a physical read replica to primary during high-availability failover (e.g. Patroni) when downstream logical subscribers (ETL pipelines, analytics, microservices) consume logical slots from the old primary. The newly promoted primary lacks the subscriber's confirmed flush LSN, resulting in broken subscriptions (`replication slot does not exist`) and requiring catastrophic full table re-syncs.
   - ✅ **Production Invariant**: In PostgreSQL 17+, enable logical replication slot synchronization on physical standbys:

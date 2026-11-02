@@ -13829,4 +13829,143 @@ func ExecuteGovernedPG17Vacuum(
 }
 ```
 
+---
+
+## 27. PostgreSQL 17 SQL/JSON Standard, `JSON_TABLE` Relational Projection & JSON Path Invariants
+
+When querying, transforming, or streaming semi-structured JSONB documents into Go data structures (`jackc/pgx/v5`), developers must never rely on legacy PostgreSQL $\le 16$ unnesting patterns (`CROSS JOIN LATERAL jsonb_array_elements()` or `jsonb_to_recordset()`). Legacy lateral unnesting generates $O(N \cdot M \cdot K)$ intermediate tuples, exceeds `work_mem`, spills unindexed JSON buffers to disk, and spikes latency by $20\times–50\times$. PostgreSQL 17 implements the full ISO SQL:2023 `JSON_TABLE()` standard, providing single-pass streaming evaluation directly over binary JSONB datums.
+
+### Production Invariants for Go Services:
+1. **Never Chain `CROSS JOIN LATERAL jsonb_array_elements` in High-Throughput Handlers**:
+   Chaining multiple lateral unnestings creates nested loop scans that allocate unbounded memory in unmonitored `MemoryContexts`. Always refactor using PostgreSQL 17 `JSON_TABLE` with explicit `COLUMNS` definitions.
+2. **Mandatory `strict` Path Mode**:
+   Always prefix JSON Path expressions with `strict` (e.g. `'strict $.orders[*]'`). Default `lax` mode silently unwraps singleton arrays or skips missing elements, causing semantic drift and silent data discrepancies.
+3. **Mandatory `ERROR ON ERROR` on Financial, Numeric & Identity Columns**:
+   Never allow default `NULL ON ERROR` on critical fields (UUID, integer, numeric, currency). Any schema drift in upstream JSON payloads must raise an explicit `pgconn.PgError` rather than silently injecting NULLs into accounting ledgers. For optional fields, declare explicit bounded defaults: `DEFAULT '0.00' ON EMPTY ERROR ON ERROR`.
+4. **Preserve Sequence Order with `FOR ORDINALITY`**:
+   JSON array elements have an intrinsic index. Always project a sequence column via `line_number FOR ORDINALITY` to maintain deterministic ordering and support idempotent upserts.
+
+```go
+package database
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// RelationalOrderItem represents a single line-item projected from raw JSONB
+type RelationalOrderItem struct {
+	EventID     uuid.UUID `json:"event_id"`
+	LineNumber  int32     `json:"line_number"`
+	SKU         string    `json:"sku"`
+	Quantity    int32     `json:"quantity"`
+	UnitPrice   float64   `json:"unit_price"`
+	Currency    string    `json:"currency"`
+	DiscountPct float64   `json:"discount_pct"`
+}
+
+type JsonTableStreamOptions struct {
+	CutoffTime time.Time
+	BatchSize  int
+	Timeout    time.Duration
+}
+
+// StreamOrderItemsWithJsonTable demonstrates governed single-pass JSON_TABLE projection
+func StreamOrderItemsWithJsonTable(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	logger *slog.Logger,
+	opts JsonTableStreamOptions,
+) ([]RelationalOrderItem, error) {
+	if pool == nil {
+		return nil, errors.New("database pool connection cannot be nil")
+	}
+	if opts.Timeout <= 0 {
+		opts.Timeout = 15 * time.Second
+	}
+	if opts.BatchSize <= 0 {
+		opts.BatchSize = 1000
+	}
+
+	queryCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
+	defer cancel()
+
+	const query = `
+		SELECT 
+			e.id,
+			jt.line_number,
+			jt.sku,
+			jt.quantity,
+			jt.unit_price,
+			jt.currency,
+			jt.discount_pct
+		FROM raw_order_events e,
+		JSON_TABLE(
+			e.payload,
+			'strict $.order.items[*]'
+			COLUMNS (
+				line_number  FOR ORDINALITY,
+				sku          TEXT            PATH '$.sku' ERROR ON ERROR,
+				quantity     INT             PATH '$.qty' ERROR ON ERROR,
+				unit_price   NUMERIC(12, 4)  PATH '$.pricing.unit_price' ERROR ON ERROR,
+				currency     VARCHAR(3)      PATH '$.pricing.currency' ERROR ON ERROR,
+				discount_pct NUMERIC(5, 2)   PATH '$.pricing.discount_pct' 
+				                               DEFAULT '0.00' ON EMPTY 
+				                               ERROR ON ERROR
+			)
+		) AS jt
+		WHERE e.created_at >= $1
+		ORDER BY e.id, jt.line_number
+		LIMIT $2;
+	`
+
+	start := time.Now()
+	rows, err := pool.Query(queryCtx, query, opts.CutoffTime, opts.BatchSize)
+	if err != nil {
+		logger.ErrorContext(ctx, "Failed to execute PostgreSQL 17 JSON_TABLE projection",
+			slog.String("error", err.Error()),
+			slog.Time("cutoff", opts.CutoffTime),
+		)
+		return nil, fmt.Errorf("JSON_TABLE query error: %w", err)
+	}
+	defer rows.Close()
+
+	items := make([]RelationalOrderItem, 0, opts.BatchSize)
+	for rows.Next() {
+		var item RelationalOrderItem
+		if scanErr := rows.Scan(
+			&item.EventID,
+			&item.LineNumber,
+			&item.SKU,
+			&item.Quantity,
+			&item.UnitPrice,
+			&item.Currency,
+			&item.DiscountPct,
+		); scanErr != nil {
+			return nil, fmt.Errorf("failed scanning JSON_TABLE row: %w", scanErr)
+		}
+		items = append(items, item)
+	}
+
+	if rows.Err() != nil {
+		return nil, fmt.Errorf("rows iteration error in JSON_TABLE: %w", rows.Err())
+	}
+
+	logger.InfoContext(ctx, "PostgreSQL 17 JSON_TABLE stream completed",
+		slog.Int("items_extracted", len(items)),
+		slog.Duration("duration", time.Since(start)),
+	)
+
+	return items, nil
+}
+```
+
+
 
