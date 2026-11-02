@@ -13644,3 +13644,189 @@ func AssertPG17QueryDiscipline(
 }
 ```
 
+---
+
+## 26. PostgreSQL 17 Adaptive Radix Tree VACUUM (`TidStore`), Buffer Ring (`BUFFER_USAGE_LIMIT`) & Maintenance Automation Invariants
+
+When building database maintenance daemons, automated bloat remediation runners, or database administration microservices in Go (`jackc/pgx/v5`), developers must never rely on legacy PostgreSQL $\le 16$ vacuum assumptions. PostgreSQL 17 completely overhauls vacuum memory tracking via `TidStore` (an adaptive radix tree compressing dead TIDs by up to $20\times$) and introduces granular shared buffer ring control via `BUFFER_USAGE_LIMIT`.
+
+### Production Invariants for Go Maintenance Services:
+1. **Never Run `VACUUM` Inside Multi-Statement Transactions**:
+   In `pgx`, calling `tx.Exec(ctx, "VACUUM ...")` throws `ERROR: VACUUM cannot run inside a transaction block (SQLSTATE 25001)`. Always acquire a dedicated raw `*pgxpool.Conn` via `pool.Acquire(ctx)` and execute `VACUUM` directly outside transaction scope.
+2. **Buffer Ring Sizing (`BUFFER_USAGE_LIMIT`)**:
+   Never execute unbuffered maintenance (`BUFFER_USAGE_LIMIT '0'`), which sweeps through `shared_buffers` and evicts active OLTP cache lines. Mandate `BUFFER_USAGE_LIMIT '64MB'` (or 128MB–256MB) to boost sequential NVMe vacuum throughput from 30 MB/s to 450+ MB/s without cache pollution.
+3. **Assert Single-Pass Invariant (`index_vacuum_count <= 1`)**:
+   Continuously poll `pg_stat_progress_vacuum`. If `index_vacuum_count > 1`, dead tuples exceeded memory and triggered legacy multi-pass index thrashing. Emit a high-severity alert indicating `autovacuum_work_mem` must be elevated.
+4. **Emergency Recovery & Secondary Index Follow-up**:
+   In acute disk exhaustion emergencies, invoke `INDEX_CLEANUP FALSE` to truncate trailing heap pages immediately, then dispatch asynchronous `REINDEX CONCURRENTLY` jobs once disk headroom is restored.
+
+```go
+package database
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// PG17VacuumConfig dictates parameters for governed maintenance execution.
+type PG17VacuumConfig struct {
+	TableName            string
+	BufferUsageLimitMB   int  // Recommended: 64 to 256. 0 is strictly forbidden.
+	ParallelWorkers      int  // 0 disables explicit PARALLEL; otherwise workers <= IndexCount
+	DisableIndexCleanup  bool // Emergency circuit breaker for acute bloat/wraparound
+	DisableTruncate      bool
+	PollInterval         time.Duration
+}
+
+// VacuumTelemetrySnapshot represents an instantaneous read from pg_stat_progress_vacuum.
+type VacuumTelemetrySnapshot struct {
+	PID              int32
+	Phase            string
+	HeapBlksTotal    int64
+	HeapBlksScanned  int64
+	HeapBlksVacuumed int64
+	IndexVacuumCount int64
+	NumDeadTuples    int64
+}
+
+// ExecuteGovernedPG17Vacuum performs a production-grade, telemetry-monitored vacuum operation.
+func ExecuteGovernedPG17Vacuum(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	cfg PG17VacuumConfig,
+	logger *slog.Logger,
+) error {
+	// Guard 1: Prohibit unbuffered cache wipeout
+	if cfg.BufferUsageLimitMB <= 0 {
+		return fmt.Errorf("invariance violation: BufferUsageLimitMB must be > 0 (found %d); 0 evicts shared_buffers", cfg.BufferUsageLimitMB)
+	}
+
+	// Guard 2: Engine Qualification (PostgreSQL >= 17.0)
+	var serverVersion int
+	if err := pool.QueryRow(ctx, "SHOW server_version_num").Scan(&serverVersion); err != nil {
+		return fmt.Errorf("failed to query server_version_num: %w", err)
+	}
+	if serverVersion < 170000 {
+		return fmt.Errorf("invariance violation: PostgreSQL 17+ required for TidStore and BUFFER_USAGE_LIMIT (found version %d)", serverVersion)
+	}
+
+	// Assemble safe command
+	clauses := []string{
+		fmt.Sprintf("BUFFER_USAGE_LIMIT '%dMB'", cfg.BufferUsageLimitMB),
+	}
+	if cfg.ParallelWorkers > 1 {
+		clauses = append(clauses, fmt.Sprintf("PARALLEL %d", cfg.ParallelWorkers))
+	}
+	if cfg.DisableIndexCleanup {
+		clauses = append(clauses, "INDEX_CLEANUP FALSE")
+	}
+	if cfg.DisableTruncate {
+		clauses = append(clauses, "TRUNCATE FALSE")
+	}
+
+	vacuumSQL := fmt.Sprintf("VACUUM (%s) %s", strings.Join(clauses, ", "), pgx.Identifier{cfg.TableName}.Sanitize())
+
+	// Acquire dedicated connection (VACUUM cannot run within a multi-statement transaction)
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to acquire raw connection for vacuum: %w", err)
+	}
+	defer conn.Release()
+
+	// Launch async telemetry supervisor
+	pollInterval := cfg.PollInterval
+	if pollInterval <= 0 {
+		pollInterval = 2 * time.Second
+	}
+
+	stopMonitor := make(chan struct{})
+	monitorDone := make(chan struct{})
+
+	go func() {
+		defer close(monitorDone)
+		ticker := time.NewTicker(pollInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-stopMonitor:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				var t VacuumTelemetrySnapshot
+				err := pool.QueryRow(ctx, `
+					SELECT pid, phase, heap_blks_total, heap_blks_scanned, 
+					       heap_blks_vacuumed, index_vacuum_count, num_dead_tuples
+					FROM pg_stat_progress_vacuum
+					WHERE relid = $1::regclass
+				`, cfg.TableName).Scan(
+					&t.PID, &t.Phase, &t.HeapBlksTotal, &t.HeapBlksScanned,
+					&t.HeapBlksVacuumed, &t.IndexVacuumCount, &t.NumDeadTuples,
+				)
+				if err == nil {
+					// Single-Pass Invariant Assertion
+					if t.IndexVacuumCount > 1 {
+						logger.ErrorContext(ctx, "CRITICAL: Multi-pass index vacuuming detected! autovacuum_work_mem undersized",
+							slog.String("table", cfg.TableName),
+							slog.Int64("index_vacuum_count", t.IndexVacuumCount),
+							slog.Int64("dead_tuples", t.NumDeadTuples),
+						)
+					}
+					var pct float64
+					if t.HeapBlksTotal > 0 {
+						pct = (float64(t.HeapBlksScanned) / float64(t.HeapBlksTotal)) * 100.0
+					}
+					logger.InfoContext(ctx, "PG17 Vacuum Progress",
+						slog.String("table", cfg.TableName),
+						slog.String("phase", t.Phase),
+						slog.Float64("scanned_pct", pct),
+						slog.Int64("dead_tids_in_tidstore", t.NumDeadTuples),
+						slog.Int64("index_passes", t.IndexVacuumCount),
+					)
+				}
+			}
+		}
+	}()
+
+	start := time.Now()
+	logger.InfoContext(ctx, "Dispatching governed PostgreSQL 17 VACUUM",
+		slog.String("table", cfg.TableName),
+		slog.Int("buffer_limit_mb", cfg.BufferUsageLimitMB),
+		slog.Int("parallel_workers", cfg.ParallelWorkers),
+		slog.String("sql", vacuumSQL),
+	)
+
+	_, execErr := conn.Exec(ctx, vacuumSQL)
+	close(stopMonitor)
+	<-monitorDone // await monitor shutdown
+
+	if execErr != nil {
+		return fmt.Errorf("governed vacuum failed on %s: %w", cfg.TableName, execErr)
+	}
+
+	logger.InfoContext(ctx, "PostgreSQL 17 VACUUM successfully completed",
+		slog.String("table", cfg.TableName),
+		slog.Duration("duration", time.Since(start)),
+		slog.Int("buffer_limit_mb", cfg.BufferUsageLimitMB),
+	)
+
+	// If emergency INDEX_CLEANUP FALSE was used, log urgent follow-up directive
+	if cfg.DisableIndexCleanup {
+		logger.WarnContext(ctx, "EMERGENCY INDEX_CLEANUP FALSE was used. Secondary indexes contain dead keys. Must schedule REINDEX CONCURRENTLY immediately.",
+			slog.String("table", cfg.TableName),
+		)
+	}
+
+	return nil
+}
+```
+
+

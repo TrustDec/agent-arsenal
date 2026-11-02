@@ -982,9 +982,25 @@ alwaysApply: false
 - **B-Tree Index Deduplication & High-Cardinality Sizing (PostgreSQL 13+)**:
   - ❌ **Disabling B-Tree Deduplication on Low-Uniqueness Columns**: Leaving default un-deduplicated B-tree structures on columns with recurring duplicates (e.g., status flags, category codes, foreign keys). This inflates index sizes on NVMe by 300–400% and triggers unnecessary page splits.
   - ✅ **Production Invariant**: Ensure B-Tree deduplication is enabled (`deduplicate_items = on`, default since PG13) on non-unique indexes. This coalesces duplicate posting lists into compact B-tree leaf pages, dramatically boosting shared buffer hit ratios and reducing index scan latency.
-- **PostgreSQL 17+ Radix Tree Vacuum Optimization (`tidstore`) & Dead Tuple Management**:
-  - ❌ **Inflating `maintenance_work_mem` to Prevent Multi-Pass Vacuuming**: In PostgreSQL 16 and older, `VACUUM` tracked dead tuple TIDs in a flat array limited by `maintenance_work_mem` (up to 1 GB holding ~178 million TIDs). When dead tuples exceeded this threshold, `VACUUM` was forced into expensive multi-pass index vacuuming, causing severe NVMe I/O thrashing.
-  - ✅ **Production Invariant**: PostgreSQL 17 replaces flat TID arrays with an adaptive radix tree structure (`tidstore`). It reduces vacuum memory consumption by up to 20× and completely eliminates multi-pass index vacuuming on large bloats. Keep `maintenance_work_mem` reasonably bounded (e.g. 512MB to 1GB) rather than over-allocating, and monitor `pg_stat_progress_vacuum` to verify that `index_vacuum_count` remains 1 even under tens of millions of dead tuples.
+- **PostgreSQL 17+ Adaptive Radix Tree VACUUM (`TidStore`), Multi-Pass Elimination & `vacuum_buffer_usage_limit` Invariants**:
+  - ❌ **Legacy Multi-Pass Index Thrashing & Runaway `maintenance_work_mem` Oversizing**: In PostgreSQL $\le 16$, `VACUUM` tracked dead tuple TIDs in a flat array of 6-byte `ItemPointerData` structs bounded by `maintenance_work_mem` (max 1GB holding ~178 million TIDs). When dead tuples exceeded this limit, VACUUM was forced into multi-pass index vacuuming ($K > 1$), re-scanning and sorting gigabytes of secondary B-Trees multiple times. Agents falsely over-allocate `maintenance_work_mem = 16GB`, which, when combined with concurrent autovacuum workers, provokes Linux kernel OOM killer `SIGKILL 137` postmaster decapitations. Furthermore, running vacuums under legacy default 256KB ring buffers throttles throughput to 25 MB/s on NVMe, while setting `BUFFER_USAGE_LIMIT = 0` completely wipes out `shared_buffers`, causing application p99 read latencies to cliff.
+  - ✅ **Production Invariant**: In PostgreSQL 17+, dead tuples are managed by `TidStore`, an adaptive in-memory radix tree that stores block numbers once and bit-packs offset numbers, compressing memory by $4\times–20\times$ (~1.5 bytes/TID) and guaranteeing single-pass index elimination ($K \equiv 1$). Decouple `autovacuum_work_mem = 512MB` from manual `maintenance_work_mem = 1GB`. Accelerate NVMe sequential vacuum throughput from 35 MB/s to 450+ MB/s via calibrated buffer rings (`vacuum_buffer_usage_limit = 64MB` or `VACUUM (BUFFER_USAGE_LIMIT '64MB', PARALLEL 4)`), while strictly prohibiting `BUFFER_USAGE_LIMIT = 0` on production OLTP:
+    ```sql
+    -- High-throughput, cache-isolated maintenance vacuum on PostgreSQL 17+:
+    VACUUM (
+      BUFFER_USAGE_LIMIT '64MB',
+      PARALLEL 4,
+      INDEX_CLEANUP AUTO,
+      ANALYZE
+    ) core_events;
+
+    -- Verify single-pass execution in progress monitor:
+    SELECT pid, phase, heap_blks_scanned, heap_blks_total, 
+           index_vacuum_count, num_dead_tuples
+    FROM pg_stat_progress_vacuum
+    WHERE relid = 'core_events'::regclass;
+    ```
+    Assert `index_vacuum_count <= 1` at all times. In container environments, mount `/dev/shm >= 2GB` to ensure parallel vacuum workers successfully allocate shared `TidStore` Dynamic Shared Memory (DSM) segments. In acute disk saturation emergencies (>95% disk), execute `VACUUM (INDEX_CLEANUP FALSE, TRUNCATE TRUE)` to reclaim trailing heap pages immediately, then immediately schedule `REINDEX CONCURRENTLY` before returning to normal traffic.
 - **Logical Replication Standby Failover Slots (`failover = true` & `sync_replication_slots`)**:
   - ❌ **The Post-Failover Replication Slot Desynchronization Disaster**: Promoting a physical read replica to primary during high-availability failover (e.g. Patroni) when downstream logical subscribers (ETL pipelines, analytics, microservices) consume logical slots from the old primary. The newly promoted primary lacks the subscriber's confirmed flush LSN, resulting in broken subscriptions (`replication slot does not exist`) and requiring catastrophic full table re-syncs.
   - ✅ **Production Invariant**: In PostgreSQL 17+, enable logical replication slot synchronization on physical standbys:
