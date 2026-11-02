@@ -1090,6 +1090,42 @@ alwaysApply: false
 - **NVMe Storage `effective_io_concurrency` & `random_page_cost` Tuning**:
   - ❌ **Leaving Spinning-Disk Defaults on Cloud NVMe Instances**: Running modern cloud SSD / NVMe instances with default PostgreSQL settings (`effective_io_concurrency = 1`, `random_page_cost = 4.0`). The query planner penalizes index scans and executes slow sequential table scans, while the engine submits synchronous, serialized I/O requests that leave NVMe read queues idle.
   - ✅ **Production Invariant**: On SSD/NVMe storage (AWS EBS gp3/io2, Google Extreme SSD), set `random_page_cost = 1.1` (reflecting nearly identical random vs sequential latency) and tune `effective_io_concurrency = 200` to 300. This enables asynchronous prefetching (`posix_fadvise`) during Bitmap Heap Scans, saturating NVMe controller parallelism.
+- **PostgreSQL 17+ Checkpointer vs Background Writer Architectural Split (`pg_stat_checkpointer` vs `pg_stat_bgwriter`)**:
+  - ❌ **Querying Legacy Removed Columns from `pg_stat_bgwriter` & Checkpoint Progress Blindness**: In PostgreSQL 17, checkpoint statistics (`checkpoints_timed`, `checkpoints_req`, `checkpoint_write_time`, `checkpoint_sync_time`, `buffers_checkpoint`) and backend buffer metrics were permanently removed from `pg_stat_bgwriter` and migrated to the new dedicated `pg_stat_checkpointer` view and `pg_stat_io`. Legacy telemetry queries fail immediately with fatal `SQLSTATE 42703: column "checkpoints_timed" does not exist`, crashing Prometheus exporters and health checkers. Furthermore, agents fail to monitor the forced checkpoint ratio $R_{\text{req}} = \text{num\_requested} / (\text{num\_timed} + \text{num\_requested})$; when $R_{\text{req}} > 0.10$, checkpoints are triggered by WAL starvation (`max_wal_size` undersized), continuously resetting the Full-Page Write (FPW) horizon and multiplying WAL generation by $10\times–20\times$.
+  - ✅ **Production Invariant**: In PostgreSQL 17+, always query `pg_stat_checkpointer` for checkpoint and standby restartpoint telemetry, use `pg_stat_bgwriter` solely for background buffer cleaning, deploy a version-agnostic compatibility view for cross-fleet scraping, configure `checkpoint_completion_target = 0.9` and `max_wal_size >= 16GB` to ensure timed checkpoints account for $\ge 90\%$ of cycles ($R_{\text{req}} \le 0.10$), and verify `bgwriter_lru_maxpages = 800` to prevent user backends from stalling on synchronous buffer writes:
+    ```sql
+    -- 1. Resilient cross-version compatibility view for Prometheus/Datadog scrapers
+    CREATE OR REPLACE VIEW v_cluster_checkpoint_stats AS
+    SELECT
+        c.num_timed,
+        c.num_requested,
+        c.restartpoints_timed,
+        c.restartpoints_req,
+        c.restartpoints_done,
+        c.write_time AS checkpoint_write_time_ms,
+        c.sync_time AS checkpoint_sync_time_ms,
+        c.buffers_written AS buffers_checkpoint,
+        b.buffers_clean,
+        b.maxwritten_clean,
+        b.buffers_alloc,
+        COALESCE(i.buffers_backend, 0) AS buffers_backend
+    FROM pg_stat_checkpointer c
+    CROSS JOIN pg_stat_bgwriter b
+    LEFT JOIN LATERAL (
+        SELECT SUM(writes)::bigint AS buffers_backend
+        FROM pg_stat_io
+        WHERE backend_type = 'client backend' AND io_context = 'normal' AND io_object = 'relation'
+    ) i ON true;
+
+    -- 2. Audit checkpointer stability: Verify forced checkpoint ratio <= 10%
+    SELECT
+        num_timed,
+        num_requested,
+        ROUND((num_requested::numeric / NULLIF(num_timed + num_requested, 0)) * 100, 2) AS forced_checkpoint_pct,
+        buffers_written,
+        ROUND((sync_time / NULLIF(write_time + sync_time, 0)) * 100, 2) AS fsync_pct
+    FROM pg_stat_checkpointer;
+    ```
 - **PostgreSQL 17+ Resilient `COPY` Streaming Ingestion (`ON_ERROR ignore`, `LOG_VERBOSITY`, DLQ & Telemetry)**:
   - ❌ **Single-Row Failure Aborting Multi-Gigabyte Ingestion vs Silent Data Loss with Unbounded `ON_ERROR ignore`**: In PostgreSQL 16 and older, executing `COPY raw_events FROM STDIN` failed entirely if a single malformed row or invalid encoding was encountered after ingesting 50 million records, discarding all progress and rolling back the transaction. Conversely, in PostgreSQL 17, blindly enabling `ON_ERROR ignore` without DLQ interception causes PostgreSQL to discard malformed rows at the parser level without audit trails; if schema shifts occur, 90% of data is silently dropped ($P(\text{silent loss}) = 1.0$). Furthermore, agents mistake `ON_ERROR ignore` for `ON CONFLICT DO NOTHING`: `ON_ERROR ignore` ONLY catches data conversion errors—any Primary Key, Unique, Check, or Foreign Key constraint collision still violently aborts the entire transaction. Omitting `LOG_VERBOSITY silent` floods server logs with hundreds of thousands of NOTICE lines, saturating root disk space and triggering postmaster `PANIC: could not write to log file: No space left on device`.
   - ✅ **Production Invariant**: In PostgreSQL 17+, stream high-throughput batch imports into an `UNLOGGED` staging table using `ON_ERROR ignore` and explicit `LOG_VERBOSITY`, monitor skipped rows via `pg_stat_progress_copy` with an SLA circuit breaker, capture rejected notices into a Dead-Letter Queue (DLQ), and atomically promote to target tables via set-based `INSERT ... ON CONFLICT` or `MERGE`:

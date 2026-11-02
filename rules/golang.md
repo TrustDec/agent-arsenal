@@ -14605,6 +14605,244 @@ func ExecuteGovernedResilientCopy(
 }
 ```
 
+---
+
+## 31. PostgreSQL 17 Checkpointer vs Background Writer Architectural Split, Standby Restartpoint Telemetry & Forced Checkpoint Invariants
+
+In Go microservices and database telemetry collectors utilizing `jackc/pgx/v5`, autonomous agents must enforce the following production invariants following the PostgreSQL 17 architectural split:
+1. **Dynamic Catalog Introspection (`server_version_num`)**: Never execute legacy `SELECT checkpoints_timed, checkpoints_req FROM pg_stat_bgwriter` on PostgreSQL 17+. The checkpointer columns were permanently removed from `pg_stat_bgwriter` and migrated to `pg_stat_checkpointer`. Querying removed columns fails with fatal `SQLSTATE 42703: column "checkpoints_timed" does not exist`, crashing scrape loops. Always introspect `current_setting('server_version_num')::int` to branch query execution cleanly.
+2. **Forced Checkpoint Ratio Bounding ($R_{\text{req}} \le 0.10$)**: Compute the forced checkpoint ratio $R_{\text{req}} = \frac{\Delta \text{num\_requested}}{\Delta \text{num\_timed} + \Delta \text{num\_requested}}$. If $R_{\text{req}} > 0.10$, checkpoints are being triggered by WAL starvation (`max_wal_size` exhausted). Frequent forced checkpoints continuously reset the Full-Page Write (FPW) horizon, exploding WAL write amplification by $10\times–20\times$ and exhausting replication bandwidth.
+3. **Background Writer Cushioning Efficacy ($\eta_{\text{cushion}} \ge 0.95$)**: Correlate `buffers_clean` from `pg_stat_bgwriter` with backend writes in `pg_stat_io`. If $\eta_{\text{cushion}} = \frac{B_{\text{clean}}}{B_{\text{clean}} + B_{\text{backend}}} < 0.95$, client backends are stalling on synchronous dirty buffer disk writes during user queries, causing p99 latencies to cliff from 1.5ms to 5,000ms.
+4. **Standby Recovery Restartpoint Telemetry**: On physical streaming standbys, monitor `restartpoints_done`, `restartpoints_req`, and `write_time` to verify that WAL redo replay workers are not stalling on storage fsync latency.
+
+```go
+package telemetry
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// CheckpointerStats captures point-in-time checkpointer and bgwriter metrics.
+type CheckpointerStats struct {
+	Timestamp          time.Time
+	ServerVersionNum   int
+	NumTimed           int64
+	NumRequested       int64
+	RestartpointsTimed int64
+	RestartpointsReq   int64
+	RestartpointsDone  int64
+	WriteTimeMs        float64
+	SyncTimeMs         float64
+	BuffersWritten     int64
+	BuffersClean       int64
+	MaxwrittenClean    int64
+	BuffersAlloc       int64
+	BuffersBackend     int64
+}
+
+// CheckpointerDeltaAnalysis evaluates rate metrics against SLA thresholds.
+type CheckpointerDeltaAnalysis struct {
+	WindowDurationSeconds float64
+	ForcedCheckpointRatio float64 // SLA: <= 0.10 (Target: <= 0.05)
+	BuffersWrittenPerSec  float64
+	BuffersCleanPerSec    float64
+	BuffersBackendPerSec  float64
+	CushioningEfficacy    float64 // SLA: >= 0.95
+	SyncTimeRatio         float64 // sync_time / (write_time + sync_time)
+	IsHealthy             bool
+	Violations            []string
+}
+
+// PostgresCheckpointerSentinel autonomously monitors checkpointer and bgwriter health.
+type PostgresCheckpointerSentinel struct {
+	pool        *pgxpool.Pool
+	logger      *slog.Logger
+	mu          sync.Mutex
+	version     int
+	lastSample  *CheckpointerStats
+}
+
+// NewPostgresCheckpointerSentinel instantiates a new checkpointer sentinel.
+func NewPostgresCheckpointerSentinel(pool *pgxpool.Pool, logger *slog.Logger) *PostgresCheckpointerSentinel {
+	return &PostgresCheckpointerSentinel{
+		pool:   pool,
+		logger: logger,
+	}
+}
+
+// DetectVersion resolves the server version to determine query paths.
+func (s *PostgresCheckpointerSentinel) DetectVersion(ctx context.Context) error {
+	var ver int
+	err := s.pool.QueryRow(ctx, "SELECT current_setting('server_version_num')::integer;").Scan(&ver)
+	if err != nil {
+		return fmt.Errorf("failed to query server_version_num: %w", err)
+	}
+	s.version = ver
+	return nil
+}
+
+// Collect captures a consistent snapshot across PostgreSQL 16 and 17+.
+func (s *PostgresCheckpointerSentinel) Collect(ctx context.Context) (*CheckpointerStats, error) {
+	if s.version == 0 {
+		if err := s.DetectVersion(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	stats := &CheckpointerStats{
+		Timestamp:        time.Now(),
+		ServerVersionNum: s.version,
+	}
+
+	if s.version >= 170000 {
+		// PostgreSQL 17+: Query dedicated pg_stat_checkpointer and pg_stat_bgwriter
+		const qCheckpointer = `
+			SELECT
+				num_timed,
+				num_requested,
+				restartpoints_timed,
+				restartpoints_req,
+				restartpoints_done,
+				write_time,
+				sync_time,
+				buffers_written
+			FROM pg_stat_checkpointer;
+		`
+		err := s.pool.QueryRow(ctx, qCheckpointer).Scan(
+			&stats.NumTimed,
+			&stats.NumRequested,
+			&stats.RestartpointsTimed,
+			&stats.RestartpointsReq,
+			&stats.RestartpointsDone,
+			&stats.WriteTimeMs,
+			&stats.SyncTimeMs,
+			&stats.BuffersWritten,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("pg_stat_checkpointer scan failed: %w", err)
+		}
+
+		const qBgwriter = `
+			SELECT
+				buffers_clean,
+				maxwritten_clean,
+				buffers_alloc
+			FROM pg_stat_bgwriter;
+		`
+		err = s.pool.QueryRow(ctx, qBgwriter).Scan(
+			&stats.BuffersClean,
+			&stats.MaxwrittenClean,
+			&stats.BuffersAlloc,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("pg_stat_bgwriter scan failed: %w", err)
+		}
+
+		// Collect backend writes from pg_stat_io
+		const qIO = `
+			SELECT COALESCE(SUM(writes), 0)::bigint
+			FROM pg_stat_io
+			WHERE backend_type = 'client backend' AND io_context = 'normal' AND io_object = 'relation';
+		`
+		_ = s.pool.QueryRow(ctx, qIO).Scan(&stats.BuffersBackend)
+	} else {
+		// PostgreSQL <= 16: Legacy unified pg_stat_bgwriter
+		const qLegacy = `
+			SELECT
+				checkpoints_timed,
+				checkpoints_req,
+				checkpoint_write_time,
+				checkpoint_sync_time,
+				buffers_checkpoint,
+				buffers_clean,
+				maxwritten_clean,
+				buffers_alloc,
+				buffers_backend
+			FROM pg_stat_bgwriter;
+		`
+		err := s.pool.QueryRow(ctx, qLegacy).Scan(
+			&stats.NumTimed,
+			&stats.NumRequested,
+			&stats.WriteTimeMs,
+			&stats.SyncTimeMs,
+			&stats.BuffersWritten,
+			&stats.BuffersClean,
+			&stats.MaxwrittenClean,
+			&stats.BuffersAlloc,
+			&stats.BuffersBackend,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("legacy pg_stat_bgwriter scan failed: %w", err)
+		}
+	}
+
+	return stats, nil
+}
+
+// EvaluateRates computes delta calculus between two snapshots.
+func (s *PostgresCheckpointerSentinel) EvaluateRates(curr, prev *CheckpointerStats) *CheckpointerDeltaAnalysis {
+	dt := curr.Timestamp.Sub(prev.Timestamp).Seconds()
+	if dt <= 0 {
+		dt = 0.001
+	}
+
+	deltaTimed := float64(curr.NumTimed - prev.NumTimed)
+	deltaReq := float64(curr.NumRequested - prev.NumRequested)
+	totalCP := deltaTimed + deltaReq
+
+	forcedRatio := 0.0
+	if totalCP > 0 {
+		forcedRatio = deltaReq / totalCP
+	}
+
+	deltaClean := float64(curr.BuffersClean - prev.BuffersClean)
+	deltaBackend := float64(curr.BuffersBackend - prev.BuffersBackend)
+	cushioning := 1.0
+	if (deltaClean + deltaBackend) > 0 {
+		cushioning = deltaClean / (deltaClean + deltaBackend)
+	}
+
+	deltaWriteTime := curr.WriteTimeMs - prev.WriteTimeMs
+	deltaSyncTime := curr.SyncTimeMs - prev.SyncTimeMs
+	totalTime := deltaWriteTime + deltaSyncTime
+	syncRatio := 0.0
+	if totalTime > 0 {
+		syncRatio = deltaSyncTime / totalTime
+	}
+
+	analysis := &CheckpointerDeltaAnalysis{
+		WindowDurationSeconds: dt,
+		ForcedCheckpointRatio: forcedRatio,
+		BuffersWrittenPerSec:  float64(curr.BuffersWritten-prev.BuffersWritten) / dt,
+		BuffersCleanPerSec:    deltaClean / dt,
+		BuffersBackendPerSec:  deltaBackend / dt,
+		CushioningEfficacy:    cushioning,
+		SyncTimeRatio:         syncRatio,
+		IsHealthy:             true,
+	}
+
+	if forcedRatio > 0.10 {
+		analysis.IsHealthy = false
+		analysis.Violations = append(analysis.Violations,
+			fmt.Sprintf("Forced checkpoint ratio %.1f%% > 10%% SLA threshold. max_wal_size is undersized.", forcedRatio*100))
+	}
+	if cushioning < 0.95 {
+		analysis.IsHealthy = false
+		analysis.Violations = append(analysis.Violations,
+			fmt.Sprintf("Bgwriter cushioning %.1f%% < 95%% SLA. Backends synchronously writing %.1f buffers/sec.", cushioning*100, analysis.BuffersBackendPerSec))
+	}
+
+	return analysis
+}
+```
+
+
 
 
 
