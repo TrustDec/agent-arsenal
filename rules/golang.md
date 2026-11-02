@@ -14188,6 +14188,207 @@ func ExecuteGovernedCreateSubscriber(ctx context.Context, cfg SubscriberMigratio
 }
 ```
 
+---
+
+## 29. PostgreSQL 17 MERGE with RETURNING merge_action(), Concurrency Conflict Guard & Batch Synchronization Invariants
+
+When implementing high-throughput batch ETL reconciliation, multi-entity synchronizations, or change-data-capture (CDC) pipelines in Go microservices using `jackc/pgx/v5`, autonomous agents must strictly distinguish between point upserts and batch reconciliations:
+1. **Never Substitute MERGE for Single-Row OLTP Upserts**: `MERGE` lacks row-level speculative insertion locking (`SpeculativeInsertionWait`). In high-concurrency workloads under `READ COMMITTED`, two concurrent transactions running `MERGE` against the same non-existent row will both evaluate `WHEN NOT MATCHED`, attempt `INSERT`, and crash with `SQLSTATE 23505 (unique_violation)`. Always use `INSERT ... ON CONFLICT DO UPDATE` for single-row mutations.
+2. **Mandatory Source Deduplication CTE**: Before joining against target tables, always deduplicate incoming source records via `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY updated_at DESC)` in a CTE. Joining un-deduplicated batches that match a target row more than once triggers fatal `ERROR: MERGE command cannot affect row a second time` (`SQLSTATE 21000`), terminating the entire transaction.
+3. **Clause Ordering Precedence**: Always place destructive branches (`WHEN MATCHED AND ... THEN DELETE`) before unconditional `UPDATE` branches. PostgreSQL evaluates clauses in declaration order and short-circuits on the first match; placing an unconditional update first creates unreachable dead code for subsequent delete or conditional update branches.
+4. **Single-Roundtrip Mutation Telemetry via `RETURNING merge_action()`**: Leverage PostgreSQL 17's native `merge_action()` function (`'INSERT'`, `'UPDATE'`, `'DELETE'`) to emit structured domain events directly into transactional outbox buffers without secondary `SELECT` round-trips.
+5. **Idempotent Concurrency Conflict Retries**: Wrap batch `MERGE` executions in an exponential jitter retry loop catching `SQLSTATE 23505`, `40001`, and `40P01` to safely withstand transient interleaving.
+
+```go
+package database
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math/rand/v2"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// SyncPayload represents the inbound batch record.
+type SyncPayload struct {
+	TenantID   string    `json:"tenant_id"`
+	ProductID  string    `json:"product_id"`
+	Name       string    `json:"name"`
+	PriceCents int64     `json:"price_cents"`
+	IsDeleted  bool      `json:"is_deleted"`
+	Version    int64     `json:"version"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// MutationEvent represents the single-roundtrip mutation delta from PostgreSQL 17 RETURNING merge_action().
+type MutationEvent struct {
+	Action     string    `json:"action"` // "INSERT", "UPDATE", "DELETE"
+	TenantID   string    `json:"tenant_id"`
+	ProductID  string    `json:"product_id"`
+	PriceCents int64     `json:"price_cents"`
+	Version    int64     `json:"version"`
+	Timestamp  time.Time `json:"timestamp"`
+}
+
+// ResilientBatchProductMerge executes a production-grade PostgreSQL 17 MERGE with automatic
+// deduplication, clause precedence enforcement, and retry with jittered backoff on concurrency races.
+func ResilientBatchProductMerge(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	logger *slog.Logger,
+	records []SyncPayload,
+) ([]MutationEvent, error) {
+	if len(records) == 0 {
+		return nil, nil
+	}
+
+	const maxRetries = 3
+	baseBackoff := 40 * time.Millisecond
+
+	rawJSON, err := json.Marshal(records)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal sync records: %w", err)
+	}
+
+	const mergeSQL = `
+		WITH raw_batch AS (
+			SELECT * FROM json_to_recordset($1::json) AS (
+				tenant_id TEXT,
+				product_id TEXT,
+				name TEXT,
+				price_cents BIGINT,
+				is_deleted BOOLEAN,
+				version BIGINT,
+				updated_at TIMESTAMPTZ
+			)
+		),
+		deduped_batch AS (
+			SELECT *,
+			       ROW_NUMBER() OVER (
+			           PARTITION BY tenant_id, product_id 
+			           ORDER BY version DESC, updated_at DESC
+			       ) AS _rn
+			FROM raw_batch
+		),
+		clean_batch AS (
+			SELECT * FROM deduped_batch WHERE _rn = 1
+		)
+		MERGE INTO products AS t
+		USING clean_batch AS s
+		ON t.tenant_id = s.tenant_id AND t.product_id = s.product_id
+		-- Precedence 1: Destructive DELETE must precede UPDATE to prevent dead branches
+		WHEN MATCHED AND s.is_deleted = TRUE THEN
+			DELETE
+		-- Precedence 2: Monotonic version-checked UPDATE
+		WHEN MATCHED AND s.version > t.version THEN
+			UPDATE SET
+				name = s.name,
+				price_cents = s.price_cents,
+				version = s.version,
+				updated_at = s.updated_at
+		-- Precedence 3: INSERT when entity does not exist and is not marked deleted
+		WHEN NOT MATCHED AND s.is_deleted = FALSE THEN
+			INSERT (tenant_id, product_id, name, price_cents, version, updated_at)
+			VALUES (s.tenant_id, s.product_id, s.name, s.price_cents, s.version, s.updated_at)
+		-- PostgreSQL 17 native RETURNING with merge_action()
+		RETURNING
+			merge_action() AS action,
+			t.tenant_id,
+			t.product_id,
+			COALESCE(t.price_cents, 0) AS price_cents,
+			COALESCE(t.version, 0) AS version,
+			NOW() AS timestamp;
+	`
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		events, err := func() ([]MutationEvent, error) {
+			tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+			if err != nil {
+				return nil, fmt.Errorf("failed to begin tx: %w", err)
+			}
+			defer tx.Rollback(ctx)
+
+			// Fence execution time
+			if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout = '25000ms'"); err != nil {
+				return nil, err
+			}
+
+			rows, err := tx.Query(ctx, mergeSQL, string(rawJSON))
+			if err != nil {
+				return nil, err
+			}
+			defer rows.Close()
+
+			var results []MutationEvent
+			for rows.Next() {
+				var ev MutationEvent
+				if err := rows.Scan(
+					&ev.Action,
+					&ev.TenantID,
+					&ev.ProductID,
+					&ev.PriceCents,
+					&ev.Version,
+					&ev.Timestamp,
+				); err != nil {
+					return nil, fmt.Errorf("failed to scan mutation event: %w", err)
+				}
+				results = append(results, ev)
+			}
+			if err := rows.Err(); err != nil {
+				return nil, err
+			}
+
+			if err := tx.Commit(ctx); err != nil {
+				return nil, fmt.Errorf("failed to commit merge tx: %w", err)
+			}
+			return results, nil
+		}()
+
+		if err == nil {
+			logger.InfoContext(ctx, "batch MERGE completed successfully",
+				slog.Int("inbound_count", len(records)),
+				slog.Int("mutations_returned", len(events)),
+				slog.Int("attempt", attempt),
+			)
+			return events, nil
+		}
+
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			// Catch concurrency collision (23505), serialization abort (40001), or deadlock (40P01)
+			if pgErr.Code == "23505" || pgErr.Code == "40001" || pgErr.Code == "40P01" {
+				if attempt == maxRetries {
+					return nil, fmt.Errorf("batch merge failed after %d retries (code=%s): %w", attempt, pgErr.Code, err)
+				}
+				sleepDur := time.Duration(float64(baseBackoff) * (1.0 + rand.Float64())) * time.Duration(1<<(attempt-1))
+				logger.WarnContext(ctx, "transient concurrency race during MERGE, retrying with backoff",
+					slog.Int("attempt", attempt),
+					slog.String("code", pgErr.Code),
+					slog.Duration("backoff", sleepDur),
+				)
+				select {
+				case <-time.After(sleepDur):
+					continue
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+		}
+
+		return nil, fmt.Errorf("fatal non-retryable MERGE error: %w", err)
+	}
+
+	return nil, errors.New("batch MERGE exhausted retry budget")
+}
+```
+
 
 
 

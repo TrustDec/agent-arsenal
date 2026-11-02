@@ -1135,19 +1135,54 @@ alwaysApply: false
     RETURNING task_queue.*;
     ```
     Workers concurrently skip in-flight rows without blocking, achieving lock-free linear scale.
-- **PostgreSQL 17+ `MERGE ... RETURNING` for Atomic Upserts with Mutation Tracking**:
-  - ❌ **Two-Step Upsert or Blind `ON CONFLICT DO UPDATE` Without Action Audit**: Needing to know whether an atomic upsert operation actually inserted a new record or updated an existing one, forcing developers into separate `SELECT` pre-flight queries or ambiguous `RETURNING (xmax = 0) AS inserted` heuristics.
-  - ✅ **Production Invariant**: In PostgreSQL 17+, use `MERGE` with `RETURNING merge_action()` to atomically apply updates/inserts and determine exact mutation actions in a single roundtrip:
+- **PostgreSQL 17+ `MERGE ... RETURNING (merge_action())`, Concurrency Guard & Source Deduplication Invariants**:
+  - ❌ **The Concurrency Race Condition, Cardinality Violation (SQLSTATE 21000) & Dead Branch Catastrophe**: Blindly substituting `INSERT ... ON CONFLICT DO UPDATE` with `MERGE` on high-concurrency OLTP endpoints. Unlike `INSERT ... ON CONFLICT` which acquires speculative insertion locks on unique indexes (`SpeculativeInsertionWait`), `MERGE` executes a standard join scan; under `READ COMMITTED`, two concurrent transactions querying the same missing row will both evaluate `WHEN NOT MATCHED`, attempt concurrent inserts, and violently abort with `SQLSTATE 23505 (unique_violation)` or serialization failure (`SQLSTATE 40001`). Joining against source batches containing duplicate join keys throws fatal `ERROR: MERGE command cannot affect row a second time` (`SQLSTATE 21000`). Declaring an unconditional `WHEN MATCHED THEN UPDATE` before a conditional `WHEN MATCHED AND source.is_deleted THEN DELETE` renders the delete branch dead code, preventing records from ever being purged ($P(\text{corruption}) = 1.0$). Omitting dedicated B-Tree indexes on target join columns forces $O(M \cdot N)$ sequential scans, locking relations and exhausting connection pools.
+  - ✅ **Production Invariant**: In PostgreSQL 17+, reserve `MERGE` for complex multi-action batch synchronizations (conditional insert, update, and delete) and ETL pipelines, while retaining `INSERT ... ON CONFLICT` for single-row/point OLTP upserts. Enforce mandatory source deduplication via `ROW_NUMBER() OVER (PARTITION BY join_keys ORDER BY updated_at DESC)` in a CTE prior to `USING (...)` to mathematically eradicate `SQLSTATE 21000`. Place destructive and conditional clauses strictly before fallback updates (`DELETE` before conditional `UPDATE`, before unconditional `UPDATE`). Ensure target join columns have a `PRIMARY KEY` or leftmost composite B-Tree index, project `merge_action()` alongside target and source columns in `RETURNING` for single-roundtrip CDC/outbox dispatch, and encapsulate execution within an exponential jitter retry wrapper handling transient `23505` and `40001` conflicts:
     ```sql
-    MERGE INTO user_profiles AS target
-    USING incoming_profiles AS source
-    ON target.user_id = source.user_id
-    WHEN MATCHED AND target.updated_at < source.updated_at THEN
-        UPDATE SET display_name = source.display_name, updated_at = source.updated_at
-    WHEN NOT MATCHED THEN
-        INSERT (user_id, display_name, updated_at)
-        VALUES (source.user_id, source.display_name, source.updated_at)
-    RETURNING merge_action(), target.user_id;
+    WITH raw_batch AS (
+        SELECT * FROM json_to_recordset($1::json) AS (
+            sku TEXT,
+            tenant_id TEXT,
+            name TEXT,
+            price_cents BIGINT,
+            is_deleted BOOLEAN,
+            updated_at TIMESTAMPTZ
+        )
+    ),
+    deduped_batch AS (
+        SELECT *,
+               ROW_NUMBER() OVER (
+                   PARTITION BY tenant_id, sku 
+                   ORDER BY updated_at DESC
+               ) AS _rn
+        FROM raw_batch
+    ),
+    clean_batch AS (
+        SELECT * FROM deduped_batch WHERE _rn = 1
+    )
+    MERGE INTO inventory_products AS t
+    USING clean_batch AS s
+    ON t.tenant_id = s.tenant_id AND t.sku = s.sku
+    -- 1. Destructive branch MUST precede update to prevent dead branch masking
+    WHEN MATCHED AND s.is_deleted = TRUE THEN
+        DELETE
+    -- 2. Conditional or standard update for non-deleted rows
+    WHEN MATCHED AND s.updated_at > t.updated_at THEN
+        UPDATE SET
+            name = s.name,
+            price_cents = s.price_cents,
+            updated_at = s.updated_at
+    -- 3. Insert when entity does not exist and is not marked deleted
+    WHEN NOT MATCHED AND s.is_deleted = FALSE THEN
+        INSERT (tenant_id, sku, name, price_cents, updated_at)
+        VALUES (s.tenant_id, s.sku, s.name, s.price_cents, s.updated_at)
+    -- PostgreSQL 17 Native RETURNING with merge_action() for single-roundtrip CDC
+    RETURNING 
+        merge_action() AS action,
+        t.sku,
+        t.tenant_id,
+        COALESCE(t.price_cents, 0) AS price_cents,
+        NOW() AS processed_at;
     ```
 - **JSONB Path Subscripting vs Legacy `->>` Operator Index Selectivity**:
   - ❌ **Mixing Extraction Operators Breaking B-Tree Index Matching**: Creating a functional B-tree index using `(payload->>'user_id')` but querying with `payload['user_id']` or `payload->'user_id'`. PostgreSQL does not treat different extraction operators as interchangeable, resulting in silent index misses and full sequential scans.
